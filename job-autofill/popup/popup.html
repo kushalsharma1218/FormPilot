@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Job Autofill</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="popup.css"/>
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <div class="header">
+      <div class="logo">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" fill="#3b82f6" stroke="#3b82f6" stroke-width="1.5" stroke-linejoin="round"/>
+        </svg>
+        <span>Job Autofill</span>
+      </div>
+      <div class="site-badge" id="site-badge">—</div>
+    </div>
+
+    <!-- Editable Site Key -->
+    <div class="site-key-row">
+      <div class="site-key-info">
+        <span class="site-key-label">Site Key</span>
+        <span class="site-key-hint">Groups all pages on this site together</span>
+      </div>
+      <div class="site-key-edit-wrap">
+        <input type="text" id="site-key-input" class="site-key-input" placeholder="e.g. greenhouse-amazon" />
+        <button id="btn-rename" class="btn-rename" title="Save site key">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Toggle Row -->
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <span class="toggle-label">Enable for this site</span>
+        <span class="toggle-sub" id="toggle-sub">Loading...</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="enable-toggle"/>
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <!-- Stats Row -->
+    <div class="stats-row">
+      <div class="stat">
+        <span class="stat-value" id="field-count">0</span>
+        <span class="stat-label">Saved Fields</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <span class="stat-value" id="status-text">Disabled</span>
+        <span class="stat-label">Status</span>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-autofill">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="13 2 13 9 20 9"></polyline><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path></svg>
+        Autofill Current Page
+      </button>
+      <button class="btn btn-secondary" id="btn-save">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        Sync / Capture Fields
+      </button>
+      <button class="btn btn-danger" id="btn-clear">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+        Clear Site Data
+      </button>
+    </div>
+
+    <!-- Saved Fields -->
+    <div class="fields-section">
+      <div class="fields-header">
+        <span>Saved Fields</span>
+        <span class="fields-hint">click to edit</span>
+      </div>
+      <div class="fields-list" id="fields-list">
+        <div class="empty-state">No data saved yet.<br/>Enable the site and submit a form.</div>
+      </div>
+      <div class="multipage-note">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        Fields from all pages of this site are merged together
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">All data stored locally · Never shared</div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
