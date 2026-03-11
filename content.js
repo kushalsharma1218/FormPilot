@@ -20,6 +20,35 @@ try {
 
 console.log(`[Job Autofill] Content script loaded on: ${location.hostname} (stored under: ${hostname})`);
 
+let currentGlobalProfile = {};
+
+const GLOBAL_HEURISTICS = [
+  { pId: 'firstName', regex: /first.?name|given.?name|prenom|nombre/i },
+  { pId: 'lastName', regex: /last.?name|family.?name|surname/i },
+  { pId: 'email', regex: /e?mail|e-mail|mail\s*address/i },
+  { pId: 'phone', regex: /phone|mobile|cell|tel|telephone|contact.?number/i },
+  { pId: 'linkedin', regex: /linkedin|linked\s*in/i },
+  { pId: 'github', regex: /github|git\s*hub/i },
+  { pId: 'portfolio', regex: /portfolio|website|personal.?site/i },
+  { pId: 'address', regex: /address|street/i },
+  { pId: 'city', regex: /city/i },
+  { pId: 'state', regex: /state|province/i },
+  { pId: 'zipcode', regex: /zip|postal|post\s*code/i },
+  { pId: 'currentCompany', regex: /company|employer/i }
+];
+
+function getGlobalMatch(fieldKey) {
+  if (!fieldKey || !currentGlobalProfile) return null;
+  // Strip any array index like [0] from the key for heuristic matching
+  const cleanKey = fieldKey.replace(/\[\d+\]$/, '');
+  for (const h of GLOBAL_HEURISTICS) {
+    if (h.regex.test(cleanKey) && currentGlobalProfile[h.pId]) {
+      return currentGlobalProfile[h.pId];
+    }
+  }
+  return null;
+}
+
 // ── Field key helpers ──────────────────────────────────────────
 
 // Detect auto-generated/unstable IDs (UUIDs, purely numeric, long opaque hashes)
@@ -28,15 +57,15 @@ function isUnstableId(str) {
   if (!str) return false;
   const s = str.trim();
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) // UUID
-      || /^\d+$/.test(s)                          // purely numeric
-      || /^[a-z0-9]{20,}$/i.test(s);              // long opaque hash (no separators)
+    || /^\d+$/.test(s)                          // purely numeric
+    || /^[a-z0-9]{20,}$/i.test(s);              // long opaque hash (no separators)
 }
 
 // Known sensitive field patterns — never save these
 const SENSITIVE_RE = /ssn|social.?sec|\bsin\b|tax.?id|\bein\b|passport|bank.?acc|routing|\bcvv\b|credit.?card|debit|secret/i;
 
 function getFieldKey(el) {
-  // aria-labelledby: resolve the label element's text (most reliable on modern ATSes)
+  // 1. aria-labelledby: resolve the label element's text
   const labelledBy = el.getAttribute('aria-labelledby');
   if (labelledBy) {
     const labelText = labelledBy.split(' ')
@@ -45,7 +74,23 @@ function getFieldKey(el) {
     if (labelText) return labelText;
   }
 
-  // Prefer name > stable id > aria-label > placeholder
+  // 2. label[for="ID"]
+  if (el.id) {
+    const label = document.querySelector(`label[for="${el.id}"]`);
+    if (label && label.innerText.trim()) return label.innerText.trim();
+  }
+
+  // 3. Closest label parent
+  const parentLabel = el.closest('label');
+  if (parentLabel && parentLabel.innerText.trim()) return parentLabel.innerText.trim();
+
+  // 4. Preceding sibling label (common in simple layouts)
+  const prev = el.previousElementSibling;
+  if (prev && (prev.tagName === 'LABEL' || prev.classList.contains('label'))) {
+    if (prev.innerText.trim()) return prev.innerText.trim();
+  }
+
+  // 5. Prefer name > stable id > aria-label > placeholder
   const candidates = [
     el.name,
     el.id,
@@ -54,7 +99,6 @@ function getFieldKey(el) {
   ];
   for (const c of candidates) {
     if (!c || !c.trim()) continue;
-    // Skip auto-generated unstable IDs
     if (isUnstableId(c.trim())) continue;
     return c.trim();
   }
@@ -66,13 +110,195 @@ function isSensitiveField(el) {
   const key = el.name || el.id || el.getAttribute('aria-label') || el.placeholder || '';
   const label = el.getAttribute('aria-labelledby')
     ? (el.getAttribute('aria-labelledby').split(' ')
-        .map(id => document.getElementById(id)?.innerText || '').join(' '))
+      .map(id => document.getElementById(id)?.innerText || '').join(' '))
     : '';
   return SENSITIVE_RE.test(key) || SENSITIVE_RE.test(label);
 }
 
+// ── Detect Workday ATS pages ──────────────────────────────────
+function isWorkdayPage() {
+  return !!(
+    window.workday ||
+    document.querySelector('[data-automation-id="applyFlowPage"]') ||
+    document.querySelector('[data-automation-id="applyFlowReviewPage"]') ||
+    /myworkdayjobs\.com|myworkday\.com/i.test(location.hostname)
+  );
+}
+
+// ── Workday-specific field capture ───────────────────────────
+// Workday uses custom React components instead of standard HTML form
+// elements. On Review pages, data is in label+span pairs. On input
+// pages, inputs have data-automation-id attributes.
+function getWorkdayFields() {
+  const fields = {};
+  const NO_RESPONSE_CLASS = 'css-1j5bq6h'; // Workday's "No Response" styling
+
+  // Strategy 1: Label → Value span pairs (Review pages)
+  // Pattern: <label for="X">Label</label> ... <span id="X" class="css-1ccsoih">Value</span>
+  document.querySelectorAll('label[for]').forEach(label => {
+    const labelText = label.innerText?.trim();
+    if (!labelText) return;
+    // Clean label: remove required asterisks and excessive whitespace
+    const cleanLabel = labelText.replace(/\*/g, '').trim();
+    if (!cleanLabel) return;
+
+    const forId = label.getAttribute('for');
+    if (!forId) return;
+    const valueEl = document.getElementById(forId);
+    if (!valueEl) return;
+
+    // Skip "No Response" values
+    if (valueEl.classList.contains(NO_RESPONSE_CLASS)) return;
+
+    const value = valueEl.innerText?.trim();
+    if (value && value !== 'No Response') {
+      fields[cleanLabel] = value;
+    }
+  });
+
+  // Strategy 2: Section headings with direct value spans (no label[for])
+  // Pattern: <h3>Section</h3> ... <span class="css-1ccsoih">Value</span>
+  document.querySelectorAll('[aria-labelledby]').forEach(group => {
+    const sectionId = group.getAttribute('aria-labelledby');
+    if (!sectionId) return;
+    const sectionLabel = document.getElementById(sectionId);
+    if (!sectionLabel) return;
+    const sectionName = sectionLabel.innerText?.trim();
+    if (!sectionName) return;
+
+    // Look for direct value spans that don't have a <label for> pointing at them
+    group.querySelectorAll('span[id]').forEach(span => {
+      // Already captured by Strategy 1? Skip if there's a label[for] pointing here
+      if (document.querySelector(`label[for="${span.id}"]`)) return;
+      if (span.classList.contains(NO_RESPONSE_CLASS)) return;
+      const value = span.innerText?.trim();
+      if (value && value !== 'No Response') {
+        fields[sectionName] = value;
+      }
+    });
+  });
+
+  // Strategy 3: Rich-text questionnaire answers (Application Questions)
+  // Pattern: <div id="rich-labelXXX">Question HTML</div> followed by value span
+  document.querySelectorAll('[id^="rich-label"]').forEach(richLabel => {
+    // Extract question text from the rich text container
+    const questionText = richLabel.innerText?.trim()
+      ?.replace(/\*/g, '')?.trim();
+    if (!questionText) return;
+    // Truncate very long questions to a reasonable key
+    const key = questionText.length > 100
+      ? questionText.substring(0, 100).trim()
+      : questionText;
+
+    // The answer span is typically in a sibling div.css-233int > span
+    const parent = richLabel.closest('.css-7t35fz') || richLabel.parentElement;
+    if (!parent) return;
+    const answerSpan = parent.querySelector('span[id]:not([id^="rich-label"])');
+    if (!answerSpan) return;
+    if (answerSpan.classList.contains(NO_RESPONSE_CLASS)) return;
+    const value = answerSpan.innerText?.trim();
+    if (value && value !== 'No Response') {
+      fields[key] = value;
+    }
+  });
+
+  // Strategy 4: Workday input fields on non-review pages (actual form inputs)
+  // These have data-automation-id attributes on inputs
+  document.querySelectorAll('input[data-automation-id], textarea[data-automation-id], select[data-automation-id]').forEach(el => {
+    const autoId = el.getAttribute('data-automation-id');
+    if (!autoId) return;
+    const type = (el.type || '').toLowerCase();
+    if (type === 'hidden' || type === 'submit' || type === 'button' || type === 'password' || type === 'file') return;
+    if (isSensitiveField(el)) return;
+
+    // Use label or automation-id as key
+    let key = getFieldKey(el);
+    if (!key || isUnstableId(key)) key = autoId;
+    if (!key) return;
+
+    if (type === 'checkbox') {
+      fields[key] = el.checked ? 'true' : 'false';
+    } else {
+      const value = el.value?.trim();
+      if (value) fields[key] = value;
+    }
+  });
+
+  // Strategy 5: data-fkit-id containers (Workday FormKit fields)
+  // These wrap Workday's custom form fields
+  document.querySelectorAll('[data-fkit-id]').forEach(container => {
+    // Find all label+value pairs inside this container
+    container.querySelectorAll('label').forEach(label => {
+      const labelText = label.innerText?.trim()?.replace(/\*/g, '')?.trim();
+      if (!labelText) return;
+      const forAttr = label.getAttribute('for');
+      if (forAttr) {
+        const valueEl = document.getElementById(forAttr);
+        if (valueEl && !valueEl.classList.contains(NO_RESPONSE_CLASS)) {
+          const value = valueEl.innerText?.trim();
+          if (value && value !== 'No Response' && !fields[labelText]) {
+            fields[labelText] = value;
+          }
+        }
+      }
+    });
+  });
+
+  // Strategy 6: File attachment info
+  document.querySelectorAll('[data-automation-id="file-upload-item-name"]').forEach(el => {
+    const filename = el.innerText?.trim();
+    if (filename) {
+      fields['Resume/CV Filename'] = filename;
+    }
+  });
+
+  console.log(`[Job Autofill] Workday fields captured:`, fields);
+  return fields;
+}
+
+// ── General ATS display-field scraper ─────────────────────────
+// For sites that render form data as label+value pairs in read-only
+// display mode (common in many ATS review/confirmation pages)
+function getDisplayFields() {
+  const fields = {};
+
+  // Pattern: <label>Text</label> followed by a sibling <span>/<div> with the value
+  document.querySelectorAll('label').forEach(label => {
+    const labelText = label.innerText?.trim()?.replace(/\*/g, '')?.trim();
+    if (!labelText || labelText.length > 120) return;
+
+    const forAttr = label.getAttribute('for');
+    if (forAttr) {
+      const target = document.getElementById(forAttr);
+      if (!target) return;
+      // If target is an input/select/textarea, skip (handled by standard capture)
+      const tag = target.tagName.toUpperCase();
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      // It's a display element (span, div, etc.)
+      const value = target.innerText?.trim();
+      if (value && value !== 'No Response' && value.length < 2000) {
+        fields[labelText] = value;
+      }
+    }
+  });
+
+  return fields;
+}
+
 function getFormFields() {
   const fields = {};
+
+  // ── Workday-specific capture ──
+  if (isWorkdayPage()) {
+    const wdFields = getWorkdayFields();
+    Object.assign(fields, wdFields);
+    // If we got good Workday data, return early — no need for generic scraping
+    if (Object.keys(wdFields).length > 3) {
+      console.log(`[Job Autofill] Workday capture found ${Object.keys(wdFields).length} fields, skipping generic scan.`);
+      return fields;
+    }
+  }
+
   // Exclude: hidden, submit, button, reset, file, PASSWORD (security!), single-char OTPs
   const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select';
 
@@ -144,8 +370,8 @@ function getFormFields() {
       return;
     }
     const text = el.getAttribute('aria-valuenow')
-               || el.getAttribute('data-value')
-               || el.innerText?.trim();
+      || el.getAttribute('data-value')
+      || el.innerText?.trim();
     if (text) fields[fieldKey] = text;
   });
 
@@ -160,18 +386,24 @@ function getFormFields() {
     if (values.length) fields[key] = values.join(',');
   });
 
+  // ── General display-field capture (for review/confirmation pages) ──
+  if (Object.keys(fields).length < 3) {
+    const displayFields = getDisplayFields();
+    Object.assign(fields, displayFields);
+  }
+
   return fields;
 }
 
 function triggerEvents(el) {
-  el.dispatchEvent(new Event('input',  { bubbles: true }));
+  el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function setNativeValue(el, val) {
-  const proto = el.tagName === 'SELECT'   ? HTMLSelectElement.prototype
-              : el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype
-              : HTMLInputElement.prototype;
+  const proto = el.tagName === 'SELECT' ? HTMLSelectElement.prototype
+    : el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
   if (setter) setter.call(el, val);
   else el.value = val;
@@ -206,8 +438,9 @@ function fillFields(savedFields) {
     const isDuplicate = keyCounts[key] > 1;
     keyIndex[key] = (keyIndex[key] || 0);
     const fieldKey = isDuplicate ? `${key}[${keyIndex[key]++}]` : key;
-    if (!(fieldKey in savedFields)) return;
-    const val = savedFields[fieldKey];
+    let val = savedFields[fieldKey];
+    if (val === undefined) val = getGlobalMatch(fieldKey);
+    if (val === undefined || val === null) return;
 
     if (type === 'checkbox') {
       el.checked = val === 'true' || val === true;
@@ -240,8 +473,9 @@ function fillFields(savedFields) {
     const isDuplicate = comboKeyCounts[key] > 1;
     comboKeyIndex[key] = (comboKeyIndex[key] || 0);
     const fieldKey = isDuplicate ? `${key}[${comboKeyIndex[key]++}]` : key;
-    if (!(fieldKey in savedFields)) return;
-    const val = savedFields[fieldKey];
+    let val = savedFields[fieldKey];
+    if (val === undefined) val = getGlobalMatch(fieldKey);
+    if (val === undefined || val === null) return;
 
     const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
     if (inputChild) {
@@ -262,8 +496,11 @@ function fillFields(savedFields) {
   // ── Custom ARIA listboxes (already expanded) ───────────────────
   document.querySelectorAll('[role="listbox"]').forEach(listbox => {
     const key = getFieldKey(listbox);
-    if (!key || !(key in savedFields)) return;
-    const vals = String(savedFields[key]).split(',');
+    if (!key) return;
+    let val = savedFields[key];
+    if (val === undefined) val = getGlobalMatch(key);
+    if (val === undefined || val === null) return;
+    const vals = String(val).split(',');
     listbox.querySelectorAll('[role="option"]').forEach(opt => {
       const optVal = opt.getAttribute('data-value') || opt.getAttribute('value') || opt.innerText?.trim();
       if (vals.includes(optVal) && opt.getAttribute('aria-selected') !== 'true') opt.click();
@@ -305,8 +542,9 @@ function fillStandardFields(savedFields) {
   elements.forEach(({ el, key, type }) => {
     keyIndex[key] = (keyIndex[key] || 0);
     const fieldKey = keyCounts[key] > 1 ? `${key}[${keyIndex[key]++}]` : key;
-    if (!(fieldKey in savedFields)) return;
-    const val = savedFields[fieldKey];
+    let val = savedFields[fieldKey];
+    if (val === undefined) val = getGlobalMatch(fieldKey);
+    if (val === undefined || val === null) return;
     if (type === 'checkbox') {
       el.checked = val === 'true' || val === true;
       triggerEvents(el);
@@ -321,6 +559,11 @@ function fillStandardFields(savedFields) {
 // ── Banner UI ──────────────────────────────────────────────────
 function showAutofillBanner(savedFields) {
   if (document.getElementById('ja-banner')) return;
+  // Don't show if user already skipped or accepted during this session
+  if (sessionStorage.getItem('ja_autofill_dismissed') === 'true') {
+    console.log('[Job Autofill] Autofill banner already dismissed this session, skipping.');
+    return;
+  }
 
   const banner = document.createElement('div');
   banner.id = 'ja-banner';
@@ -355,6 +598,8 @@ function showAutofillBanner(savedFields) {
       #ja-yes:hover { background: #2563eb; transform: scale(1.04); }
       #ja-no  { background: rgba(255,255,255,0.08); color: #94a3b8; }
       #ja-no:hover { background: rgba(255,255,255,0.15); }
+      #ja-never { background: rgba(239, 68, 68, 0.1); color: #ef4444; }
+      #ja-never:hover { background: rgba(239, 68, 68, 0.2); }
     </style>
     <span class="ja-icon">⚡</span>
     <div class="ja-text">
@@ -364,19 +609,35 @@ function showAutofillBanner(savedFields) {
     <div class="ja-btns">
       <button id="ja-yes">Yes</button>
       <button id="ja-no">Skip</button>
+      <button id="ja-never">Never</button>
     </div>
   `;
 
   document.body.appendChild(banner);
 
   document.getElementById('ja-yes').onclick = () => {
+    sessionStorage.setItem('ja_autofill_dismissed', 'true');
     fillFields(savedFields);
     banner.remove();
   };
-  document.getElementById('ja-no').onclick = () => banner.remove();
+  document.getElementById('ja-no').onclick = () => {
+    sessionStorage.setItem('ja_autofill_dismissed', 'true');
+    banner.remove();
+  };
+  document.getElementById('ja-never').onclick = () => {
+    sessionStorage.setItem('ja_autofill_dismissed', 'true');
+    chrome.runtime.sendMessage({ type: 'DISABLE_SITE', hostname });
+    banner.remove();
+  };
 
-  // Auto-dismiss after 12s
-  setTimeout(() => banner?.remove(), 12000);
+  // Auto-dismiss after 12s — also remember so it doesn't pop up again
+  setTimeout(() => {
+    const b = document.getElementById('ja-banner');
+    if (b) {
+      sessionStorage.setItem('ja_autofill_dismissed', 'true');
+      b.remove();
+    }
+  }, 12000);
 }
 
 // ── Save Data Prompt ──────────────────────────────────────────
@@ -413,6 +674,8 @@ function showSaveDataBanner(fields) {
       #ja-save-yes:hover { background: #059669; transform: scale(1.04); }
       #ja-save-no  { background: rgba(255,255,255,0.08); color: #94a3b8; }
       #ja-save-no:hover { background: rgba(255,255,255,0.15); }
+      #ja-save-never { background: rgba(239, 68, 68, 0.1); color: #ef4444; }
+      #ja-save-never:hover { background: rgba(239, 68, 68, 0.2); }
     </style>
     <span class="ja-icon">💾</span>
     <div class="ja-text">
@@ -422,6 +685,7 @@ function showSaveDataBanner(fields) {
     <div class="ja-btns">
       <button id="ja-save-yes">Save</button>
       <button id="ja-save-no">Skip</button>
+      <button id="ja-save-never">Never</button>
     </div>
   `;
 
@@ -439,6 +703,12 @@ function showSaveDataBanner(fields) {
     e.preventDefault();
     e.stopPropagation();
     sessionStorage.setItem('ja_prompt_skipped', 'true');
+    banner.remove();
+  };
+  document.getElementById('ja-save-never').onmousedown = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    chrome.runtime.sendMessage({ type: 'DISABLE_SITE', hostname });
     banner.remove();
   };
 
@@ -465,15 +735,15 @@ function attachRecorder() {
     console.log(`[Job Autofill] Intercepted submission via: ${source}`);
     const fields = getFormFields();
     console.log(`[Job Autofill] Captured fields:`, fields);
-    
+
     if (Object.keys(fields).length > 0) {
       // If user previously clicked Save on page 1, silently save page 2+ data
       if (sessionStorage.getItem('ja_prompt_skipped') === 'true') {
-         console.log(`[Job Autofill] Banner skipped this session. Silently saving data.`);
-         chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields });
+        console.log(`[Job Autofill] Banner skipped this session. Silently saving data.`);
+        chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields });
       } else {
-         console.log(`[Job Autofill] Prompting to save data.`);
-         showSaveDataBanner(fields);
+        console.log(`[Job Autofill] Prompting to save data.`);
+        showSaveDataBanner(fields);
       }
     } else {
       console.log(`[Job Autofill] No fields found, skipping prompt.`);
@@ -489,13 +759,20 @@ function attachRecorder() {
   document.addEventListener('mousedown', (e) => {
     let el = e.target;
     let isSubmit = false;
-    
-    // traverse up a bit to catch icons inside buttons
+
+    // traverse up to catch icons inside buttons (5 levels for nested ATS UIs)
     let depth = 0;
-    while (el && el !== document.body && depth < 3) {
+    while (el && el !== document.body && depth < 5) {
       const tagName = (el.tagName || '').toUpperCase();
       const type = (el.type || '').toLowerCase();
-      
+
+      // Workday-specific: detect buttons by data-automation-id
+      const autoId = el.getAttribute?.('data-automation-id') || '';
+      if (/pageFooterNextButton|pageFooterSubmitButton|bottom-navigation-next/i.test(autoId)) {
+        isSubmit = true;
+        break;
+      }
+
       if (tagName === 'BUTTON' || (tagName === 'INPUT' && (type === 'submit' || type === 'button'))) {
         const text = (el.innerText || el.value || '').toLowerCase();
         if (/(submit|apply|save|continue|next|send)/i.test(text)) {
@@ -533,7 +810,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     return true; // async
   }
-  
+
   if (msg.type === 'MANUAL_AUTOFILL') {
     chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }).then(resp => {
       if (resp?.site?.fields) {
@@ -545,24 +822,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true; // async
   }
+
+  if (msg.type === 'EXTRACT_PAGE_TEXT') {
+    // Try to get main content, otherwise fallback to body
+    let container = document.querySelector('main, [role="main"], article, .job-description, #job-description, .posting-content, .job-details');
+    if (!container) container = document.body;
+
+    let text = container.innerText || '';
+    // Basic cleanup: collapse whitespace
+    text = text.replace(/\s+/g, ' ').trim();
+    // Truncate to avoid massive payloads (15k chars is usually plenty for a JD)
+    if (text.length > 15000) text = text.substring(0, 15000);
+
+    sendResponse({ ok: true, text });
+    return true;
+  }
 });
 
 // ── Init ───────────────────────────────────────────────────────
-(async () => {
-  // Always attach the recorder so we can prompt to save on any site
-  attachRecorder();
-
-  // Resolve the effective site key (may be custom-renamed by user)
-  const keyResp = await chrome.runtime.sendMessage({ type: 'GET_SITE_KEY', hostname });
-  const siteKey = keyResp?.siteKey || hostname;
+async function init() {
+  console.log(`[Job Autofill] Initializing on ${location.href}`);
 
   const resp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname });
   const site = resp?.site;
+  if (site?.disabled) {
+    console.log(`[Job Autofill] Extension explicitly disabled for this site.`);
+    return;
+  }
+
+  // Always attach the recorder so we can prompt to save on any site
+  attachRecorder();
+
+  const profileResp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
+  currentGlobalProfile = profileResp?.profile || {};
+
+  // Resolve the effective site key (may be custom-renamed by user)
+  const siteKey = resp?.siteKey || hostname;
+
   if (!site?.enabled) return;
 
   const savedCount = Object.keys(site.fields || {}).length;
-  if (savedCount > 0) {
+  const globalCount = Object.keys(currentGlobalProfile || {}).length;
+  if (savedCount > 0 || globalCount > 0) {
     // Small delay to let the page fully render
-    setTimeout(() => showAutofillBanner(site.fields), 800);
+    setTimeout(() => showAutofillBanner(site.fields || {}), 800);
   }
-})();
+}
+
+// Initial run
+init();
+
+// Handle SPA navigation (hash changes)
+window.addEventListener('hashchange', () => {
+  console.log('[Job Autofill] Hash change detected, re-initializing...');
+  init();
+});
+
+// Also watch for major DOM changes that might indicate a page transition in some SPAs
+let lastPath = location.pathname + location.search + location.hash;
+const navObserver = new MutationObserver(() => {
+  const currentPath = location.pathname + location.search + location.hash;
+  if (currentPath !== lastPath) {
+    lastPath = currentPath;
+    console.log('[Job Autofill] Path change detected via MutationObserver, re-initializing...');
+    init();
+  }
+});
+navObserver.observe(document.head, { childList: true, subtree: true });
+navObserver.observe(document.body, { childList: true });

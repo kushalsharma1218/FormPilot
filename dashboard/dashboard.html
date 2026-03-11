@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job Autofill — AI Copilot Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="dashboard.css">
+</head>
+
+<body>
+    <div class="app">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-logo">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" fill="#3b82f6" stroke="#3b82f6" stroke-width="1.5"
+                        stroke-linejoin="round" />
+                </svg>
+                <div class="sidebar-logo-text">
+                    <span class="logo-title">Job Autofill</span>
+                    <span class="logo-version">v2.0 · AI Copilot</span>
+                </div>
+            </div>
+
+            <nav class="sidebar-nav">
+                <button class="nav-item active" data-tab="overview">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7" rx="1" />
+                        <rect x="14" y="3" width="7" height="7" rx="1" />
+                        <rect x="3" y="14" width="7" height="7" rx="1" />
+                        <rect x="14" y="14" width="7" height="7" rx="1" />
+                    </svg>
+                    <span>Overview</span>
+                </button>
+                <button class="nav-item" data-tab="sites">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="2" y1="12" x2="22" y2="12" />
+                        <path
+                            d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+                    </svg>
+                    <span>Saved Sites</span>
+                </button>
+                <button class="nav-item" data-tab="profile">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                        <circle cx="12" cy="7" r="4" />
+                    </svg>
+                    <span>Global Profile</span>
+                </button>
+
+                <div class="nav-divider">
+                    <span>AI Features</span>
+                </div>
+
+                <button class="nav-item" data-tab="tracker">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                        <line x1="16" y1="2" x2="16" y2="6" />
+                        <line x1="8" y1="2" x2="8" y2="6" />
+                        <line x1="3" y1="10" x2="21" y2="10" />
+                    </svg>
+                    <span>Application Tracker</span>
+                </button>
+                <button class="nav-item" data-tab="interview">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                    </svg>
+                    <span>Interview Prep</span>
+                </button>
+                <button class="nav-item" data-tab="settings">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3" />
+                        <path
+                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                    </svg>
+                    <span>Settings</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="sidebar-footer-text">All data stored locally<br>Never shared</div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- ═══ OVERVIEW TAB ═══ -->
+            <section class="tab-content active" id="tab-overview">
+                <div class="page-header">
+                    <h1>Dashboard</h1>
+                    <p class="page-subtitle">Quick overview of your Job Autofill AI Copilot</p>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card stat-blue">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <circle cx="12" cy="12" r="10" />
+                                <line x1="2" y1="12" x2="22" y2="12" />
+                                <path
+                                    d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="stat-total-sites">0</span>
+                            <span class="stat-card-label">Total Sites</span>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-green">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="stat-active-sites">0</span>
+                            <span class="stat-card-label">Active Sites</span>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-purple">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                                <line x1="16" y1="2" x2="16" y2="6" />
+                                <line x1="8" y1="2" x2="8" y2="6" />
+                                <line x1="3" y1="10" x2="21" y2="10" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="stat-applications">0</span>
+                            <span class="stat-card-label">Applications</span>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-amber">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <polygon
+                                    points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="stat-ai-status">—</span>
+                            <span class="stat-card-label">AI Status</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Applications -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Recent Applications</h2>
+                        <button class="btn-ghost" id="btn-view-all-apps">View All →</button>
+                    </div>
+                    <div id="recent-apps-list" class="recent-sites-list">
+                        <div class="empty-state">No applications tracked yet. Apply to a job to get started!</div>
+                    </div>
+                </div>
+
+                <!-- Profile Completeness -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Profile Completeness</h2>
+                    </div>
+                    <div class="profile-completeness">
+                        <div class="progress-bar-track">
+                            <div class="progress-bar-fill" id="profile-progress"></div>
+                        </div>
+                        <div class="progress-info">
+                            <span id="profile-percent">0%</span>
+                            <span class="progress-hint" id="profile-hint">Upload your resume for instant AI-powered
+                                profile setup</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ═══ SAVED SITES TAB ═══ -->
+            <section class="tab-content" id="tab-sites">
+                <div class="page-header">
+                    <h1>Saved Sites</h1>
+                    <p class="page-subtitle">Manage your saved application data per site</p>
+                </div>
+
+                <div class="search-bar">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8" />
+                        <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    </svg>
+                    <input type="text" id="site-search" placeholder="Search sites..." />
+                </div>
+
+                <div id="all-sites-list" class="all-sites-list">
+                    <div class="empty-state">No sites recorded yet. Visit a job application page to get started.</div>
+                </div>
+            </section>
+
+            <!-- ═══ GLOBAL PROFILE TAB ═══ -->
+            <section class="tab-content" id="tab-profile">
+                <div class="page-header">
+                    <h1>Global Profile</h1>
+                    <p class="page-subtitle">Your master profile powers AI autofill, resume tailoring & match
+                        scoring</p>
+                </div>
+
+                <!-- Resume Upload -->
+                <div class="card card-highlight">
+                    <div class="card-header">
+                        <h2>⚡ Quick Setup — Upload Resume</h2>
+                    </div>
+                    <p class="card-hint">Paste your resume text or upload a .txt file. AI will extract and populate your
+                        entire profile instantly.</p>
+                    <div class="resume-upload-area">
+                        <textarea id="resume-text" class="resume-textarea"
+                            placeholder="Paste your resume text here...&#10;&#10;Or click 'Upload File' below to load from a text file."></textarea>
+                        <div class="resume-actions">
+                            <button class="btn btn-primary" id="btn-parse-resume">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <polygon
+                                        points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                                </svg>
+                                Parse with AI
+                            </button>
+                            <button type="button" class="btn btn-secondary" id="btn-upload-resume">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                    <polyline points="17 8 12 3 7 8" />
+                                    <line x1="12" y1="3" x2="12" y2="15" />
+                                </svg>
+                                Upload PDF / TXT
+                            </button>
+                            <input type="file" id="resume-file-input" accept=".txt,.text,.pdf" hidden />
+                            <span id="parse-status" class="status-msg"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <form id="profile-form" class="profile-form">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Personal Information</h2>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="firstName">First Name</label>
+                                <input type="text" id="firstName" name="firstName" placeholder="e.g. Jane">
+                            </div>
+                            <div class="form-group">
+                                <label for="lastName">Last Name</label>
+                                <input type="text" id="lastName" name="lastName" placeholder="e.g. Doe">
+                            </div>
+                            <div class="form-group">
+                                <label for="email">Email</label>
+                                <input type="email" id="email" name="email" placeholder="e.g. jane@example.com">
+                            </div>
+                            <div class="form-group">
+                                <label for="phone">Phone Number</label>
+                                <input type="tel" id="phone" name="phone" placeholder="e.g. 555-123-4567">
+                            </div>
+                            <div class="form-group">
+                                <label for="currentTitle">Current Title</label>
+                                <input type="text" id="currentTitle" name="currentTitle"
+                                    placeholder="e.g. Software Engineer">
+                            </div>
+                            <div class="form-group">
+                                <label for="totalYearsExperience">Years of Experience</label>
+                                <input type="number" id="totalYearsExperience" name="totalYearsExperience"
+                                    placeholder="e.g. 5">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Professional Summary</h2>
+                        </div>
+                        <div class="form-group full-width">
+                            <textarea id="summary" name="summary" rows="4"
+                                placeholder="Brief professional summary..."></textarea>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Links & Socials</h2>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="linkedin">LinkedIn URL</label>
+                                <input type="url" id="linkedin" name="linkedin"
+                                    placeholder="https://linkedin.com/in/...">
+                            </div>
+                            <div class="form-group">
+                                <label for="github">GitHub URL</label>
+                                <input type="url" id="github" name="github" placeholder="https://github.com/...">
+                            </div>
+                            <div class="form-group full-width">
+                                <label for="portfolio">Portfolio / Website</label>
+                                <input type="url" id="portfolio" name="portfolio" placeholder="https://yourwebsite.com">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Location</h2>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-group full-width">
+                                <label for="address">Street Address</label>
+                                <input type="text" id="address" name="address" placeholder="123 Main St">
+                            </div>
+                            <div class="form-group">
+                                <label for="city">City</label>
+                                <input type="text" id="city" name="city" placeholder="San Francisco">
+                            </div>
+                            <div class="form-group">
+                                <label for="state">State / Province</label>
+                                <input type="text" id="state" name="state" placeholder="CA">
+                            </div>
+                            <div class="form-group">
+                                <label for="zipcode">Zip / Postal Code</label>
+                                <input type="text" id="zipcode" name="zipcode" placeholder="94105">
+                            </div>
+                            <div class="form-group">
+                                <label for="currentCompany">Current Company</label>
+                                <input type="text" id="currentCompany" name="currentCompany" placeholder="Acme Corp">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Skills -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Skills</h2>
+                        </div>
+                        <div class="skills-input-row">
+                            <input type="text" id="skill-input" placeholder="Type a skill and press Enter..." />
+                            <button type="button" class="btn btn-secondary btn-sm" id="btn-add-skill">Add</button>
+                        </div>
+                        <div id="skills-container" class="skills-tags"></div>
+                    </div>
+
+                    <!-- Work History -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Work History</h2>
+                            <button type="button" class="btn btn-secondary btn-sm" id="btn-add-work">+ Add
+                                Position</button>
+                        </div>
+                        <div id="work-history-container"></div>
+                    </div>
+
+                    <!-- Education -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Education</h2>
+                            <button type="button" class="btn btn-secondary btn-sm" id="btn-add-edu">+ Add
+                                Education</button>
+                        </div>
+                        <div id="education-container"></div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary btn-lg">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2.5">
+                                <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z" />
+                                <polyline points="17 21 17 13 7 13 7 21" />
+                                <polyline points="7 3 7 8 15 8" />
+                            </svg>
+                            Save Profile
+                        </button>
+                        <span id="save-status" class="status-msg"></span>
+                    </div>
+                </form>
+            </section>
+
+            <!-- ═══ APPLICATION TRACKER TAB ═══ -->
+            <section class="tab-content" id="tab-tracker">
+                <div class="page-header">
+                    <h1>Application Tracker</h1>
+                    <p class="page-subtitle">Track your job applications and stay organized</p>
+                </div>
+
+                <!-- Status Filter Tabs -->
+                <div class="tracker-filters">
+                    <button class="filter-btn active" data-status="all">All</button>
+                    <button class="filter-btn" data-status="applied">Applied</button>
+                    <button class="filter-btn" data-status="screening">Screening</button>
+                    <button class="filter-btn" data-status="interviewing">Interviewing</button>
+                    <button class="filter-btn" data-status="offer">Offer</button>
+                    <button class="filter-btn" data-status="rejected">Rejected</button>
+                </div>
+
+                <!-- Add Application Button -->
+                <div class="tracker-actions">
+                    <button class="btn btn-primary" id="btn-add-application">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <line x1="12" y1="5" x2="12" y2="19" />
+                            <line x1="5" y1="12" x2="19" y2="12" />
+                        </svg>
+                        Add Application
+                    </button>
+                    <div class="tracker-stats">
+                        <span id="tracker-count">0 applications</span>
+                    </div>
+                </div>
+
+                <div id="applications-list" class="applications-list">
+                    <div class="empty-state">No applications tracked yet.<br>Applications will auto-log when you apply,
+                        or add them manually.</div>
+                </div>
+            </section>
+
+            <!-- ═══ INTERVIEW PREP TAB ═══ -->
+            <section class="tab-content" id="tab-interview">
+                <div class="page-header">
+                    <h1>Interview Prep</h1>
+                    <p class="page-subtitle">AI-generated interview questions and answers based on your profile</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Generate Interview Prep</h2>
+                    </div>
+                    <p class="card-hint">Select an application or paste a job description to generate personalized
+                        interview prep.</p>
+                    <div class="interview-setup">
+                        <select id="interview-app-select" class="interview-select">
+                            <option value="">— Select an application —</option>
+                        </select>
+                        <span class="interview-or">or</span>
+                        <textarea id="interview-jd-input" class="interview-jd-textarea"
+                            placeholder="Paste a job description here..."></textarea>
+                        <button class="btn btn-primary" id="btn-generate-interview">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <polygon
+                                    points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                            </svg>
+                            Generate with AI
+                        </button>
+                    </div>
+                </div>
+
+                <div id="interview-results" class="interview-results" hidden>
+                    <!-- Behavioral Questions -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>🎯 Behavioral Questions</h2>
+                        </div>
+                        <div id="behavioral-questions" class="questions-list"></div>
+                    </div>
+                    <!-- Technical Questions -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>💻 Technical Questions</h2>
+                        </div>
+                        <div id="technical-questions" class="questions-list"></div>
+                    </div>
+                    <!-- Company/Culture Questions -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>🏢 Company & Culture</h2>
+                        </div>
+                        <div id="company-questions" class="questions-list"></div>
+                    </div>
+                    <!-- Questions to Ask -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>❓ Smart Questions to Ask</h2>
+                        </div>
+                        <div id="questions-to-ask" class="questions-list"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ═══ SETTINGS TAB ═══ -->
+            <section class="tab-content" id="tab-settings">
+                <div class="page-header">
+                    <h1>Settings</h1>
+                    <p class="page-subtitle">Configure AI, manage disabled sites, and import/export data</p>
+                </div>
+
+                <!-- AI Configuration -->
+                <div class="card card-highlight">
+                    <div class="card-header">
+                        <h2>🤖 AI Configuration</h2>
+                    </div>
+                    <p class="card-hint">Connect your AI provider to enable resume parsing, cover letters, match
+                        scoring, interview prep, and more.</p>
+                    <div class="ai-settings-form">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="ai-provider">Provider</label>
+                                <select id="ai-provider">
+                                    <option value="gemini">Google Gemini</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="ai-model">Model</label>
+                                <select id="ai-model">
+                                    <option value="gemini-2.0-flash">Gemini 2.0 Flash (Fast)</option>
+                                    <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (Fastest)</option>
+                                    <option value="gemini-2.5-flash-preview-04-17">Gemini 2.5 Flash (Best)</option>
+                                </select>
+                            </div>
+                            <div class="form-group full-width">
+                                <label for="ai-api-key">API Key</label>
+                                <div class="api-key-input-wrap">
+                                    <input type="password" id="ai-api-key" placeholder="Enter your Gemini API key...">
+                                    <button type="button" class="btn-icon" id="btn-toggle-key" title="Show/Hide">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2">
+                                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                                            <circle cx="12" cy="12" r="3" />
+                                        </svg>
+                                    </button>
+                                </div>
+                                <span class="form-hint">Get a free API key at <a
+                                        href="https://aistudio.google.com/apikey" target="_blank"
+                                        rel="noopener">aistudio.google.com/apikey</a></span>
+                            </div>
+                        </div>
+                        <div class="ai-settings-actions">
+                            <div class="toggle-row-inline">
+                                <label class="switch">
+                                    <input type="checkbox" id="ai-enabled" />
+                                    <span class="slider"></span>
+                                </label>
+                                <span>Enable AI Features</span>
+                            </div>
+                            <div style="display:flex;gap:8px;align-items:center;">
+                                <button class="btn btn-secondary" id="btn-test-ai">Test Connection</button>
+                                <button class="btn btn-primary" id="btn-save-ai">Save Settings</button>
+                                <span id="ai-status-msg" class="status-msg"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Disabled Sites -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Disabled Sites</h2>
+                        <span class="card-badge" id="disabled-count">0</span>
+                    </div>
+                    <p class="card-hint">The extension is completely disabled for these sites.</p>
+                    <div id="disabled-sites-list" class="disabled-sites-list">
+                        <div class="empty-state">No sites are currently disabled.</div>
+                    </div>
+                </div>
+
+                <!-- Export / Import -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Data Management</h2>
+                    </div>
+                    <p class="card-hint">Export your data as JSON for backup, or import from a previous export.</p>
+                    <div class="data-actions">
+                        <button class="btn btn-secondary" id="btn-export">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                <polyline points="7 10 12 15 17 10" />
+                                <line x1="12" y1="15" x2="12" y2="3" />
+                            </svg>
+                            Export All Data
+                        </button>
+                        <button class="btn btn-secondary" id="btn-import">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                <polyline points="17 8 12 3 7 8" />
+                                <line x1="12" y1="3" x2="12" y2="15" />
+                            </svg>
+                            Import Data
+                        </button>
+                        <input type="file" id="import-file" accept=".json" hidden />
+                    </div>
+                </div>
+
+                <!-- Danger Zone -->
+                <div class="card card-danger">
+                    <div class="card-header">
+                        <h2>Danger Zone</h2>
+                    </div>
+                    <p class="card-hint">Permanently delete all extension data. This cannot be undone.</p>
+                    <div class="data-actions">
+                        <button class="btn btn-danger" id="btn-nuke">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <polyline points="3 6 5 6 21 6" />
+                                <path d="M19 6l-1 14H6L5 6" />
+                                <path d="M10 11v6M14 11v6" />
+                                <path d="M9 6V4h6v2" />
+                            </svg>
+                            Delete All Data
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div class="modal-overlay" id="confirm-modal" hidden>
+        <div class="modal">
+            <h3 id="modal-title">Confirm</h3>
+            <p id="modal-message">Are you sure?</p>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                <button class="btn btn-danger" id="modal-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Application Modal -->
+    <div class="modal-overlay" id="add-app-modal" hidden>
+        <div class="modal modal-wide">
+            <h3>Add Application</h3>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="app-company">Company</label>
+                    <input type="text" id="app-company" placeholder="e.g. Google" />
+                </div>
+                <div class="form-group">
+                    <label for="app-title">Job Title</label>
+                    <input type="text" id="app-title" placeholder="e.g. Software Engineer" />
+                </div>
+                <div class="form-group">
+                    <label for="app-location">Location</label>
+                    <input type="text" id="app-location" placeholder="e.g. Remote" />
+                </div>
+                <div class="form-group">
+                    <label for="app-status">Status</label>
+                    <select id="app-status">
+                        <option value="applied">Applied</option>
+                        <option value="screening">Screening</option>
+                        <option value="interviewing">Interviewing</option>
+                        <option value="offer">Offer</option>
+                        <option value="rejected">Rejected</option>
+                    </select>
+                </div>
+                <div class="form-group full-width">
+                    <label for="app-url">Application URL</label>
+                    <input type="url" id="app-url" placeholder="https://..." />
+                </div>
+                <div class="form-group full-width">
+                    <label for="app-jd">Job Description (for AI features)</label>
+                    <textarea id="app-jd" rows="4" placeholder="Paste the job description..."></textarea>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="add-app-cancel">Cancel</button>
+                <button class="btn btn-primary" id="add-app-save">Save Application</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cover Letter Modal -->
+    <div class="modal-overlay" id="cover-letter-modal" hidden>
+        <div class="modal modal-wide">
+            <h3>✍️ AI Cover Letter</h3>
+            <div class="cover-letter-options">
+                <label>Tone:</label>
+                <select id="cl-tone">
+                    <option value="professional">Professional</option>
+                    <option value="conversational">Conversational</option>
+                    <option value="bold">Bold & Confident</option>
+                </select>
+                <button class="btn btn-primary btn-sm" id="btn-generate-cl">Generate</button>
+                <span id="cl-status" class="status-msg"></span>
+            </div>
+            <textarea id="cl-output" class="cl-textarea" placeholder="Cover letter will appear here..."
+                readonly></textarea>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="cl-close">Close</button>
+                <button class="btn btn-secondary" id="cl-copy">📋 Copy</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+
+    <script src="dashboard.js"></script>
+</body>
+
+</html>
