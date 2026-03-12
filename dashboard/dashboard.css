@@ -1927,3 +1927,168 @@ textarea#summary:focus {
         grid-template-columns: 120px 1fr 28px;
     }
 }
+
+/* ─── Dashboard Full-Screen Auth Shield ───────────────────── */
+.dash-auth-shield {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: radial-gradient(circle at center -20%, rgba(99, 102, 241, 0.15) 0%, var(--bg-deep) 60%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.dash-auth-card {
+    background: var(--bg-surface);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-lg);
+    width: 100%;
+    max-width: 400px;
+    padding: 40px;
+    box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+    animation: authCardEnter 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes authCardEnter {
+    from { opacity: 0; transform: translateY(20px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.dash-auth-header {
+    text-align: center;
+    margin-bottom: 32px;
+}
+
+.dash-auth-logo {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 20px;
+}
+
+.dash-auth-logo svg {
+    filter: drop-shadow(0 0 20px rgba(99, 102, 241, 0.4));
+}
+
+.dash-auth-header h2 {
+    font-size: 26px;
+    font-weight: 700;
+    margin: 0 0 8px 0;
+    color: var(--text-main);
+    letter-spacing: -0.02em;
+}
+
+.dash-auth-header p {
+    font-size: 14px;
+    color: var(--text-sec);
+    margin: 0;
+}
+
+.dash-auth-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.dash-auth-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+    font-family: inherit;
+    font-size: 15px;
+    padding: 14px 16px;
+    border-radius: var(--radius-md);
+    transition: all 0.2s ease;
+}
+
+.dash-auth-input::placeholder {
+    color: var(--text-muted);
+}
+
+.dash-auth-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: rgba(255, 255, 255, 0.06);
+    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.15);
+}
+
+.dash-auth-btn {
+    padding: 14px;
+    font-size: 15px;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    transition: all 0.2s ease;
+}
+
+.btn-primary.dash-auth-btn {
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3);
+}
+
+.dash-auth-divider {
+    display: flex;
+    align-items: center;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 24px;
+}
+
+.dash-auth-divider::before,
+.dash-auth-divider::after {
+    content: '';
+    flex: 1;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.dash-auth-divider span {
+    padding: 0 16px;
+}
+
+.dash-auth-google {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+}
+
+.dash-auth-google:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.dash-google-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-right: 10px;
+}
+
+.dash-auth-error {
+    color: var(--danger);
+    font-size: 14px;
+    text-align: center;
+    min-height: 20px;
+}
+
+.dash-auth-footer {
+    margin-top: 32px;
+    text-align: center;
+    font-size: 14px;
+    color: var(--text-muted);
+}
+
+.dash-auth-footer a {
+    color: var(--accent-bright);
+    text-decoration: none;
+    font-weight: 500;
+    transition: color 0.2s ease;
+}
+
+.dash-auth-footer a:hover {
+    text-decoration: underline;
+}
