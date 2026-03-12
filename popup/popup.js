@@ -144,6 +144,15 @@ async function init() {
       currentHostname = 'unknown';
     }
 
+    // Auth Gate
+    const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
+    if (authStatus.configured && !authStatus.loggedIn) {
+      document.getElementById('auth-ui').style.display = 'flex';
+      setupAuthListeners();
+      return; // Stop here, don't load main UI
+    }
+
+    document.getElementById('main-ui').style.display = 'block';
     document.getElementById('site-badge').textContent = currentHostname;
 
     // Load site data & AI settings in parallel
@@ -390,4 +399,76 @@ document.getElementById('btn-ai-track').addEventListener('click', async () => {
   }
 });
 
+// ── Auth Gate Setup ────────────────────────────────────────────
+function setupAuthListeners() {
+  const btnGoogle = document.getElementById('btn-auth-google');
+  const btnEmail = document.getElementById('btn-auth-signin');
+  const msg = document.getElementById('auth-error-msg');
+
+  document.getElementById('auth-link-setup').addEventListener('click', (e) => {
+    e.preventDefault();
+    if (chrome.runtime.openOptionsPage) {
+      chrome.runtime.openOptionsPage();
+    } else {
+      window.open(chrome.runtime.getURL('dashboard/dashboard.html'));
+    }
+  });
+
+  btnEmail.addEventListener('click', async () => {
+    const email = document.getElementById('auth-email').value;
+    const pwd = document.getElementById('auth-password').value;
+    if (!email || !pwd) {
+      msg.textContent = 'Email and password required.';
+      return;
+    }
+    
+    msg.textContent = '';
+    btnEmail.disabled = true;
+    btnEmail.textContent = 'Signing in...';
+
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd });
+      if (resp.ok) {
+        window.location.reload(); // Reload popup to show main UI
+      } else {
+        msg.textContent = resp.error;
+      }
+    } catch (err) {
+      msg.textContent = err.message;
+    } finally {
+      btnEmail.disabled = false;
+      btnEmail.textContent = 'Sign In';
+    }
+  });
+
+  btnGoogle.addEventListener('click', async () => {
+    msg.textContent = '';
+    btnGoogle.disabled = true;
+    
+    try {
+      // 1. Get Google Access Token via Chrome Identity API
+      chrome.identity.getAuthToken({ interactive: true }, async (token) => {
+        if (chrome.runtime.lastError || !token) {
+          msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
+          btnGoogle.disabled = false;
+          return;
+        }
+
+        // 2. Pass to Background for Firebase Auth
+        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN_GOOGLE', accessToken: token });
+        if (resp.ok) {
+          window.location.reload();
+        } else {
+          msg.textContent = resp.error;
+          btnGoogle.disabled = false;
+        }
+      });
+    } catch (err) {
+      msg.textContent = err.message;
+      btnGoogle.disabled = false;
+    }
+  });
+}
+
+// ── Kickoff ────────────────────────────────────────────────────
 init();

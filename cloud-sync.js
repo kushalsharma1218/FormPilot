@@ -184,6 +184,37 @@ async function cloudSignIn(email, password) {
   return authState;
 }
 
+async function cloudSignInWithGoogle(googleAccessToken) {
+  if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
+
+  const resp = await fetch(authUrl('signInWithIdp'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      postBody: `access_token=${googleAccessToken}&providerId=google.com`,
+      requestUri: 'http://localhost',
+      returnIdpCredential: true,
+      returnSecureToken: true
+    }),
+  });
+
+  const data = await resp.json();
+  if (data.error) {
+    throw new Error(friendlyAuthError(data.error.message));
+  }
+
+  const authState = {
+    userId: data.localId,
+    email: data.email,
+    displayName: data.displayName || data.email.split('@')[0],
+    idToken: data.idToken,
+    refreshToken: data.refreshToken,
+    tokenExpiresAt: Date.now() + (parseInt(data.expiresIn) * 1000),
+  };
+  await saveAuthState(authState);
+  return authState;
+}
+
 async function cloudSignOut() {
   await clearAuthState();
   await chrome.storage.local.remove(SYNC_META_KEY);

@@ -50,7 +50,21 @@ const FIREBASE_CONFIG = {
 };
 ```
 
-## Step 5: Reload Extension
+## Step 5: (Optional) Enable Google Login
+
+If you want to use the **Sign in with Google** button:
+
+1. In the **Authentication** tab of Firebase Console, click "Add new provider" and select **Google**. Enable it and save.
+2. Go to [Google Cloud Console](https://console.cloud.google.com/) (make sure you are in your Firebase project).
+3. Search for "APIs & Services" -> **Credentials**.
+4. You will see an **OAuth 2.0 Client ID** that Firebase auto-generated.
+5. Create a new credential: **OAuth client ID** -> **Chrome app**.
+6. Enter your Chrome Extension ID (found in `chrome://extensions/` under "Job Autofill" with Developer Mode on, e.g., `abcdefghijklmnop...`).
+7. Copy the generated `Client ID`.
+8. Open `manifest.json` in your code and replace `"YOUR_GOOGLE_OAUTH_CLIENT_ID"` with your copied ID.
+9. *Note: If publishing the extension, or packing it, ensure you update the Key/Extension ID.*
+
+## Step 6: Reload Extension
 1. Go to `chrome://extensions/`
 2. Click the reload icon `↻` on the Job Autofill extension.
-3. Open the Dashboard Settings tab, and you can now Sign Up and start syncing!
+3. Open the extension popup, and you will be asked to sign in to access your data!

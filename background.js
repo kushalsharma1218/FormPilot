@@ -300,6 +300,14 @@ async function handleMessage(msg, sender) {
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
+    case 'CLOUD_SIGN_IN_GOOGLE': {
+      if (!msg.accessToken) return { ok: false, error: 'Google Access Token is required' };
+      const auth = await cloudSignInWithGoogle(msg.accessToken);
+      // Auto-pull cloud data on login
+      try { await pullAllFromCloud(); } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
+      return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
+    }
+
     case 'CLOUD_SIGN_OUT': {
       await cloudSignOut();
       return { ok: true };
