@@ -1,6 +1,7 @@
-// background.js — Service Worker (v2.1 Refactored)
+// background.js — Service Worker (v2.2 with Cloud Sync)
 
 importScripts('ai-service.js');
+importScripts('cloud-sync.js');
 
 const STORAGE_KEY = 'autofill_data';
 const GLOBAL_STORAGE_KEY = 'global_profile_data';
@@ -94,6 +95,7 @@ async function handleMessage(msg, sender) {
       if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {} };
       data.sites[siteKey].fields = Object.assign({}, data.sites[siteKey].fields, msg.fields || {});
       await saveData(data);
+      queueCloudSync();
       return { ok: true };
     }
 
@@ -143,6 +145,7 @@ async function handleMessage(msg, sender) {
         return { ok: false, error: 'Invalid profile data' };
       }
       await saveGlobalProfile(msg.profile);
+      queueCloudSync();
       return { ok: true };
     }
 
@@ -155,6 +158,7 @@ async function handleMessage(msg, sender) {
     case 'AI_SAVE_SETTINGS': {
       if (!msg.settings) return { ok: false, error: 'Missing settings' };
       await saveAiSettings(msg.settings);
+      queueCloudSync();
       return { ok: true };
     }
 
@@ -264,10 +268,85 @@ async function handleMessage(msg, sender) {
     case 'APP_DELETE': {
       if (!msg.id) return { ok: false, error: 'Application ID is required' };
       const apps = await deleteApplication(msg.id);
+      queueCloudSync();
       return { ok: true, apps };
+    }
+
+    // ── Cloud Sync ────────────────────────────────────────────────
+    case 'CLOUD_GET_STATUS': {
+      const auth = await getAuthState();
+      const meta = await getSyncMeta();
+      return {
+        configured: isCloudConfigured(),
+        loggedIn: !!auth,
+        user: auth ? { email: auth.email, displayName: auth.displayName } : null,
+        lastSync: meta,
+      };
+    }
+
+    case 'CLOUD_SIGN_UP': {
+      if (!msg.email || !msg.password) return { ok: false, error: 'Email and password are required' };
+      const auth = await cloudSignUp(msg.email, msg.password, msg.displayName || '');
+      // Auto-push local data to cloud on signup
+      try { await pushAllToCloud(); } catch (e) { console.warn('[Cloud] Post-signup push failed:', e); }
+      return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
+    }
+
+    case 'CLOUD_SIGN_IN': {
+      if (!msg.email || !msg.password) return { ok: false, error: 'Email and password are required' };
+      const auth = await cloudSignIn(msg.email, msg.password);
+      // Auto-pull cloud data on login
+      try { await pullAllFromCloud(); } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
+      return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
+    }
+
+    case 'CLOUD_SIGN_OUT': {
+      await cloudSignOut();
+      return { ok: true };
+    }
+
+    case 'CLOUD_RESET_PASSWORD': {
+      if (!msg.email) return { ok: false, error: 'Email is required' };
+      await cloudResetPassword(msg.email);
+      return { ok: true };
+    }
+
+    case 'CLOUD_PUSH': {
+      await pushAllToCloud();
+      return { ok: true };
+    }
+
+    case 'CLOUD_PULL': {
+      await pullAllFromCloud();
+      return { ok: true };
+    }
+
+    case 'CLOUD_SYNC': {
+      // Pull first (get latest), then push (upload merged)
+      await pullAllFromCloud();
+      await pushAllToCloud();
+      return { ok: true };
     }
 
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
+}
+
+// ── Auto Cloud Sync (debounced) ────────────────────────────────
+let syncTimer = null;
+function queueCloudSync() {
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    try {
+      const auth = await getAuthState();
+      if (auth && isCloudConfigured()) {
+        console.log('[Cloud] Auto-syncing...');
+        await pushAllToCloud();
+        console.log('[Cloud] Auto-sync complete.');
+      }
+    } catch (err) {
+      console.warn('[Cloud] Auto-sync failed:', err.message);
+    }
+  }, 5000); // 5 second debounce
 }

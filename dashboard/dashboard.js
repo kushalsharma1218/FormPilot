@@ -138,6 +138,7 @@ async function loadAllData() {
         renderInterviewAppSelect();
         renderDisabledSites();
         renderAiSettings();
+        renderCloudSync();
     } catch (err) {
         console.error('[Dashboard] Render error:', err);
     }
@@ -1137,5 +1138,147 @@ document.getElementById('btn-nuke').addEventListener('click', () => {
     });
 });
 
+// ── Cloud Sync ─────────────────────────────────────────────────
+async function renderCloudSync() {
+    const statusResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
+    const { configured, loggedIn, user, lastSync } = statusResp;
+
+    const msgEl = document.getElementById('cloud-auth-msg');
+    const badge = document.getElementById('cloud-status-badge');
+    const authForms = document.getElementById('cloud-auth-forms');
+    const loggedInView = document.getElementById('cloud-logged-in');
+
+    msgEl.textContent = '';
+    
+    if (!configured) {
+        badge.textContent = 'Not Configured';
+        badge.style.background = 'rgba(239, 68, 68, 0.12)';
+        badge.style.color = 'var(--red-400)';
+        msgEl.textContent = 'Cloud sync requires Firebase config in setup.';
+        return;
+    }
+
+    if (loggedIn && user) {
+        authForms.style.display = 'none';
+        loggedInView.style.display = 'block';
+        badge.textContent = 'Connected';
+        badge.style.background = 'rgba(34, 197, 94, 0.12)';
+        badge.style.color = 'var(--green-400)';
+
+        document.getElementById('cloud-user-name').textContent = user.displayName || 'Job Hunter';
+        document.getElementById('cloud-user-email').textContent = user.email;
+
+        const timeStr = lastSync?.lastPushedAt || lastSync?.lastPulledAt 
+            ? new Date(lastSync.lastPushedAt || lastSync.lastPulledAt).toLocaleString() 
+            : 'Never';
+        document.getElementById('cloud-last-sync').textContent = timeStr;
+    } else {
+        authForms.style.display = 'grid';
+        loggedInView.style.display = 'none';
+        badge.textContent = 'Disconnected';
+        badge.style.background = 'rgba(251, 191, 36, 0.12)';
+        badge.style.color = 'var(--amber-400)';
+    }
+}
+
+document.getElementById('btn-cloud-signin').addEventListener('click', async () => {
+    const email = document.getElementById('cloud-email').value;
+    const pwd = document.getElementById('cloud-password').value;
+    const msg = document.getElementById('cloud-auth-msg');
+    const btn = document.getElementById('btn-cloud-signin');
+
+    if (!email || !pwd) {
+        msg.textContent = '❌ Email and password required.';
+        msg.className = 'status-msg error';
+        return;
+    }
+
+    setLoading(btn, true);
+    msg.textContent = 'Signing in...';
+    msg.className = 'status-msg';
+    
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd });
+        if (resp.ok) {
+            msg.textContent = '✓ Sign in successful!';
+            msg.className = 'status-msg success';
+            document.getElementById('cloud-email').value = '';
+            document.getElementById('cloud-password').value = '';
+            await loadAllData();
+        } else {
+            msg.textContent = '❌ ' + resp.error;
+            msg.className = 'status-msg error';
+        }
+    } catch (err) {
+        msg.textContent = '❌ ' + err.message;
+        msg.className = 'status-msg error';
+    } finally {
+        setLoading(btn, false);
+    }
+});
+
+document.getElementById('btn-cloud-signup').addEventListener('click', async () => {
+    const email = document.getElementById('cloud-email').value;
+    const pwd = document.getElementById('cloud-password').value;
+    const msg = document.getElementById('cloud-auth-msg');
+    const btn = document.getElementById('btn-cloud-signup');
+
+    if (!email || !pwd) {
+        msg.textContent = '❌ Email and password required.';
+        msg.className = 'status-msg error';
+        return;
+    }
+
+    setLoading(btn, true);
+    msg.textContent = 'Creating account...';
+    msg.className = 'status-msg';
+    
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_UP', email, password: pwd });
+        if (resp.ok) {
+            msg.textContent = '✓ Account created & logged in!';
+            msg.className = 'status-msg success';
+            document.getElementById('cloud-email').value = '';
+            document.getElementById('cloud-password').value = '';
+            await loadAllData();
+        } else {
+            msg.textContent = '❌ ' + resp.error;
+            msg.className = 'status-msg error';
+        }
+    } catch (err) {
+        msg.textContent = '❌ ' + err.message;
+        msg.className = 'status-msg error';
+    } finally {
+        setLoading(btn, false);
+    }
+});
+
+document.getElementById('btn-cloud-sync').addEventListener('click', async () => {
+    const btn = document.getElementById('btn-cloud-sync');
+    setLoading(btn, true);
+    showToast('Syncing with cloud...', 'success');
+    
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SYNC' });
+        if (resp.ok) {
+            showToast('✓ Cloud sync complete', 'success');
+            await loadAllData();
+        } else {
+            showToast('❌ Sync failed: ' + resp.error, 'error');
+        }
+    } catch (err) {
+        showToast('❌ Sync failed: ' + err.message, 'error');
+    } finally {
+        setLoading(btn, false);
+    }
+});
+
+document.getElementById('btn-cloud-signout').addEventListener('click', async () => {
+    await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
+    showToast('Signed out of cloud sync', 'success');
+    await loadAllData();
+});
+
 // ── Init ───────────────────────────────────────────────────────
 loadAllData();
+

@@ -582,6 +582,57 @@
                     </div>
                 </div>
 
+                <!-- Cloud Sync -->
+                <div class="card card-highlight">
+                    <div class="card-header">
+                        <h2>☁️ Cloud Sync (Cross-Device)</h2>
+                        <span class="card-badge" id="cloud-status-badge">Disconnected</span>
+                    </div>
+                    <p class="card-hint">Sign in to securely sync your profiles, sites, and applications across all your devices.</p>
+                    
+                    <!-- Not Logged In -->
+                    <div id="cloud-auth-forms" class="form-grid">
+                        <div class="form-group">
+                            <label>Email</label>
+                            <input type="email" id="cloud-email" placeholder="you@example.com">
+                        </div>
+                        <div class="form-group">
+                            <label>Password</label>
+                            <input type="password" id="cloud-password" placeholder="••••••••">
+                        </div>
+                        <div class="form-group full-width" style="margin-top: 8px;">
+                            <div class="data-actions">
+                                <button class="btn btn-primary" id="btn-cloud-signin">Sign In</button>
+                                <button class="btn btn-secondary" id="btn-cloud-signup">Create Account</button>
+                            </div>
+                            <div id="cloud-auth-msg" class="status-msg" style="margin-top: 8px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Logged In -->
+                    <div id="cloud-logged-in" style="display: none;">
+                        <div style="background: var(--bg-surface); padding: 16px; border-radius: var(--radius-sm); margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between;">
+                            <div>
+                                <div style="font-weight: 600; color: var(--text-main); font-size: 14px;" id="cloud-user-name">User Name</div>
+                                <div style="color: var(--text-sec); font-size: 13px;" id="cloud-user-email">user@example.com</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 4px;">Last Synced</div>
+                                <div style="font-size: 12px; font-weight: 500; color: var(--green-400);" id="cloud-last-sync">Just now</div>
+                            </div>
+                        </div>
+                        <div class="data-actions">
+                            <button class="btn btn-secondary" id="btn-cloud-sync">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3"/>
+                                </svg>
+                                Sync Now
+                            </button>
+                            <button class="btn btn-danger" id="btn-cloud-signout">Sign Out</button>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Export / Import -->
                 <div class="card">
                     <div class="card-header">
