@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Job Autofill — AI Copilot",
-  "version": "2.0.0",
-  "description": "AI-powered job application assistant: autofill, resume tailoring, match scoring, cover letters, interview prep & application tracking.",
+  "version": "2.2.0",
+  "description": "AI-powered job application assistant: autofill, resume tailoring, match scoring, interview prep & application tracking. Works with free on-device AI — no API key needed!",
   "permissions": [
     "storage",
     "activeTab",
     "scripting",
     "tabs",
-    "sidePanel"
+    "sidePanel",
+    "aiLanguageModelOriginTrial"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -44,5 +45,16 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "dashboard/pdf.worker.min.js",
+        "dashboard/pdf.min.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
 }

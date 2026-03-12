@@ -113,13 +113,46 @@ Resume text:
 ${resumeText}
 """`;
 
-        const result = await activeModel.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig: {
-                temperature: 0.1,
-                responseMimeType: "application/json"
+        // Retry logic for rate limiting / quota issues
+        let result;
+        let lastErr;
+
+        const modifiedPrompt = prompt + '\n\nIMPORTANT: Return ONLY a valid JSON object or array. Do not include markdown blocks or any other text.';
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                result = await activeModel.generateContent({
+                    contents: [{ role: 'user', parts: [{ text: modifiedPrompt }] }],
+                    generationConfig: {
+                        temperature: 0.1
+                    }
+                });
+                break; // success
+            } catch (genErr) {
+                lastErr = genErr;
+                const errMsg = genErr.message || '';
+                if (errMsg.includes('quota') || errMsg.includes('rate') || errMsg.includes('429') || errMsg.includes('free_tier')) {
+                    const waitMs = 2000 * Math.pow(2, attempt);
+                    console.warn(`[Backend] Rate limit/quota error on attempt ${attempt + 1}. Waiting ${waitMs}ms...`);
+                    await new Promise(r => setTimeout(r, waitMs));
+                    continue;
+                }
+                throw genErr; // non-retryable error
             }
-        });
+        }
+
+        if (!result) {
+            const errMsg = lastErr?.message || 'Unknown error';
+            if (errMsg.includes('quota') || errMsg.includes('free_tier') || errMsg.includes('limit: 0')) {
+                return res.status(429).json({
+                    error: 'API quota exceeded. Your Gemini free tier may be exhausted. ' +
+                        'Please enable billing on your Google Cloud project at https://console.cloud.google.com/billing, ' +
+                        'or create a new API key at https://aistudio.google.com/apikey, ' +
+                        'or wait for your quota to reset (usually resets daily).'
+                });
+            }
+            throw lastErr;
+        }
 
         const responseText = result.response.text();
         let parsedData;

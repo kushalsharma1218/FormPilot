@@ -799,74 +799,120 @@ function attachRecorder() {
 
 // ── Incoming Messages (from popup) ───────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || !msg.type) return false;
+
   if (msg.type === 'MANUAL_SAVE') {
-    const fields = getFormFields();
-    if (Object.keys(fields).length > 0) {
-      chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields }, () => {
-        sendResponse({ ok: true, count: Object.keys(fields).length });
-      });
-    } else {
+    try {
+      const fields = getFormFields();
+      const count = Object.keys(fields).length;
+      if (count > 0) {
+        chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields })
+          .then(() => sendResponse({ ok: true, count }))
+          .catch(() => sendResponse({ ok: false, count: 0 }));
+      } else {
+        sendResponse({ ok: false, count: 0 });
+      }
+    } catch (err) {
+      console.error('[Job Autofill] MANUAL_SAVE error:', err);
       sendResponse({ ok: false, count: 0 });
     }
-    return true; // async
+    return true;
   }
 
   if (msg.type === 'MANUAL_AUTOFILL') {
-    chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }).then(resp => {
-      if (resp?.site?.fields) {
-        fillFields(resp.site.fields);
-        sendResponse({ ok: true });
-      } else {
+    chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname })
+      .then(resp => {
+        if (resp?.site?.fields && Object.keys(resp.site.fields).length > 0) {
+          fillFields(resp.site.fields);
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false });
+        }
+      })
+      .catch(err => {
+        console.error('[Job Autofill] MANUAL_AUTOFILL error:', err);
         sendResponse({ ok: false });
-      }
-    });
-    return true; // async
+      });
+    return true;
   }
 
   if (msg.type === 'EXTRACT_PAGE_TEXT') {
-    // Try to get main content, otherwise fallback to body
-    let container = document.querySelector('main, [role="main"], article, .job-description, #job-description, .posting-content, .job-details');
-    if (!container) container = document.body;
+    try {
+      let container = document.querySelector('main, [role="main"], article, .job-description, #job-description, .posting-content, .job-details');
+      if (!container) container = document.body;
 
-    let text = container.innerText || '';
-    // Basic cleanup: collapse whitespace
-    text = text.replace(/\s+/g, ' ').trim();
-    // Truncate to avoid massive payloads (15k chars is usually plenty for a JD)
-    if (text.length > 15000) text = text.substring(0, 15000);
+      let text = (container.innerText || '').replace(/\s+/g, ' ').trim();
+      if (text.length > 15000) text = text.substring(0, 15000);
 
-    sendResponse({ ok: true, text });
+      sendResponse({ ok: true, text });
+    } catch (err) {
+      sendResponse({ ok: false, text: '' });
+    }
     return true;
   }
+
+  return false;
 });
 
+// ── Helper: Check if extension context is still valid ─────────
+function isExtensionValid() {
+  try {
+    return !!chrome.runtime?.id;
+  } catch {
+    return false;
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────
+let initRunning = false;
 async function init() {
-  console.log(`[Job Autofill] Initializing on ${location.href}`);
+  if (initRunning) return;
+  if (!isExtensionValid()) return;
+  initRunning = true;
 
-  const resp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname });
-  const site = resp?.site;
-  if (site?.disabled) {
-    console.log(`[Job Autofill] Extension explicitly disabled for this site.`);
-    return;
+  try {
+    console.log(`[Job Autofill] Initializing on ${location.href}`);
+
+    const resp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname });
+    const site = resp?.site;
+    if (site?.disabled) {
+      console.log(`[Job Autofill] Extension explicitly disabled for this site.`);
+      return;
+    }
+
+    // Always attach the recorder so we can prompt to save on any site
+    attachRecorder();
+
+    const profileResp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
+    currentGlobalProfile = profileResp?.profile || {};
+
+    if (!site?.enabled) return;
+
+    const savedCount = Object.keys(site.fields || {}).length;
+    const globalCount = Object.keys(currentGlobalProfile || {}).length;
+    if (savedCount > 0 || globalCount > 0) {
+      // Small delay to let the page fully render
+      setTimeout(() => showAutofillBanner(site.fields || {}), 800);
+    }
+  } catch (err) {
+    // Extension context invalidated (e.g., extension was updated/reloaded)
+    if (err.message?.includes('Extension context invalidated')) {
+      console.log('[Job Autofill] Extension context invalidated, stopping.');
+      return;
+    }
+    console.error('[Job Autofill] Init error:', err);
+  } finally {
+    initRunning = false;
   }
+}
 
-  // Always attach the recorder so we can prompt to save on any site
-  attachRecorder();
-
-  const profileResp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
-  currentGlobalProfile = profileResp?.profile || {};
-
-  // Resolve the effective site key (may be custom-renamed by user)
-  const siteKey = resp?.siteKey || hostname;
-
-  if (!site?.enabled) return;
-
-  const savedCount = Object.keys(site.fields || {}).length;
-  const globalCount = Object.keys(currentGlobalProfile || {}).length;
-  if (savedCount > 0 || globalCount > 0) {
-    // Small delay to let the page fully render
-    setTimeout(() => showAutofillBanner(site.fields || {}), 800);
-  }
+// ── Debounced init for SPA navigation ──────────────────────────
+let reinitTimer = null;
+function debouncedInit() {
+  if (reinitTimer) clearTimeout(reinitTimer);
+  reinitTimer = setTimeout(() => {
+    if (isExtensionValid()) init();
+  }, 300);
 }
 
 // Initial run
@@ -875,18 +921,22 @@ init();
 // Handle SPA navigation (hash changes)
 window.addEventListener('hashchange', () => {
   console.log('[Job Autofill] Hash change detected, re-initializing...');
-  init();
+  debouncedInit();
 });
 
-// Also watch for major DOM changes that might indicate a page transition in some SPAs
+// Watch for path changes in SPAs
 let lastPath = location.pathname + location.search + location.hash;
 const navObserver = new MutationObserver(() => {
   const currentPath = location.pathname + location.search + location.hash;
   if (currentPath !== lastPath) {
     lastPath = currentPath;
-    console.log('[Job Autofill] Path change detected via MutationObserver, re-initializing...');
-    init();
+    console.log('[Job Autofill] Path change detected, re-initializing...');
+    debouncedInit();
   }
 });
-navObserver.observe(document.head, { childList: true, subtree: true });
-navObserver.observe(document.body, { childList: true });
+try {
+  if (document.head) navObserver.observe(document.head, { childList: true, subtree: true });
+  if (document.body) navObserver.observe(document.body, { childList: true });
+} catch (err) {
+  console.warn('[Job Autofill] Could not attach navigation observer:', err.message);
+}

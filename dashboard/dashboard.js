@@ -81,6 +81,24 @@ document.getElementById('modal-confirm').addEventListener('click', async () => {
     confirmCallback = null;
 });
 
+// Close modals with Escape key or by clicking overlay
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        document.getElementById('confirm-modal').hidden = true;
+        document.getElementById('add-app-modal').hidden = true;
+        confirmCallback = null;
+    }
+});
+
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) {
+            overlay.hidden = true;
+            confirmCallback = null;
+        }
+    });
+});
+
 // ── Tab Navigation ─────────────────────────────────────────────
 document.querySelectorAll('.nav-item').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -110,14 +128,19 @@ async function loadAllData() {
         applications = appsResp?.apps || [];
     } catch (err) {
         console.error('[Dashboard] Load error:', err);
+        showToast('Failed to load data. Please reload.', 'error');
     }
-    renderOverview();
-    renderSites();
-    renderProfile();
-    renderTracker();
-    renderInterviewAppSelect();
-    renderDisabledSites();
-    renderAiSettings();
+    try {
+        renderOverview();
+        renderSites();
+        renderProfile();
+        renderTracker();
+        renderInterviewAppSelect();
+        renderDisabledSites();
+        renderAiSettings();
+    } catch (err) {
+        console.error('[Dashboard] Render error:', err);
+    }
 }
 
 // ── OVERVIEW TAB ───────────────────────────────────────────────
@@ -235,8 +258,12 @@ function attachSiteListeners() {
             const site = allData.sites[hostname];
             if (site) {
                 site.fields[input.dataset.key] = input.value;
-                await chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields: site.fields });
-                showToast('✓ Field updated', 'success');
+                try {
+                    await chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields: site.fields });
+                    showToast('✓ Field updated', 'success');
+                } catch (err) {
+                    showToast('⚠ Failed to save field', 'error');
+                }
             }
         });
     });
@@ -460,73 +487,98 @@ document.getElementById('resume-file-input').addEventListener('change', async (e
     const file = e.target.files[0];
     if (!file) return;
 
-    if (file.name.toLowerCase().endsWith('.pdf')) {
-        if (!aiSettings || !aiSettings.apiKey || !aiSettings.apiKey.trim()) {
-            showToast('Please enter your Gemini API Key in the Settings tab first.', 'error');
-            e.target.value = '';
-            return;
-        }
+    const btn = document.getElementById('btn-parse-resume');
+    const statusEl = document.getElementById('parse-status');
 
-        const btn = document.getElementById('btn-parse-resume');
-        const statusEl = document.getElementById('parse-status');
+    if (file.name.toLowerCase().endsWith('.pdf')) {
+        // Extract text from PDF using local pdf.js bundle
         setLoading(btn, true);
-        statusEl.textContent = 'Uploading and Parsing PDF...';
+        statusEl.textContent = 'Extracting text from PDF...';
         statusEl.className = 'status-msg success';
 
-        const formData = new FormData();
-        formData.append('resume', file);
-
-        const headers = {};
-        if (aiSettings && aiSettings.apiKey) {
-            headers['x-gemini-api-key'] = aiSettings.apiKey;
-        }
-
         try {
-            const response = await fetch('http://localhost:3000/api/parse-resume', {
-                method: 'POST',
-                headers: headers,
-                body: formData
-            });
-
-            if (!response.ok) {
-                const errData = await response.json().catch(() => ({}));
-                throw new Error(errData.error || 'Server returned ' + response.status);
+            if (!window.pdfjsLib) {
+                throw new Error('PDF library failed to load locally.');
             }
 
-            const result = await response.json();
-            if (!result.success) {
-                throw new Error(result.error || 'Failed to parse PDF');
+            // Set the worker source safely within the extension directory
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL('dashboard/pdf.worker.min.js');
+
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+            let fullText = '';
+            let extractedLinks = [];
+
+            for (let i = 1; i <= pdf.numPages; i++) {
+                const page = await pdf.getPage(i);
+
+                // 1. Extract raw text
+                const content = await page.getTextContent();
+                const pageText = content.items.map(item => item.str).join(' ');
+                fullText += pageText + '\n';
+
+                // 2. Extract embedded annotations (hyperlinks)
+                const annotations = await page.getAnnotations();
+                annotations.forEach(anno => {
+                    if (anno.subtype === 'Link' && anno.url) {
+                        extractedLinks.push(anno.url);
+                    }
+                });
             }
 
-            const parsed = result.data;
-            Object.entries(parsed).forEach(([key, value]) => {
-                if (value && (typeof value === 'string' ? value.trim() : true)) {
-                    globalProfile[key] = value;
-                }
-            });
+            if (!fullText.trim()) {
+                throw new Error('This PDF may be image-based or encrypted. Please copy-paste your resume text into the box instead.');
+            }
 
-            await chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile: globalProfile });
-            renderProfile();
-            renderOverview();
-            statusEl.textContent = '✓ PDF parsed! Profile updated.';
-            showToast('✓ PDF parsed and profile populated!', 'success');
+            // 3. Fallback: Manually regex scrape for any un-clickable text URLs (like github.com/user)
+            const urlRegex = /(?:https?:\/\/)?(?:www\.)?(?:linkedin\.com\/in\/|github\.com\/|[\w-]+\.(?:com|net|org|io|me))\S+/gi;
+            const textUrls = fullText.match(urlRegex) || [];
+
+            extractedLinks = [...extractedLinks, ...textUrls];
+
+            // Append extracted URLs to the end of the text so the AI parser can see them
+            if (extractedLinks.length > 0) {
+                // Remove duplicates and clean trailing punctuation
+                extractedLinks = [...new Set(extractedLinks.map(u => u.replace(/[.,:)]$/, '')))];
+                fullText += '\n\n--- DETECTED URLS (USE THESE FOR LINKEDIN/GITHUB/PORTFOLIO) ---\n';
+                fullText += extractedLinks.join('\n');
+            }
+
+            document.getElementById('resume-text').value = fullText.trim();
+            statusEl.textContent = '✓ PDF text extracted! Parsing with AI...';
+
+            // Auto-trigger AI parsing
+            setTimeout(() => document.getElementById('btn-parse-resume').click(), 100);
 
         } catch (err) {
             statusEl.textContent = '✗ ' + err.message;
             statusEl.className = 'status-msg error';
-            showToast('Failed: ' + err.message, 'error');
-        } finally {
+            showToast('PDF: ' + err.message, 'error');
             setLoading(btn, false);
         }
     } else {
+        // Text file — load directly
         const text = await file.text();
         document.getElementById('resume-text').value = text;
+        statusEl.textContent = '✓ File loaded! Parsing with AI...';
+        statusEl.className = 'status-msg success';
+        // Auto-trigger AI parsing
+        setTimeout(() => document.getElementById('btn-parse-resume').click(), 100);
     }
     e.target.value = '';
 });
+
 document.getElementById('btn-parse-resume').addEventListener('click', async () => {
     const text = document.getElementById('resume-text').value.trim();
     if (!text) { showToast('Please paste or upload your resume text first', 'error'); return; }
+
+    // Check if AI is enabled
+    if (!aiSettings.enabled) {
+        showToast('Please enable AI in the Settings tab first', 'error');
+        return;
+    }
+
     const btn = document.getElementById('btn-parse-resume');
     const statusEl = document.getElementById('parse-status');
     setLoading(btn, true);
@@ -614,7 +666,6 @@ function renderTracker() {
                     <textarea data-appnotes="${app.id}" placeholder="Add personal notes...">${escHtml(app.notes || '')}</textarea>
                 </div>
                 <div class="app-card-actions-row">
-                    <button class="btn btn-secondary btn-sm" data-action="coverletter" data-app-id="${app.id}">✍️ Cover Letter</button>
                     <button class="btn btn-secondary btn-sm" data-action="interview" data-app-id="${app.id}">💬 Interview Prep</button>
                     <button class="btn btn-secondary btn-sm" data-action="followup" data-app-id="${app.id}">📧 Follow-up</button>
                     <button class="btn btn-secondary btn-sm" data-action="tailor" data-app-id="${app.id}">📄 Tailor Resume</button>
@@ -666,13 +717,7 @@ function attachTrackerListeners() {
             });
         });
     });
-    document.querySelectorAll('[data-action="coverletter"]').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const app = applications.find(a => a.id === btn.dataset.appId);
-            if (app) openCoverLetterModal(app);
-        });
-    });
+
     document.querySelectorAll('[data-action="interview"]').forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -773,50 +818,7 @@ document.getElementById('add-app-save').addEventListener('click', async () => {
     }
 });
 
-// ── COVER LETTER MODAL ─────────────────────────────────────────
-let currentCoverLetterApp = null;
-function openCoverLetterModal(app) {
-    currentCoverLetterApp = app;
-    document.getElementById('cl-output').value = '';
-    document.getElementById('cl-output').removeAttribute('readonly');
-    document.getElementById('cover-letter-modal').hidden = false;
-}
-document.getElementById('cl-close').addEventListener('click', () => {
-    document.getElementById('cover-letter-modal').hidden = true;
-});
-document.getElementById('cl-copy').addEventListener('click', async () => {
-    const text = document.getElementById('cl-output').value;
-    if (text) {
-        await navigator.clipboard.writeText(text);
-        showToast('✓ Copied to clipboard', 'success');
-    }
-});
-document.getElementById('btn-generate-cl').addEventListener('click', async () => {
-    if (!currentCoverLetterApp?.jobDescription) {
-        showToast('No job description. Edit the application and add one.', 'error');
-        return;
-    }
-    const btn = document.getElementById('btn-generate-cl');
-    const statusEl = document.getElementById('cl-status');
-    setLoading(btn, true);
-    statusEl.textContent = 'Generating...';
-    statusEl.className = 'status-msg success';
-    try {
-        const tone = document.getElementById('cl-tone').value;
-        const resp = await chrome.runtime.sendMessage({
-            type: 'AI_COVER_LETTER',
-            jobDescription: currentCoverLetterApp.jobDescription,
-            tone
-        });
-        if (resp.ok) {
-            document.getElementById('cl-output').value = resp.letter;
-            statusEl.textContent = '✓ Generated!';
-        } else throw new Error(resp.error);
-    } catch (err) {
-        statusEl.textContent = '✗ ' + err.message;
-        statusEl.className = 'status-msg error';
-    } finally { setLoading(btn, false); }
-});
+
 
 // ── INTERVIEW PREP TAB ─────────────────────────────────────────
 function renderInterviewAppSelect() {
@@ -899,11 +901,78 @@ function renderQuestionsToAsk(containerId, questions) {
 
 // ── SETTINGS TAB ───────────────────────────────────────────────
 function renderAiSettings() {
-    document.getElementById('ai-provider').value = aiSettings.provider || 'gemini';
+    const provider = aiSettings.provider || 'built-in';
+    document.getElementById('ai-provider').value = provider;
     document.getElementById('ai-model').value = aiSettings.model || 'gemini-2.0-flash';
     document.getElementById('ai-api-key').value = aiSettings.apiKey || '';
-    document.getElementById('ai-enabled').checked = aiSettings.enabled || false;
+    document.getElementById('ai-enabled').checked = aiSettings.enabled !== false; // default true
+
+    updateProviderUI(provider);
+    checkBuiltInAIStatus();
 }
+
+function updateProviderUI(provider) {
+    const isBuiltIn = provider === 'built-in';
+    document.getElementById('model-group').style.display = isBuiltIn ? 'none' : '';
+    document.getElementById('api-key-group').style.display = isBuiltIn ? 'none' : '';
+
+    if (!isBuiltIn) {
+        // Populate models dynamically from the registry
+        chrome.runtime.sendMessage({ type: 'AI_GET_PROVIDERS' }, (resp) => {
+            if (!resp || !resp.providers || !resp.providers[provider]) return;
+            const prov = resp.providers[provider];
+            const modelSel = document.getElementById('ai-model');
+            modelSel.innerHTML = prov.models.map(m =>
+                `<option value="${m.id}">${m.name}</option>`
+            ).join('');
+            // Set default or saved model
+            if (aiSettings.provider === provider && aiSettings.model) {
+                modelSel.value = aiSettings.model;
+            }
+            // Update key hint
+            const hint = document.getElementById('api-key-hint');
+            if (prov.keyUrl) {
+                hint.innerHTML = `Get your API key at <a href="${prov.keyUrl}" target="_blank" rel="noopener">${prov.keyUrl.replace('https://', '')}</a>`;
+            }
+        });
+    }
+}
+
+async function checkBuiltInAIStatus() {
+    const icon = document.getElementById('builtin-status-icon');
+    const text = document.getElementById('builtin-status-text');
+    const hint = document.getElementById('builtin-status-hint');
+    const box = document.getElementById('builtin-status');
+
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'AI_CHECK_BUILTIN' });
+        if (resp.available) {
+            icon.textContent = '✅';
+            text.textContent = 'Built-in AI is available!';
+            hint.textContent = resp.needsDownload
+                ? 'Gemini Nano model needs to download first (happens automatically)'
+                : 'Gemini Nano model is ready — free, private, on-device AI';
+            box.style.borderColor = 'rgba(52, 211, 153, 0.3)';
+            box.style.background = 'rgba(52, 211, 153, 0.06)';
+        } else {
+            icon.textContent = '⚠️';
+            text.textContent = 'Built-in AI not available';
+            hint.textContent = resp.reason || 'Chrome 138+ required. Use Groq (free) or another provider.';
+            box.style.borderColor = 'rgba(251, 191, 36, 0.3)';
+            box.style.background = 'rgba(251, 191, 36, 0.06)';
+        }
+    } catch (err) {
+        icon.textContent = '❌';
+        text.textContent = 'Could not check Built-in AI';
+        hint.textContent = 'Use Groq (free tier) or another provider as fallback';
+        box.style.borderColor = 'rgba(248, 113, 113, 0.3)';
+        box.style.background = 'rgba(248, 113, 113, 0.06)';
+    }
+}
+
+document.getElementById('ai-provider').addEventListener('change', (e) => {
+    updateProviderUI(e.target.value);
+});
 
 document.getElementById('btn-toggle-key').addEventListener('click', () => {
     const input = document.getElementById('ai-api-key');
@@ -911,10 +980,12 @@ document.getElementById('btn-toggle-key').addEventListener('click', () => {
 });
 
 document.getElementById('btn-save-ai').addEventListener('click', async () => {
+    const provider = document.getElementById('ai-provider').value;
+    const isBuiltIn = provider === 'built-in';
     const settings = {
-        provider: document.getElementById('ai-provider').value,
-        model: document.getElementById('ai-model').value,
-        apiKey: document.getElementById('ai-api-key').value.trim(),
+        provider,
+        model: isBuiltIn ? 'gemini-nano' : document.getElementById('ai-model').value,
+        apiKey: isBuiltIn ? '' : document.getElementById('ai-api-key').value.trim(),
         enabled: document.getElementById('ai-enabled').checked,
     };
     await chrome.runtime.sendMessage({ type: 'AI_SAVE_SETTINGS', settings });
@@ -930,16 +1001,19 @@ document.getElementById('btn-save-ai').addEventListener('click', async () => {
 document.getElementById('btn-test-ai').addEventListener('click', async () => {
     const btn = document.getElementById('btn-test-ai');
     const msg = document.getElementById('ai-status-msg');
+    const provider = document.getElementById('ai-provider').value;
+    const isBuiltIn = provider === 'built-in';
+
     // Temporarily save settings for testing
     const settings = {
-        provider: document.getElementById('ai-provider').value,
-        model: document.getElementById('ai-model').value,
-        apiKey: document.getElementById('ai-api-key').value.trim(),
+        provider,
+        model: isBuiltIn ? 'gemini-nano' : document.getElementById('ai-model').value,
+        apiKey: isBuiltIn ? '' : document.getElementById('ai-api-key').value.trim(),
         enabled: true,
     };
     await chrome.runtime.sendMessage({ type: 'AI_SAVE_SETTINGS', settings });
     setLoading(btn, true);
-    msg.textContent = 'Testing...';
+    msg.textContent = provider === 'built-in' ? 'Testing Built-in AI...' : 'Testing API connection...';
     msg.className = 'status-msg success';
     try {
         const resp = await chrome.runtime.sendMessage({ type: 'AI_TEST_CONNECTION' });

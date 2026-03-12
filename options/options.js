@@ -3,8 +3,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   const statusMsg = document.getElementById('save-status');
 
   // Load existing profile via background script
-  const resp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
-  const profile = resp?.profile || {};
+  let profile = {};
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
+    profile = resp?.profile || {};
+  } catch (err) {
+    console.error('[Options] Failed to load profile:', err);
+  }
 
   // Populate form
   Object.keys(profile).forEach(key => {

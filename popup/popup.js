@@ -1,17 +1,32 @@
-// popup.js
+// popup.js — Job Autofill Popup (Refactored)
 
 let currentHostname = '';
 let siteData = { enabled: false, fields: {} };
 let aiEnabled = false;
 
 // ── Utilities ──────────────────────────────────────────────────
-function showToast(msg) {
+function escHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function showToast(msg, type = 'info') {
   const existing = document.querySelector('.toast');
   if (existing) existing.remove();
   const t = document.createElement('div');
-  t.className = 'toast'; t.textContent = msg;
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
   document.body.appendChild(t);
-  setTimeout(() => t.remove(), 2200);
+  setTimeout(() => {
+    t.style.opacity = '0';
+    t.style.transform = 'translateX(-50%) translateY(8px) scale(0.95)';
+    setTimeout(() => t.remove(), 300);
+  }, 2200);
 }
 
 function renderFields(fields) {
@@ -28,32 +43,45 @@ function renderFields(fields) {
   keys.forEach(key => {
     const item = document.createElement('div');
     item.className = 'field-item';
-    item.innerHTML = `
-      <span class="field-key" title="${key}">${key}</span>
-      <input class="field-val" data-key="${key}" value="${escHtml(fields[key])}" title="${escHtml(fields[key])}"/>
-    `;
+
+    const keySpan = document.createElement('span');
+    keySpan.className = 'field-key';
+    keySpan.title = key;
+    keySpan.textContent = key;
+
+    const valInput = document.createElement('input');
+    valInput.className = 'field-val';
+    valInput.dataset.key = key;
+    valInput.value = fields[key] || '';
+    valInput.title = fields[key] || '';
+
+    item.appendChild(keySpan);
+    item.appendChild(valInput);
     list.appendChild(item);
   });
 
-  // Save inline edits on blur
+  // Save inline edits on change
   list.querySelectorAll('.field-val').forEach(input => {
     input.addEventListener('change', async () => {
-      siteData.fields[input.dataset.key] = input.value;
-      await chrome.runtime.sendMessage({
-        type: 'SAVE_FIELDS', hostname: currentHostname, fields: siteData.fields
-      });
+      try {
+        siteData.fields[input.dataset.key] = input.value;
+        await chrome.runtime.sendMessage({
+          type: 'SAVE_FIELDS', hostname: currentHostname, fields: siteData.fields
+        });
+        showToast('✓ Field updated', 'success');
+      } catch (err) {
+        showToast('⚠ Failed to save field', 'error');
+      }
     });
   });
-}
-
-function escHtml(str) {
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function updateStatusUI() {
   const tog = document.getElementById('enable-toggle');
   const sub = document.getElementById('toggle-sub');
   const st = document.getElementById('status-text');
+  const btnSave = document.getElementById('btn-save');
+  const btnFill = document.getElementById('btn-autofill');
 
   if (siteData.disabled) {
     tog.checked = false;
@@ -61,8 +89,8 @@ function updateStatusUI() {
     st.textContent = 'Blocked';
     st.className = 'stat-value inactive';
     document.body.classList.add('site-disabled');
-    document.getElementById('btn-save').disabled = true;
-    document.getElementById('btn-autofill').disabled = true;
+    btnSave.disabled = true;
+    btnFill.disabled = true;
     return;
   }
 
@@ -71,108 +99,132 @@ function updateStatusUI() {
   sub.textContent = siteData.enabled ? 'Autofill active' : 'Autofill paused';
   st.textContent = siteData.enabled ? 'Active' : 'Disabled';
   st.className = siteData.enabled ? 'stat-value active' : 'stat-value inactive';
-  document.getElementById('btn-save').disabled = !siteData.enabled;
-  document.getElementById('btn-autofill').disabled = !siteData.enabled;
+  btnSave.disabled = !siteData.enabled;
+  btnFill.disabled = !siteData.enabled;
 }
 
 function setLoading(btnId, isLoading) {
-  const btn = document.getElementById(btnId);
+  const btn = typeof btnId === 'string' ? document.getElementById(btnId) : btnId;
   if (!btn) return;
   if (isLoading) {
     btn.dataset.originalHtml = btn.innerHTML;
     btn.innerHTML = '<div class="spinner"></div>';
     btn.disabled = true;
   } else {
-    btn.innerHTML = btn.dataset.originalHtml || btn.innerHTML;
+    if (btn.dataset.originalHtml) {
+      btn.innerHTML = btn.dataset.originalHtml;
+      delete btn.dataset.originalHtml;
+    }
     btn.disabled = false;
+  }
+}
+
+// ── Safe tab messaging ─────────────────────────────────────────
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function sendToTab(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch {
+    return null;
   }
 }
 
 // ── Init ───────────────────────────────────────────────────────
 async function init() {
-  // Get active tab hostname
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   try {
-    const url = new URL(tab.url);
-    currentHostname = url.hostname.replace(/^www\./, '');
-  } catch {
-    currentHostname = 'unknown';
+    const tab = await getActiveTab();
+    try {
+      const url = new URL(tab.url);
+      currentHostname = url.hostname.replace(/^www\./, '');
+    } catch {
+      currentHostname = 'unknown';
+    }
+
+    document.getElementById('site-badge').textContent = currentHostname;
+
+    // Load site data & AI settings in parallel
+    const [siteResp, aiResp, keyResp] = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname: currentHostname }),
+      chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }),
+      chrome.runtime.sendMessage({ type: 'GET_SITE_KEY', hostname: currentHostname })
+    ]);
+
+    siteData = siteResp?.site || { enabled: false, fields: {} };
+
+    const siteKey = keyResp?.siteKey || currentHostname;
+    document.getElementById('site-key-input').value = siteKey;
+
+    // Show AI section if enabled (built-in doesn't need an API key)
+    const settings = aiResp?.settings || {};
+    aiEnabled = settings.enabled && (settings.provider === 'built-in' || !!settings.apiKey);
+    document.getElementById('ai-actions').style.display = aiEnabled ? 'block' : 'none';
+
+    updateStatusUI();
+    renderFields(siteData.fields || {});
+  } catch (err) {
+    console.error('[Popup] Init error:', err);
+    showToast('⚠ Failed to load data', 'error');
   }
-
-  document.getElementById('site-badge').textContent = currentHostname;
-
-  // Load site data & AI settings
-  const [siteResp, aiResp, keyResp] = await Promise.all([
-    chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname: currentHostname }),
-    chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }),
-    chrome.runtime.sendMessage({ type: 'GET_SITE_KEY', hostname: currentHostname })
-  ]);
-
-  siteData = siteResp?.site || { enabled: false, fields: {} };
-
-  const siteKey = keyResp?.siteKey || currentHostname;
-  document.getElementById('site-key-input').value = siteKey;
-
-  // Show AI section if enabled
-  aiEnabled = aiResp?.settings?.enabled && aiResp?.settings?.apiKey;
-  if (aiEnabled) {
-    document.getElementById('ai-actions').style.display = 'block';
-  }
-
-  updateStatusUI();
-  renderFields(siteData.fields || {});
 }
 
 // ── Events ─────────────────────────────────────────────────────
 document.getElementById('enable-toggle').addEventListener('change', async (e) => {
-  siteData.enabled = e.target.checked;
-  if (siteData.enabled) siteData.disabled = false;
-  await chrome.runtime.sendMessage({
-    type: 'SET_ENABLED',
-    hostname: currentHostname,
-    enabled: siteData.enabled,
-    clearDisabled: siteData.enabled
-  });
-  updateStatusUI();
-  showToast(siteData.enabled ? '✓ Enabled for ' + currentHostname : '✗ Disabled for ' + currentHostname);
+  try {
+    siteData.enabled = e.target.checked;
+    if (siteData.enabled) siteData.disabled = false;
+    await chrome.runtime.sendMessage({
+      type: 'SET_ENABLED',
+      hostname: currentHostname,
+      enabled: siteData.enabled,
+      clearDisabled: siteData.enabled
+    });
+    updateStatusUI();
+    showToast(siteData.enabled ? '✓ Enabled for ' + currentHostname : '✗ Disabled for ' + currentHostname);
+  } catch (err) {
+    showToast('⚠ Failed to update setting', 'error');
+  }
 });
 
 document.getElementById('btn-autofill').addEventListener('click', async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  try {
-    const resp = await chrome.tabs.sendMessage(tab.id, { type: 'MANUAL_AUTOFILL' });
-    if (resp?.ok) {
-      showToast('✓ Autofilled current page');
-    } else {
-      showToast('⚠ Enable site to autofill or save data first');
-    }
-  } catch {
-    showToast('⚠ Could not reach page — try refreshing');
+  const tab = await getActiveTab();
+  const resp = await sendToTab(tab?.id, { type: 'MANUAL_AUTOFILL' });
+  if (resp?.ok) {
+    showToast('✓ Autofilled current page', 'success');
+  } else {
+    showToast('⚠ Enable site to autofill or save data first', 'error');
   }
 });
 
 document.getElementById('btn-save').addEventListener('click', async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  try {
-    const resp = await chrome.tabs.sendMessage(tab.id, { type: 'MANUAL_SAVE' });
-    if (resp?.ok) {
+  const tab = await getActiveTab();
+  const resp = await sendToTab(tab?.id, { type: 'MANUAL_SAVE' });
+  if (resp?.ok) {
+    try {
       const fresh = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname: currentHostname });
       siteData = fresh?.site || siteData;
       renderFields(siteData.fields || {});
-      showToast(`✓ Synced ${resp.count} field(s)`);
-    } else {
-      showToast('⚠ No filled fields found on this page');
+      showToast(`✓ Synced ${resp.count} field(s)`, 'success');
+    } catch {
+      showToast(`✓ Saved ${resp.count} field(s)`, 'success');
     }
-  } catch {
-    showToast('⚠ Could not reach page — try refreshing');
+  } else {
+    showToast('⚠ No filled fields found on this page', 'error');
   }
 });
 
 document.getElementById('btn-clear').addEventListener('click', async () => {
-  await chrome.runtime.sendMessage({ type: 'CLEAR_SITE', hostname: currentHostname });
-  siteData.fields = {};
-  renderFields({});
-  showToast('🗑 Cleared data for ' + currentHostname);
+  try {
+    await chrome.runtime.sendMessage({ type: 'CLEAR_SITE', hostname: currentHostname });
+    siteData.fields = {};
+    renderFields({});
+    showToast('🗑 Cleared data for ' + currentHostname, 'success');
+  } catch (err) {
+    showToast('⚠ Failed to clear data', 'error');
+  }
 });
 
 document.getElementById('btn-settings').addEventListener('click', () => {
@@ -185,30 +237,46 @@ document.getElementById('btn-settings').addEventListener('click', () => {
 
 // Rename logic
 document.getElementById('btn-rename').addEventListener('click', async () => {
-  const newKey = document.getElementById('site-key-input').value.trim();
-  const oldKey = document.getElementById('site-badge').textContent;
-  if (!newKey || newKey === oldKey) return;
+  const input = document.getElementById('site-key-input');
+  const newKey = input.value.trim();
+  const badge = document.getElementById('site-badge');
+  const oldKey = badge.textContent;
 
-  const resp = await chrome.runtime.sendMessage({ type: 'RENAME_SITE', hostname: currentHostname, newKey: newKey });
-  if (resp?.ok) {
-    document.getElementById('site-badge').textContent = resp.newKey;
-    showToast('✓ Site key saved!');
-    const dataResp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname: currentHostname });
-    siteData = dataResp?.site || siteData;
-    renderFields(siteData.fields || {});
+  if (!newKey) {
+    showToast('⚠ Site key cannot be empty', 'error');
+    return;
+  }
+  if (newKey === oldKey) return;
+
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'RENAME_SITE', hostname: currentHostname, newKey });
+    if (resp?.ok) {
+      badge.textContent = resp.newKey;
+      showToast('✓ Site key saved!', 'success');
+      const dataResp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname: currentHostname });
+      siteData = dataResp?.site || siteData;
+      renderFields(siteData.fields || {});
+    } else {
+      showToast('⚠ Failed to rename site key', 'error');
+    }
+  } catch (err) {
+    showToast('⚠ Failed to rename site key', 'error');
   }
 });
 
 // ── AI Copilot Events ──────────────────────────────────────────
 
 async function extractJobContent() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  try {
-    const resp = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_PAGE_TEXT' });
-    return resp?.text || null;
-  } catch {
+  const tab = await getActiveTab();
+  if (!tab?.id) return null;
+
+  // Can't run on restricted pages
+  const restricted = ['chrome://', 'edge://', 'about:', 'chrome-extension://'];
+  if (restricted.some(prefix => tab.url?.startsWith(prefix))) {
     return null;
   }
+
+  return (await sendToTab(tab.id, { type: 'EXTRACT_PAGE_TEXT' }))?.text || null;
 }
 
 function showAiResult(title, content, showCopy = false) {
@@ -223,9 +291,13 @@ document.getElementById('btn-ai-close').addEventListener('click', () => {
 });
 
 document.getElementById('btn-ai-copy').addEventListener('click', async () => {
-  const text = document.getElementById('ai-result-content').innerText;
-  await navigator.clipboard.writeText(text);
-  showToast('✓ Copied to clipboard!');
+  try {
+    const text = document.getElementById('ai-result-content').innerText;
+    await navigator.clipboard.writeText(text);
+    showToast('✓ Copied to clipboard!', 'success');
+  } catch {
+    showToast('⚠ Failed to copy', 'error');
+  }
 });
 
 document.getElementById('btn-ai-upload').addEventListener('click', () => {
@@ -238,11 +310,11 @@ document.getElementById('btn-ai-upload').addEventListener('click', () => {
 
 document.getElementById('btn-ai-match').addEventListener('click', async () => {
   setLoading('btn-ai-match', true);
-  showAiResult('Match Score', 'Analyzing job description...');
+  showAiResult('Match Score', '<div style="color:var(--text-dim)">Analyzing job description...</div>');
 
   const pageText = await extractJobContent();
   if (!pageText) {
-    showAiResult('Error', 'Could not read page content. Try refreshing.');
+    showAiResult('Error', '<span style="color:var(--red)">Could not read page content.</span><br/><br/><strong>Try refreshing the page</strong> or ensuring you are on a job application site.');
     setLoading('btn-ai-match', false);
     return;
   }
@@ -251,88 +323,68 @@ document.getElementById('btn-ai-match').addEventListener('click', async () => {
     const resp = await chrome.runtime.sendMessage({ type: 'AI_SCORE_MATCH', jobDescription: pageText });
     if (resp.ok && resp.score) {
       const s = resp.score;
+      const scoreColor = s.overallScore > 75 ? 'var(--green)' : s.overallScore > 50 ? 'var(--amber)' : 'var(--red)';
       const html = `
-        <div style="font-size: 24px; font-weight: 800; color: ${s.overallScore > 75 ? 'var(--green-400)' : s.overallScore > 50 ? 'var(--amber-400)' : 'var(--red-400)'};">
-          ${s.overallScore}/100
+        <div style="font-size: 24px; font-weight: 800; color: ${scoreColor};">
+          ${Number(s.overallScore) || 0}/100
         </div>
         <div style="margin-top: 8px;"><strong>Recommendation:</strong> ${escHtml(s.recommendation)}</div>
-        <div style="margin-top: 8px;"><strong>Strengths:</strong> ${(s.keyStrengths || []).join(', ')}</div>
-        ${s.gaps && s.gaps.length > 0 ? `<div style="margin-top: 8px;"><strong>Missing:</strong> ${(s.gaps).join(', ')}</div>` : ''}
+        <div style="margin-top: 8px;"><strong>Strengths:</strong> ${escHtml((s.keyStrengths || []).join(', '))}</div>
+        ${s.gaps && s.gaps.length > 0 ? `<div style="margin-top: 8px;"><strong>Gaps:</strong> ${escHtml(s.gaps.join(', '))}</div>` : ''}
+        ${s.tips && s.tips.length > 0 ? `<div style="margin-top: 8px;"><strong>Tips:</strong> ${escHtml(s.tips.join('; '))}</div>` : ''}
       `;
       showAiResult('Match Score Result', html, false);
     } else {
-      throw new Error(resp.error || 'Failed to score');
+      throw new Error(resp.error || 'Failed to score match');
     }
   } catch (e) {
-    showAiResult('Error', String(e.message));
+    showAiResult('Error', `<span style="color:var(--red)">${escHtml(e.message)}</span>`);
   } finally {
     setLoading('btn-ai-match', false);
   }
 });
 
-document.getElementById('btn-ai-cover').addEventListener('click', async () => {
-  setLoading('btn-ai-cover', true);
-  showAiResult('Cover Letter', 'Drafting cover letter...');
-
-  const pageText = await extractJobContent();
-  if (!pageText) {
-    showAiResult('Error', 'Could not read page content.');
-    setLoading('btn-ai-cover', false);
-    return;
-  }
-
-  try {
-    const resp = await chrome.runtime.sendMessage({ type: 'AI_COVER_LETTER', jobDescription: pageText, tone: 'professional' });
-    if (resp.ok && resp.letter) {
-      showAiResult('AI Cover Letter', escHtml(resp.letter).replace(/\n/g, '<br>'), true);
-    } else {
-      throw new Error(resp.error || 'Failed to generate');
-    }
-  } catch (e) {
-    showAiResult('Error', String(e.message));
-  } finally {
-    setLoading('btn-ai-cover', false);
-  }
-});
-
 document.getElementById('btn-ai-track').addEventListener('click', async () => {
   setLoading('btn-ai-track', true);
-  showAiResult('Applications Tracker', 'Extracting job details...');
+  showAiResult('Application Tracker', '<div style="color:var(--text-dim)">Extracting job details...</div>');
 
   const pageText = await extractJobContent();
   if (!pageText) {
-    showAiResult('Error', 'Could not read page content.');
+    showAiResult('Error', '<span style="color:var(--red)">Could not read page content.</span>');
     setLoading('btn-ai-track', false);
     return;
   }
 
   try {
-    // 1. Extract info to get company name and title
+    // 1. Extract job info
     const extResp = await chrome.runtime.sendMessage({ type: 'AI_EXTRACT_JOB', pageContent: pageText });
     if (!extResp.ok || !extResp.info) throw new Error(extResp.error || 'Extraction failed');
 
     const info = extResp.info;
-    if (!info.companyName) throw new Error('Could not identify company name');
+    if (!info.companyName) throw new Error('Could not identify company name from the page');
 
     // 2. Add to tracker
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = await getActiveTab();
     const app = {
       companyName: info.companyName,
       jobTitle: info.jobTitle || 'Unknown Role',
       location: info.location || '',
       status: 'applied',
-      url: tab.url,
+      url: tab?.url || '',
       jobDescription: pageText
     };
 
     const addResp = await chrome.runtime.sendMessage({ type: 'APP_ADD', application: app });
     if (addResp.ok) {
-      showAiResult('Added to Tracker', `<strong style="color:var(--green-400)">✓ Tracked successfully!</strong><br><br>${escHtml(app.companyName)} — ${escHtml(app.jobTitle)}`, false);
+      showAiResult('Added to Tracker',
+        `<strong style="color:var(--green)">✓ Tracked successfully!</strong><br><br>${escHtml(app.companyName)} — ${escHtml(app.jobTitle)}`,
+        false
+      );
     } else {
-      throw new Error(addResp.error || 'Failed to add');
+      throw new Error(addResp.error || 'Failed to add application');
     }
   } catch (e) {
-    showAiResult('Error', String(e.message));
+    showAiResult('Error', `<span style="color:var(--red)">${escHtml(e.message)}</span>`);
   } finally {
     setLoading('btn-ai-track', false);
   }
