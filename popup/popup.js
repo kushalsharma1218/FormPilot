@@ -146,9 +146,17 @@ async function init() {
 
     // Auth Gate
     const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
-    if (authStatus.configured && !authStatus.loggedIn) {
+    if (!authStatus.loggedIn) {
       document.getElementById('auth-ui').style.display = 'flex';
       setupAuthListeners();
+      
+      if (!authStatus.configured) {
+        document.getElementById('auth-error-msg').innerHTML = 'Firebase config missing. Please read the <a href="#" id="auth-link-setup-error" style="color:var(--blue-400)">setup guide</a>.';
+        document.getElementById('auth-link-setup-error').addEventListener('click', (e) => {
+          e.preventDefault();
+          chrome.tabs.create({ url: chrome.runtime.getURL('SETUP_GUIDE.md') });
+        });
+      }
       return; // Stop here, don't load main UI
     }
 

@@ -116,6 +116,25 @@ document.getElementById('btn-view-all-apps').addEventListener('click', () => {
 // ── Data Loading ───────────────────────────────────────────────
 async function loadAllData() {
     try {
+        const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
+        if (!authStatus.loggedIn) {
+            document.getElementById('dashboard-auth-shield').style.display = 'flex';
+            document.getElementById('main-dashboard-app').style.display = 'none';
+            if (!authStatus.configured) {
+                const msg = document.getElementById('dash-auth-setup-msg');
+                msg.innerHTML = 'Firebase config missing. Please read the <a href="#" id="dash-link-setup" style="color:var(--blue-400); text-decoration:none;">setup guide</a>.';
+                const link = document.getElementById('dash-link-setup');
+                if (link) link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    chrome.tabs.create({ url: chrome.runtime.getURL('SETUP_GUIDE.md') });
+                });
+            }
+            return;
+        }
+
+        document.getElementById('dashboard-auth-shield').style.display = 'none';
+        document.getElementById('main-dashboard-app').style.display = 'flex';
+
         const [dataResp, profileResp, aiResp, appsResp] = await Promise.all([
             chrome.runtime.sendMessage({ type: 'GET_ALL_DATA' }),
             chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }),
@@ -1279,6 +1298,67 @@ document.getElementById('btn-cloud-signout').addEventListener('click', async () 
     await loadAllData();
 });
 
+// ── Dashboard Auth Listeners ───────────────────────────────────
+function setupDashAuth() {
+    const btnEmail = document.getElementById('btn-dash-signin');
+    const btnGoogle = document.getElementById('btn-dash-google');
+    const msg = document.getElementById('dash-auth-error');
+
+    btnEmail.addEventListener('click', async () => {
+        const email = document.getElementById('dash-auth-email').value;
+        const pwd = document.getElementById('dash-auth-password').value;
+        if (!email || !pwd) {
+            msg.textContent = 'Email and password required.';
+            return;
+        }
+
+        msg.textContent = '';
+        btnEmail.disabled = true;
+        btnEmail.textContent = 'Signing in...';
+
+        try {
+            const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd });
+            if (resp.ok) {
+                loadAllData();
+            } else {
+                msg.textContent = resp.error;
+            }
+        } catch (err) {
+            msg.textContent = err.message;
+        } finally {
+            btnEmail.disabled = false;
+            btnEmail.textContent = 'Sign In';
+        }
+    });
+
+    btnGoogle.addEventListener('click', async () => {
+        msg.textContent = '';
+        btnGoogle.disabled = true;
+
+        try {
+            chrome.identity.getAuthToken({ interactive: true }, async (token) => {
+                if (chrome.runtime.lastError || !token) {
+                    msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
+                    btnGoogle.disabled = false;
+                    return;
+                }
+
+                const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN_GOOGLE', accessToken: token });
+                if (resp.ok) {
+                    loadAllData();
+                } else {
+                    msg.textContent = resp.error;
+                    btnGoogle.disabled = false;
+                }
+            });
+        } catch (err) {
+            msg.textContent = err.message;
+            btnGoogle.disabled = false;
+        }
+    });
+}
+
 // ── Init ───────────────────────────────────────────────────────
+setupDashAuth();
 loadAllData();
 
