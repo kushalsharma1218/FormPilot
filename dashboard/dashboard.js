@@ -1293,8 +1293,20 @@ document.getElementById('btn-cloud-sync').addEventListener('click', async () => 
 });
 
 document.getElementById('btn-cloud-signout').addEventListener('click', async () => {
+    // 1. Clear Google Identity Cache if possible
+    try {
+        chrome.identity.getAuthToken({ interactive: false }, (token) => {
+            if (token) {
+                chrome.identity.removeCachedAuthToken({ token }, () => {
+                    console.log('Google token cleared from cache');
+                });
+            }
+        });
+    } catch (e) { console.warn('Identity clear failed:', e); }
+
+    // 2. Logout from Firebase
     await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
-    showToast('Signed out of cloud sync', 'success');
+    showToast('Signed out. Local data for this account is still saved.', 'success');
     await loadAllData();
 });
 
@@ -1335,7 +1347,10 @@ function setupDashAuth() {
         msg.textContent = '';
         btnGoogle.disabled = true;
 
-        try {
+        // Clear existing token first to force account picker
+        chrome.identity.getAuthToken({ interactive: false }, (oldToken) => {
+            if (oldToken) chrome.identity.removeCachedAuthToken({ token: oldToken });
+            
             chrome.identity.getAuthToken({ interactive: true }, async (token) => {
                 if (chrome.runtime.lastError || !token) {
                     msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
@@ -1351,10 +1366,7 @@ function setupDashAuth() {
                     btnGoogle.disabled = false;
                 }
             });
-        } catch (err) {
-            msg.textContent = err.message;
-            btnGoogle.disabled = false;
-        }
+        });
     });
 }
 

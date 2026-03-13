@@ -90,7 +90,15 @@ function getFieldKey(el) {
     if (prev.innerText.trim()) return prev.innerText.trim();
   }
 
-  // 5. Prefer name > stable id > aria-label > placeholder
+  // 5. Ancestor Text Fallback (New)
+  // If no direct label found, check the closest container for heading text
+  const container = el.closest('.form-group, .field-wrapper, .input-row, [role="group"]');
+  if (container) {
+    const heading = container.querySelector('h1, h2, h3, h4, .title, .heading');
+    if (heading && heading.innerText.trim()) return heading.innerText.trim();
+  }
+
+  // 6. Prefer name > stable id > aria-label > placeholder
   const candidates = [
     el.name,
     el.id,
@@ -300,15 +308,31 @@ function getFormFields() {
   }
 
   // Exclude: hidden, submit, button, reset, file, PASSWORD (security!), single-char OTPs
-  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select';
+  // ── Deep Tree / Shadow DOM Scan (New) ──
+  // Pierces Shadow Roots and captures fields even in complex web components
+  const allElements = [];
+  const walk = (root) => {
+    const nodes = root.querySelectorAll(selectors + ', [role="combobox"], [role="listbox"], input[type=radio]');
+    nodes.forEach(n => allElements.push(n));
+    // Check for Shadow Roots
+    root.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    });
+  };
+  walk(document);
 
-  // Handle radio buttons as a group — record the selected value per name
-  const radioGroups = {};
-  document.querySelectorAll('input[type=radio]').forEach(el => {
-    if (!el.name) return;
-    if (el.checked) radioGroups[el.name] = el.value;
-  });
-  Object.assign(fields, radioGroups);
+  // Filter out: hidden, submit, button, reset, file, PASSWORD, etc.
+  const queryNodes = (nodes) => {
+    const found = [];
+    nodes.forEach(el => {
+      const type = (el.type || '').toLowerCase();
+      if (type === 'hidden' || type === 'submit' || type === 'password' || type === 'file') return;
+      found.push(el);
+    });
+    return found;
+  };
+  
+  const validElements = queryNodes(allElements);
 
   // ── Index-aware capture: duplicate keys get suffixed [0], [1], etc. ──
   const elements = [];
@@ -336,15 +360,13 @@ function getFormFields() {
       const vals = Array.from(el.selectedOptions).map(o => o.value);
       if (vals.length) fields[fieldKey] = vals.join(',');
     } else if (el.tagName === 'SELECT') {
-      // Skip placeholder options (empty value or value === text like "-- Select --")
       const opt = el.options[el.selectedIndex];
-      const val = el.value;
-      if (val && opt && opt.value !== '' && !/^[-\s]*(select|choose|pick)/i.test(opt.text)) {
-        fields[fieldKey] = val;
+      if (opt && opt.value !== '' && !/^[-\s]*(select|choose|pick)/i.test(opt.text)) {
+        // Store BOTH value and text as a combined string for better matching across sites
+        fields[fieldKey] = opt.text.trim(); 
       }
     } else {
       const value = el.value.trim();
-      // Skip if value matches the placeholder exactly (browser autofill ghost text)
       if (value && value !== el.placeholder) {
         fields[fieldKey] = value;
       }
@@ -447,11 +469,35 @@ function fillFields(savedFields) {
       triggerEvents(el);
     } else if (el.tagName === 'SELECT' && el.multiple) {
       const vals = String(val).split(',');
-      Array.from(el.options).forEach(opt => { opt.selected = vals.includes(opt.value); });
+      Array.from(el.options).forEach(opt => { opt.selected = vals.includes(opt.value) || vals.includes(opt.text.trim()); });
       triggerEvents(el);
+    } else if (el.tagName === 'SELECT') {
+      // Smart Select: Match by value OR by text (handles cross-site differences)
+      const targetText = String(val).toLowerCase().trim();
+      let matched = false;
+      for (let i = 0; i < el.options.length; i++) {
+        const opt = el.options[i];
+        if (opt.value.toLowerCase().trim() === targetText || opt.text.toLowerCase().trim() === targetText) {
+          el.selectedIndex = i;
+          matched = true;
+          break;
+        }
+      }
+      // If no exact match, try fuzzy match (contains)
+      if (!matched) {
+        for (let i = 0; i < el.options.length; i++) {
+          if (el.options[i].text.toLowerCase().includes(targetText)) {
+            el.selectedIndex = i;
+            matched = true;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        triggerEvents(el);
+      }
     } else {
-      // Only fill if the field is currently empty — don't overwrite fresh user input
-      const currentVal = el.tagName === 'SELECT' ? el.value : el.value.trim();
+      const currentVal = el.value.trim();
       if (currentVal) return;
       setNativeValue(el, val);
       triggerEvents(el);
@@ -617,6 +663,7 @@ function showAutofillBanner(savedFields) {
 
   document.getElementById('ja-yes').onclick = () => {
     sessionStorage.setItem('ja_autofill_dismissed', 'true');
+    sessionStorage.setItem('ja_autofill_active', 'true'); // NEW: Enable auto-fill for this session
     fillFields(savedFields);
     banner.remove();
   };
@@ -875,24 +922,29 @@ async function init() {
 
     const resp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname });
     const site = resp?.site;
-    if (site?.disabled) {
-      console.log(`[Job Autofill] Extension explicitly disabled for this site.`);
+    
+    // 1. If explicitly blocked ("Never") OR toggled off in popup, stop completely
+    if (site?.disabled || site?.enabled === false) {
+      console.log(`[Job Autofill] Extension inactive for ${hostname} (Disabled: ${!!site?.disabled}, Enabled: ${site?.enabled})`);
       return;
     }
 
-    // Always attach the recorder so we can prompt to save on any site
+    // Always attach the recorder so we can prompt to save on any site that is active
     attachRecorder();
 
     const profileResp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
     currentGlobalProfile = profileResp?.profile || {};
 
-    if (!site?.enabled) return;
-
     const savedCount = Object.keys(site.fields || {}).length;
     const globalCount = Object.keys(currentGlobalProfile || {}).length;
     if (savedCount > 0 || globalCount > 0) {
-      // Small delay to let the page fully render
-      setTimeout(() => showAutofillBanner(site.fields || {}), 800);
+      if (sessionStorage.getItem('ja_autofill_active') === 'true') {
+        console.log(`[Job Autofill] Autofill session active. Auto-filling new fields...`);
+        fillFields(site.fields || {});
+      } else {
+        // Small delay to let the page fully render
+        setTimeout(() => showAutofillBanner(site.fields || {}), 800);
+      }
     }
   } catch (err) {
     // Extension context invalidated (e.g., extension was updated/reloaded)

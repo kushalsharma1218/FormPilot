@@ -6,11 +6,17 @@ importScripts('cloud-sync.js');
 const STORAGE_KEY = 'autofill_data';
 const GLOBAL_STORAGE_KEY = 'global_profile_data';
 
-// ── Storage Helpers ────────────────────────────────────────────
+// ── Storage Helpers (Account Aware) ────────────────────────────
+async function getUserKey(baseKey) {
+  const auth = await getAuthState();
+  return auth ? `user_${auth.userId}_${baseKey}` : baseKey;
+}
+
 async function getData() {
   try {
-    const result = await chrome.storage.local.get(STORAGE_KEY);
-    const data = result[STORAGE_KEY] || {};
+    const key = await getUserKey(STORAGE_KEY);
+    const result = await chrome.storage.local.get(key);
+    const data = result[key] || {};
     // Ensure structure exists
     if (!data.sites) data.sites = {};
     if (!data.hostnameMappings) data.hostnameMappings = {};
@@ -22,13 +28,15 @@ async function getData() {
 }
 
 async function saveData(data) {
-  await chrome.storage.local.set({ [STORAGE_KEY]: data });
+  const key = await getUserKey(STORAGE_KEY);
+  await chrome.storage.local.set({ [key]: data });
 }
 
 async function getGlobalProfile() {
   try {
-    const result = await chrome.storage.local.get(GLOBAL_STORAGE_KEY);
-    return result[GLOBAL_STORAGE_KEY] || {};
+    const key = await getUserKey(GLOBAL_STORAGE_KEY);
+    const result = await chrome.storage.local.get(key);
+    return result[key] || {};
   } catch (err) {
     console.error('[Background] getGlobalProfile error:', err);
     return {};
@@ -36,7 +44,8 @@ async function getGlobalProfile() {
 }
 
 async function saveGlobalProfile(profile) {
-  await chrome.storage.local.set({ [GLOBAL_STORAGE_KEY]: profile });
+  const key = await getUserKey(GLOBAL_STORAGE_KEY);
+  await chrome.storage.local.set({ [key]: profile });
 }
 
 // Resolve the effective site key for a hostname (custom or plain hostname)
@@ -86,6 +95,7 @@ async function handleMessage(msg, sender) {
       data.sites[siteKey].enabled = !!msg.enabled;
       if (msg.clearDisabled) data.sites[siteKey].disabled = false;
       await saveData(data);
+      queueCloudSync();
       return { ok: true };
     }
 
@@ -104,7 +114,9 @@ async function handleMessage(msg, sender) {
       const siteKey = resolveSiteKey(data, msg.hostname);
       if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {} };
       data.sites[siteKey].disabled = true;
+      data.sites[siteKey].enabled = false; // Also disable if specifically blocked
       await saveData(data);
+      queueCloudSync();
       return { ok: true };
     }
 

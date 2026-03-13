@@ -5,10 +5,21 @@
 const AI_SETTINGS_KEY = 'ai_settings';
 const APPLICATIONS_KEY = 'applications_data';
 
-// ── Settings Management ──────────────────────────────────────
+// ── Storage Helpers (Account Aware) ────────────────────────────
+async function getAuthState() {
+  const result = await chrome.storage.local.get('cloud_auth');
+  return result['cloud_auth'] || null;
+}
+
+async function getUserKey(baseKey) {
+  const auth = await getAuthState();
+  return auth ? `user_${auth.userId}_${baseKey}` : baseKey;
+}
+
 async function getAiSettings() {
-  const result = await chrome.storage.local.get(AI_SETTINGS_KEY);
-  return result[AI_SETTINGS_KEY] || {
+  const key = await getUserKey(AI_SETTINGS_KEY);
+  const result = await chrome.storage.local.get(key);
+  return result[key] || {
     enabled: true,
     provider: 'built-in',
     apiKey: '',
@@ -17,7 +28,8 @@ async function getAiSettings() {
 }
 
 async function saveAiSettings(settings) {
-  await chrome.storage.local.set({ [AI_SETTINGS_KEY]: settings });
+  const key = await getUserKey(AI_SETTINGS_KEY);
+  await chrome.storage.local.set({ [key]: settings });
 }
 
 // ── Provider Registry ─────────────────────────────────────────
@@ -638,12 +650,14 @@ Return ONLY email body (no greeting, no sign-off, no subject line).`;
 // APPLICATION TRACKER
 // ═══════════════════════════════════════════════════════════════
 async function getApplications() {
-  const result = await chrome.storage.local.get(APPLICATIONS_KEY);
-  return result[APPLICATIONS_KEY] || [];
+  const key = await getUserKey(APPLICATIONS_KEY);
+  const result = await chrome.storage.local.get(key);
+  return result[key] || [];
 }
 
 async function saveApplications(apps) {
-  await chrome.storage.local.set({ [APPLICATIONS_KEY]: apps });
+  const key = await getUserKey(APPLICATIONS_KEY);
+  await chrome.storage.local.set({ [key]: apps });
 }
 
 async function addApplication(app) {

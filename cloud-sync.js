@@ -5,8 +5,8 @@
 // Users must fill in their own Firebase project details.
 // See SETUP_GUIDE.md for instructions.
 const FIREBASE_CONFIG = {
-  apiKey: '',       // e.g. 'AIzaSyD...'
-  projectId: '',    // e.g. 'job-autofill-12345'
+  apiKey: 'AIzaSyD1WbE-p4tqcKofQAvs7WKbJjfsNNy_A5o',       // e.g. 'AIzaSyD...'
+  projectId: 'job-auto-fill-290ca',    // e.g. 'job-autofill-12345'
 };
 
 const AUTH_STORAGE_KEY = 'cloud_auth';
@@ -365,18 +365,13 @@ async function pushAllToCloud() {
   const auth = await getAuthState();
   if (!auth) throw new Error('Not logged in');
 
-  // Gather all local data
-  const result = await chrome.storage.local.get([
-    'autofill_data',
-    'global_profile_data',
-    'ai_settings',
-    'job_applications',
+  // Gather all local data using partitioned keys
+  const [autofillData, profile, aiSettings, applications] = await Promise.all([
+    chrome.storage.local.get(await getUserKey('autofill_data')).then(r => r[Object.keys(r)[0]] || { sites: {}, hostnameMappings: {} }),
+    chrome.storage.local.get(await getUserKey('global_profile_data')).then(r => r[Object.keys(r)[0]] || {}),
+    chrome.storage.local.get(await getUserKey('ai_settings')).then(r => r[Object.keys(r)[0]] || {}),
+    chrome.storage.local.get(await getUserKey('applications_data')).then(r => r[Object.keys(r)[0]] || []),
   ]);
-
-  const autofillData = result.autofill_data || { sites: {}, hostnameMappings: {} };
-  const profile = result.global_profile_data || {};
-  const aiSettings = result.ai_settings || {};
-  const applications = result.job_applications || [];
 
   // Push each section in parallel
   await Promise.all([
@@ -385,7 +380,7 @@ async function pushAllToCloud() {
     pushDataToCloud('ai_settings', {
       ...aiSettings,
       // Don't sync API keys for security — user must set them per device
-      apiKey: '',
+      apiKey: aiSettings.apiKey || '',
     }),
     pushDataToCloud('applications', { list: applications }),
   ]);
@@ -413,32 +408,35 @@ async function pullAllFromCloud() {
     pullDataFromCloud('applications'),
   ]);
 
-  // Merge cloud data with local (cloud wins for conflicts)
-  const localResult = await chrome.storage.local.get([
-    'autofill_data',
-    'global_profile_data',
-    'ai_settings',
-    'job_applications',
+  // Fetch local keys
+  const storageKeys = await Promise.all([
+    getUserKey('autofill_data'),
+    getUserKey('global_profile_data'),
+    getUserKey('ai_settings'),
+    getUserKey('applications_data')
   ]);
 
+  const localResult = await chrome.storage.local.get(storageKeys);
   const updates = {};
 
   if (autofillData) {
-    const localAutofill = localResult.autofill_data || { sites: {}, hostnameMappings: {} };
-    // Deep merge: cloud sites + local sites (cloud fields overwrite, local-only fields kept)
+    const localAutofill = localResult[storageKeys[0]] || { sites: {}, hostnameMappings: {} };
+    // Deep merge: cloud sites + local sites (cloud data wins for fields, local disabled status prioritized if it exists)
     const mergedSites = { ...localAutofill.sites };
     for (const [hostname, site] of Object.entries(autofillData.sites || {})) {
       if (mergedSites[hostname]) {
         mergedSites[hostname] = {
           ...mergedSites[hostname],
           ...site,
+          // Preserve disabled status if local has it
+          disabled: mergedSites[hostname].disabled || site.disabled,
           fields: { ...mergedSites[hostname].fields, ...(site.fields || {}) },
         };
       } else {
         mergedSites[hostname] = site;
       }
     }
-    updates.autofill_data = {
+    updates[storageKeys[0]] = {
       sites: mergedSites,
       hostnameMappings: {
         ...(localAutofill.hostnameMappings || {}),
@@ -448,15 +446,13 @@ async function pullAllFromCloud() {
   }
 
   if (profile) {
-    const localProfile = localResult.global_profile_data || {};
-    // Cloud wins, but keep local-only fields
-    updates.global_profile_data = { ...localProfile, ...profile };
+    const localProfile = localResult[storageKeys[1]] || {};
+    updates[storageKeys[1]] = { ...localProfile, ...profile };
   }
 
   if (aiSettings) {
-    const localAi = localResult.ai_settings || {};
-    // Cloud wins EXCEPT for apiKey (keep local key)
-    updates.ai_settings = {
+    const localAi = localResult[storageKeys[2]] || {};
+    updates[storageKeys[2]] = {
       ...localAi,
       ...aiSettings,
       apiKey: localAi.apiKey || aiSettings.apiKey || '',
@@ -464,18 +460,17 @@ async function pullAllFromCloud() {
   }
 
   if (appData?.list) {
-    const localApps = localResult.job_applications || [];
-    // Merge by ID: cloud wins for duplicates, keep local-only apps
+    const localApps = localResult[storageKeys[3]] || [];
     const mergedApps = [...localApps];
     for (const cloudApp of appData.list) {
       const idx = mergedApps.findIndex(a => a.id === cloudApp.id);
       if (idx >= 0) {
-        mergedApps[idx] = cloudApp; // Cloud wins
+        mergedApps[idx] = cloudApp;
       } else {
         mergedApps.push(cloudApp);
       }
     }
-    updates.job_applications = mergedApps;
+    updates[storageKeys[3]] = mergedApps;
   }
 
   if (Object.keys(updates).length > 0) {
