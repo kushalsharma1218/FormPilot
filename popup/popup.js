@@ -1,8 +1,19 @@
 // popup.js — Job Autofill Popup (Refactored)
 
 let currentHostname = '';
-let siteData = { enabled: false, fields: {} };
+let siteData = { enabled: true, fields: {} };
 let aiEnabled = false;
+let teachActive = false;
+let initInFlight = false;
+let initAttempts = 0;
+
+function withTimeout(promise, ms, fallback = null) {
+  let timeoutId;
+  const timeout = new Promise(resolve => {
+    timeoutId = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
 
 // ── Utilities ──────────────────────────────────────────────────
 function escHtml(str) {
@@ -135,7 +146,17 @@ async function sendToTab(tabId, message) {
 
 // ── Init ───────────────────────────────────────────────────────
 async function init() {
+  if (initInFlight) return;
+  initInFlight = true;
+  initAttempts += 1;
   try {
+    const authEl = document.getElementById('auth-ui');
+    const mainEl = document.getElementById('main-ui');
+
+    // Default to auth UI so popup never appears blank
+    if (authEl) authEl.style.display = 'flex';
+    if (mainEl) mainEl.style.display = 'none';
+
     const tab = await getActiveTab();
     try {
       const url = new URL(tab.url);
@@ -145,11 +166,33 @@ async function init() {
     }
 
     // Auth Gate
-    const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
-    if (!authStatus.loggedIn) {
-      document.getElementById('auth-ui').style.display = 'flex';
+    const authStatus = await withTimeout(
+      chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null),
+      5000,
+      null
+    );
+    if (!authStatus || !authStatus.loggedIn) {
+      if (authEl) authEl.style.display = 'flex';
       setupAuthListeners();
       
+      if (!authStatus) {
+        const errEl = document.getElementById('auth-error-msg');
+        if (errEl) {
+          errEl.innerHTML = 'Background not responding. <a href="#" id="auth-retry">Retry</a>';
+          const retry = document.getElementById('auth-retry');
+          if (retry) {
+            retry.addEventListener('click', (e) => {
+              e.preventDefault();
+              init();
+            });
+          }
+        }
+        if (initAttempts < 3) {
+          setTimeout(() => init(), 1200);
+        }
+        initInFlight = false;
+        return;
+      }
       if (!authStatus.configured) {
         document.getElementById('auth-error-msg').innerHTML = 'Firebase config missing. Please read the <a href="#" id="auth-link-setup-error" style="color:var(--blue-400)">setup guide</a>.';
         document.getElementById('auth-link-setup-error').addEventListener('click', (e) => {
@@ -157,10 +200,12 @@ async function init() {
           chrome.tabs.create({ url: chrome.runtime.getURL('SETUP_GUIDE.md') });
         });
       }
+      initInFlight = false;
       return; // Stop here, don't load main UI
     }
 
-    document.getElementById('main-ui').style.display = 'block';
+    if (authEl) authEl.style.display = 'none';
+    if (mainEl) mainEl.style.display = 'block';
     document.getElementById('site-badge').textContent = currentHostname;
 
     // Load site data & AI settings in parallel
@@ -170,7 +215,7 @@ async function init() {
       chrome.runtime.sendMessage({ type: 'GET_SITE_KEY', hostname: currentHostname })
     ]);
 
-    siteData = siteResp?.site || { enabled: false, fields: {} };
+    siteData = siteResp?.site || { enabled: true, fields: {} };
 
     const siteKey = keyResp?.siteKey || currentHostname;
     document.getElementById('site-key-input').value = siteKey;
@@ -185,6 +230,10 @@ async function init() {
   } catch (err) {
     console.error('[Popup] Init error:', err);
     showToast('⚠ Failed to load data', 'error');
+    document.getElementById('auth-ui').style.display = 'flex';
+    document.getElementById('auth-error-msg').textContent = 'Initialization failed. Please reload the extension.';
+  } finally {
+    initInFlight = false;
   }
 }
 
@@ -213,6 +262,38 @@ document.getElementById('btn-autofill').addEventListener('click', async () => {
     showToast('✓ Autofilled current page', 'success');
   } else {
     showToast('⚠ Enable site to autofill or save data first', 'error');
+  }
+});
+
+document.getElementById('btn-teach').addEventListener('click', async () => {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  const btn = document.getElementById('btn-teach');
+  if (!btn.dataset.defaultHtml) btn.dataset.defaultHtml = btn.innerHTML;
+  if (!teachActive) {
+    await sendToTab(tab.id, { type: 'TEACH_MODE_START' });
+    teachActive = true;
+    btn.textContent = 'Teaching...';
+    showToast('Click a field to teach mapping', 'success');
+  } else {
+    await sendToTab(tab.id, { type: 'TEACH_MODE_STOP' });
+    teachActive = false;
+    btn.innerHTML = btn.dataset.defaultHtml || btn.innerHTML;
+    showToast('Teach mode stopped', 'info');
+  }
+});
+
+// Restore Teach button icon text when popup loads
+const teachBtn = document.getElementById('btn-teach');
+if (teachBtn && !teachBtn.dataset.defaultHtml) {
+  teachBtn.dataset.defaultHtml = teachBtn.innerHTML;
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'TEACH_MODE_DONE') {
+    const btn = document.getElementById('btn-teach');
+    teachActive = false;
+    if (btn?.dataset.defaultHtml) btn.innerHTML = btn.dataset.defaultHtml;
   }
 });
 
@@ -435,7 +516,15 @@ function setupAuthListeners() {
     btnEmail.textContent = 'Signing in...';
 
     try {
-      const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd });
+      const resp = await withTimeout(
+        chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd }).catch(() => null),
+        6000,
+        null
+      );
+      if (!resp) {
+        msg.textContent = 'Background not responding. Please reload the extension.';
+        return;
+      }
       if (resp.ok) {
         window.location.reload(); // Reload popup to show main UI
       } else {
@@ -449,33 +538,40 @@ function setupAuthListeners() {
     }
   });
 
-  btnGoogle.addEventListener('click', async () => {
-    msg.textContent = '';
-    btnGoogle.disabled = true;
-    
-    try {
-      // 1. Get Google Access Token via Chrome Identity API
-      chrome.identity.getAuthToken({ interactive: true }, async (token) => {
-        if (chrome.runtime.lastError || !token) {
-          msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
+  if (btnGoogle) {
+    btnGoogle.addEventListener('click', async () => {
+      msg.textContent = '';
+      btnGoogle.disabled = true;
+      
+      try {
+        if (!chrome.identity || !chrome.identity.getAuthToken) {
+          msg.textContent = 'Google Sign-in unavailable. Check identity permission.';
           btnGoogle.disabled = false;
           return;
         }
+        // 1. Get Google Access Token via Chrome Identity API
+        chrome.identity.getAuthToken({ interactive: true }, async (token) => {
+          if (chrome.runtime.lastError || !token) {
+            msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
+            btnGoogle.disabled = false;
+            return;
+          }
 
-        // 2. Pass to Background for Firebase Auth
-        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN_GOOGLE', accessToken: token });
-        if (resp.ok) {
-          window.location.reload();
-        } else {
-          msg.textContent = resp.error;
-          btnGoogle.disabled = false;
-        }
-      });
-    } catch (err) {
-      msg.textContent = err.message;
-      btnGoogle.disabled = false;
-    }
-  });
+          // 2. Pass to Background for Firebase Auth
+          const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN_GOOGLE', accessToken: token });
+          if (resp.ok) {
+            window.location.reload();
+          } else {
+            msg.textContent = resp.error;
+            btnGoogle.disabled = false;
+          }
+        });
+      } catch (err) {
+        msg.textContent = err.message;
+        btnGoogle.disabled = false;
+      }
+    });
+  }
 }
 
 // ── Kickoff ────────────────────────────────────────────────────

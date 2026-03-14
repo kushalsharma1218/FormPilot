@@ -1,25 +1,36 @@
 // background.js — Service Worker (v2.2 with Cloud Sync)
 
+importScripts('lib/auth-store.js');
+importScripts('lib/ai-utils.js');
+importScripts('lib/firestore-utils.js');
 importScripts('ai-service.js');
 importScripts('cloud-sync.js');
 
 const STORAGE_KEY = 'autofill_data';
 const GLOBAL_STORAGE_KEY = 'global_profile_data';
+const SESSION_KEY = 'autofill_session';
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ── Storage Helpers (Account Aware) ────────────────────────────
-async function getUserKey(baseKey) {
-  const auth = await getAuthState();
-  return auth ? `user_${auth.userId}_${baseKey}` : baseKey;
-}
+const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
+  getUserKey: async (baseKey) => baseKey,
+  getAuthState: async () => null,
+};
 
 async function getData() {
   try {
-    const key = await getUserKey(STORAGE_KEY);
+    const key = await AuthStore.getUserKey(STORAGE_KEY);
     const result = await chrome.storage.local.get(key);
     const data = result[key] || {};
     // Ensure structure exists
     if (!data.sites) data.sites = {};
     if (!data.hostnameMappings) data.hostnameMappings = {};
+    // Normalize site entries
+    Object.values(data.sites).forEach(site => {
+      if (!site.fields) site.fields = {};
+      if (!Array.isArray(site.mappings)) site.mappings = [];
+      if (site.enabled === undefined) site.enabled = !site.disabled;
+    });
     return data;
   } catch (err) {
     console.error('[Background] getData error:', err);
@@ -28,13 +39,13 @@ async function getData() {
 }
 
 async function saveData(data) {
-  const key = await getUserKey(STORAGE_KEY);
+  const key = await AuthStore.getUserKey(STORAGE_KEY);
   await chrome.storage.local.set({ [key]: data });
 }
 
 async function getGlobalProfile() {
   try {
-    const key = await getUserKey(GLOBAL_STORAGE_KEY);
+    const key = await AuthStore.getUserKey(GLOBAL_STORAGE_KEY);
     const result = await chrome.storage.local.get(key);
     return result[key] || {};
   } catch (err) {
@@ -44,7 +55,7 @@ async function getGlobalProfile() {
 }
 
 async function saveGlobalProfile(profile) {
-  const key = await getUserKey(GLOBAL_STORAGE_KEY);
+  const key = await AuthStore.getUserKey(GLOBAL_STORAGE_KEY);
   await chrome.storage.local.set({ [key]: profile });
 }
 
@@ -52,6 +63,60 @@ async function saveGlobalProfile(profile) {
 function resolveSiteKey(data, hostname) {
   if (!hostname) return hostname;
   return (data.hostnameMappings || {})[hostname] || hostname;
+}
+
+async function resolveSiteKeyForHost(hostname) {
+  const data = await getData();
+  return resolveSiteKey(data, hostname) || hostname;
+}
+
+// ── Session Helpers (Multi-page forms) ────────────────────────
+async function getSessionStore() {
+  const key = await AuthStore.getUserKey(SESSION_KEY);
+  const result = await chrome.storage.local.get(key);
+  const store = result[key] || {};
+  const now = Date.now();
+  let changed = false;
+  for (const [siteKey, entry] of Object.entries(store)) {
+    const updatedAt = new Date(entry?.updatedAt || 0).getTime();
+    if (!updatedAt || (now - updatedAt) > SESSION_TTL_MS) {
+      delete store[siteKey];
+      changed = true;
+    }
+  }
+  if (changed) {
+    await chrome.storage.local.set({ [key]: store });
+  }
+  return store;
+}
+
+async function saveSessionStore(store) {
+  const key = await AuthStore.getUserKey(SESSION_KEY);
+  await chrome.storage.local.set({ [key]: store });
+}
+
+async function getSessionFields(hostname) {
+  const siteKey = await resolveSiteKeyForHost(hostname);
+  const store = await getSessionStore();
+  return store[siteKey]?.fields || {};
+}
+
+async function mergeSessionFields(hostname, fields) {
+  const siteKey = await resolveSiteKeyForHost(hostname);
+  const store = await getSessionStore();
+  const entry = store[siteKey] || { fields: {} };
+  entry.fields = { ...(entry.fields || {}), ...(fields || {}) };
+  entry.updatedAt = new Date().toISOString();
+  store[siteKey] = entry;
+  await saveSessionStore(store);
+  return entry.fields;
+}
+
+async function clearSessionFields(hostname) {
+  const siteKey = await resolveSiteKeyForHost(hostname);
+  const store = await getSessionStore();
+  delete store[siteKey];
+  await saveSessionStore(store);
 }
 
 // ── Message Handler ────────────────────────────────────────────
@@ -84,7 +149,7 @@ async function handleMessage(msg, sender) {
     case 'GET_SITE_DATA': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      const site = data.sites[siteKey] || { enabled: false, fields: {} };
+      const site = data.sites[siteKey] || { enabled: true, fields: {}, mappings: [] };
       return { site, siteKey };
     }
 
@@ -106,6 +171,57 @@ async function handleMessage(msg, sender) {
       data.sites[siteKey].fields = Object.assign({}, data.sites[siteKey].fields, msg.fields || {});
       await saveData(data);
       queueCloudSync();
+      return { ok: true };
+    }
+
+    case 'GET_SITE_MAPPINGS': {
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      const site = data.sites[siteKey] || { enabled: true, fields: {}, mappings: [] };
+      return { ok: true, mappings: site.mappings || [], siteKey };
+    }
+
+    case 'SAVE_SITE_MAPPING': {
+      if (!msg.mapping || !msg.hostname) return { ok: false, error: 'Missing mapping/hostname' };
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [] };
+      if (!Array.isArray(data.sites[siteKey].mappings)) data.sites[siteKey].mappings = [];
+      const mappings = data.sites[siteKey].mappings;
+      const idx = mappings.findIndex(m => m.signature === msg.mapping.signature);
+      const normalized = {
+        signature: msg.mapping.signature,
+        mappedKey: msg.mapping.mappedKey,
+        label: msg.mapping.label || '',
+        type: msg.mapping.type || '',
+        updatedAt: new Date().toISOString(),
+      };
+      if (idx >= 0) {
+        mappings[idx] = { ...mappings[idx], ...normalized };
+      } else {
+        mappings.push(normalized);
+      }
+      data.sites[siteKey].mappings = mappings;
+      await saveData(data);
+      return { ok: true, mappings };
+    }
+
+    case 'SESSION_GET': {
+      const fields = await getSessionFields(msg.hostname);
+      return { ok: true, fields };
+    }
+
+    case 'SESSION_MERGE': {
+      const fields = await mergeSessionFields(msg.hostname, msg.fields || {});
+      return { ok: true, fields };
+    }
+
+    case 'SESSION_CLEAR': {
+      await clearSessionFields(msg.hostname);
+      return { ok: true };
+    }
+
+    case 'TEACH_MODE_DONE': {
       return { ok: true };
     }
 
@@ -286,7 +402,10 @@ async function handleMessage(msg, sender) {
 
     // ── Cloud Sync ────────────────────────────────────────────────
     case 'CLOUD_GET_STATUS': {
-      const auth = await getAuthState();
+      if (typeof ensureFirebaseConfigLoaded === 'function') {
+        await ensureFirebaseConfigLoaded();
+      }
+      const auth = await AuthStore.getAuthState();
       const meta = await getSyncMeta();
       return {
         configured: isCloudConfigured(),
@@ -296,8 +415,26 @@ async function handleMessage(msg, sender) {
       };
     }
 
+    case 'CLOUD_GET_CONFIG': {
+      if (typeof getCloudConfig === 'function') {
+        const config = await getCloudConfig();
+        return { ok: true, config };
+      }
+      return { ok: false, error: 'Cloud config not available' };
+    }
+
+    case 'CLOUD_SAVE_CONFIG': {
+      if (!msg.config) return { ok: false, error: 'Missing config' };
+      if (typeof saveCloudConfig === 'function') {
+        const config = await saveCloudConfig(msg.config);
+        return { ok: true, config };
+      }
+      return { ok: false, error: 'Cloud config not available' };
+    }
+
     case 'CLOUD_SIGN_UP': {
       if (!msg.email || !msg.password) return { ok: false, error: 'Email and password are required' };
+      console.log('[Cloud] Sign up attempt:', msg.email);
       const auth = await cloudSignUp(msg.email, msg.password, msg.displayName || '');
       // Auto-push local data to cloud on signup
       try { await pushAllToCloud(); } catch (e) { console.warn('[Cloud] Post-signup push failed:', e); }
@@ -306,6 +443,7 @@ async function handleMessage(msg, sender) {
 
     case 'CLOUD_SIGN_IN': {
       if (!msg.email || !msg.password) return { ok: false, error: 'Email and password are required' };
+      console.log('[Cloud] Sign in attempt:', msg.email);
       const auth = await cloudSignIn(msg.email, msg.password);
       // Auto-pull cloud data on login
       try { await pullAllFromCloud(); } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
@@ -359,7 +497,10 @@ function queueCloudSync() {
   if (syncTimer) clearTimeout(syncTimer);
   syncTimer = setTimeout(async () => {
     try {
-      const auth = await getAuthState();
+      const auth = await AuthStore.getAuthState();
+      if (typeof ensureFirebaseConfigLoaded === 'function') {
+        await ensureFirebaseConfigLoaded();
+      }
       if (auth && isCloudConfigured()) {
         console.log('[Cloud] Auto-syncing...');
         await pushAllToCloud();

@@ -2,15 +2,123 @@
 // Uses Firebase Auth REST API + Firestore REST API (no SDK needed)
 
 // ── Firebase Config ────────────────────────────────────────────
-// Users must fill in their own Firebase project details.
-// See SETUP_GUIDE.md for instructions.
+// Default Firebase project details (safe to ship; security enforced by rules).
+// Users can still override via dashboard if needed.
 const FIREBASE_CONFIG = {
-  apiKey: 'AIzaSyD1WbE-p4tqcKofQAvs7WKbJjfsNNy_A5o',       // e.g. 'AIzaSyD...'
-  projectId: 'job-auto-fill-290ca',    // e.g. 'job-autofill-12345'
+  apiKey: 'AIzaSyD1WbE-p4tqcKofQAvs7WKbJjfsNNy_A5o',
+  projectId: 'job-auto-fill-290ca',
+  authDomain: 'job-auto-fill-290ca.firebaseapp.com',
 };
 
-const AUTH_STORAGE_KEY = 'cloud_auth';
+const CloudAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {};
+const FirestoreUtils = (globalThis.JobAutofill && JobAutofill.FirestoreUtils) || null;
+const getAuthState = CloudAuthStore.getAuthState || (async () => null);
+const saveAuthState = CloudAuthStore.saveAuthState || (async () => {});
+const clearAuthState = CloudAuthStore.clearAuthState || (async () => {});
+const getUserKey = CloudAuthStore.getUserKey || (async (baseKey) => baseKey);
+const toFirestoreValue = FirestoreUtils?.toFirestoreValue || function (val) {
+  if (val === null || val === undefined) return { nullValue: null };
+  if (typeof val === 'boolean') return { booleanValue: val };
+  if (typeof val === 'number') {
+    if (Number.isInteger(val)) return { integerValue: String(val) };
+    return { doubleValue: val };
+  }
+  if (typeof val === 'string') return { stringValue: val };
+  if (Array.isArray(val)) {
+    return { arrayValue: { values: val.map(toFirestoreValue) } };
+  }
+  if (typeof val === 'object') {
+    const fields = {};
+    Object.entries(val).forEach(([k, v]) => {
+      fields[k] = toFirestoreValue(v);
+    });
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(val) };
+};
+const fromFirestoreValue = FirestoreUtils?.fromFirestoreValue || function (fv) {
+  if (!fv) return null;
+  if ('nullValue' in fv) return null;
+  if ('booleanValue' in fv) return fv.booleanValue;
+  if ('integerValue' in fv) return parseInt(fv.integerValue, 10);
+  if ('doubleValue' in fv) return fv.doubleValue;
+  if ('stringValue' in fv) return fv.stringValue;
+  if ('arrayValue' in fv) {
+    return (fv.arrayValue.values || []).map(fromFirestoreValue);
+  }
+  if ('mapValue' in fv) {
+    const obj = {};
+    Object.entries(fv.mapValue.fields || {}).forEach(([k, v]) => {
+      obj[k] = fromFirestoreValue(v);
+    });
+    return obj;
+  }
+  return null;
+};
+const toFirestoreDoc = FirestoreUtils?.toFirestoreDoc || function (obj) {
+  const fields = {};
+  Object.entries(obj || {}).forEach(([k, v]) => {
+    fields[k] = toFirestoreValue(v);
+  });
+  return { fields };
+};
+const fromFirestoreDoc = FirestoreUtils?.fromFirestoreDoc || function (doc) {
+  if (!doc || !doc.fields) return {};
+  const obj = {};
+  Object.entries(doc.fields).forEach(([k, v]) => {
+    obj[k] = fromFirestoreValue(v);
+  });
+  return obj;
+};
+
 const SYNC_META_KEY = 'cloud_sync_meta';
+const CLOUD_CONFIG_KEY = 'cloud_config';
+let configLoadPromise = null;
+
+function setFirebaseConfig(config) {
+  FIREBASE_CONFIG.apiKey = (config?.apiKey || '').trim();
+  FIREBASE_CONFIG.projectId = (config?.projectId || '').trim();
+  if (config?.authDomain) {
+    FIREBASE_CONFIG.authDomain = (config?.authDomain || '').trim();
+  }
+}
+
+async function ensureFirebaseConfigLoaded() {
+  if (configLoadPromise) return configLoadPromise;
+  configLoadPromise = chrome.storage.local.get(CLOUD_CONFIG_KEY)
+    .then((result) => {
+      const stored = result[CLOUD_CONFIG_KEY] || {};
+      // If user saved empty values previously, fall back to baked defaults.
+      const merged = {
+        apiKey: (stored.apiKey || FIREBASE_CONFIG.apiKey || '').trim(),
+        projectId: (stored.projectId || FIREBASE_CONFIG.projectId || '').trim(),
+        authDomain: (stored.authDomain || FIREBASE_CONFIG.authDomain || '').trim(),
+      };
+      setFirebaseConfig(merged);
+      return merged;
+    })
+    .catch(() => {
+      // Keep defaults if storage read fails
+      return { apiKey: FIREBASE_CONFIG.apiKey, projectId: FIREBASE_CONFIG.projectId, authDomain: FIREBASE_CONFIG.authDomain };
+    });
+  return configLoadPromise;
+}
+
+async function getCloudConfig() {
+  await ensureFirebaseConfigLoaded();
+  return { apiKey: FIREBASE_CONFIG.apiKey, projectId: FIREBASE_CONFIG.projectId, authDomain: FIREBASE_CONFIG.authDomain };
+}
+
+async function saveCloudConfig(config) {
+  const normalized = {
+    apiKey: (config?.apiKey || '').trim(),
+    projectId: (config?.projectId || '').trim(),
+    authDomain: (config?.authDomain || '').trim(),
+  };
+  await chrome.storage.local.set({ [CLOUD_CONFIG_KEY]: normalized });
+  setFirebaseConfig(normalized);
+  return normalized;
+}
 
 // ── Helpers ────────────────────────────────────────────────────
 function firestoreUrl(path) {
@@ -31,22 +139,6 @@ function isCloudConfigured() {
 }
 
 // ── Auth State ─────────────────────────────────────────────────
-async function getAuthState() {
-  try {
-    const result = await chrome.storage.local.get(AUTH_STORAGE_KEY);
-    return result[AUTH_STORAGE_KEY] || null;
-  } catch {
-    return null;
-  }
-}
-
-async function saveAuthState(state) {
-  await chrome.storage.local.set({ [AUTH_STORAGE_KEY]: state });
-}
-
-async function clearAuthState() {
-  await chrome.storage.local.remove(AUTH_STORAGE_KEY);
-}
 
 // ── Token Management ───────────────────────────────────────────
 async function getValidToken() {
@@ -98,6 +190,7 @@ async function getValidToken() {
 
 // ── Authentication ─────────────────────────────────────────────
 async function cloudSignUp(email, password, displayName) {
+  await ensureFirebaseConfigLoaded();
   if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
 
   const resp = await fetch(authUrl('signUp'), {
@@ -141,6 +234,7 @@ async function cloudSignUp(email, password, displayName) {
 }
 
 async function cloudSignIn(email, password) {
+  await ensureFirebaseConfigLoaded();
   if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
 
   const resp = await fetch(authUrl('signInWithPassword'), {
@@ -185,6 +279,7 @@ async function cloudSignIn(email, password) {
 }
 
 async function cloudSignInWithGoogle(googleAccessToken) {
+  await ensureFirebaseConfigLoaded();
   if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
 
   const resp = await fetch(authUrl('signInWithIdp'), {
@@ -221,6 +316,7 @@ async function cloudSignOut() {
 }
 
 async function cloudResetPassword(email) {
+  await ensureFirebaseConfigLoaded();
   if (!isCloudConfigured()) throw new Error('Cloud sync not configured.');
 
   const resp = await fetch(authUrl('sendOobCode'), {
@@ -249,70 +345,10 @@ function friendlyAuthError(code) {
   return map[code] || code || 'Authentication failed.';
 }
 
-// ── Firestore Data Conversion ──────────────────────────────────
-// Convert JS values to Firestore REST API format and back
-
-function toFirestoreValue(val) {
-  if (val === null || val === undefined) return { nullValue: null };
-  if (typeof val === 'boolean') return { booleanValue: val };
-  if (typeof val === 'number') {
-    if (Number.isInteger(val)) return { integerValue: String(val) };
-    return { doubleValue: val };
-  }
-  if (typeof val === 'string') return { stringValue: val };
-  if (Array.isArray(val)) {
-    return { arrayValue: { values: val.map(toFirestoreValue) } };
-  }
-  if (typeof val === 'object') {
-    const fields = {};
-    for (const [k, v] of Object.entries(val)) {
-      fields[k] = toFirestoreValue(v);
-    }
-    return { mapValue: { fields } };
-  }
-  return { stringValue: String(val) };
-}
-
-function fromFirestoreValue(fv) {
-  if (!fv) return null;
-  if ('nullValue' in fv) return null;
-  if ('booleanValue' in fv) return fv.booleanValue;
-  if ('integerValue' in fv) return parseInt(fv.integerValue);
-  if ('doubleValue' in fv) return fv.doubleValue;
-  if ('stringValue' in fv) return fv.stringValue;
-  if ('arrayValue' in fv) {
-    return (fv.arrayValue.values || []).map(fromFirestoreValue);
-  }
-  if ('mapValue' in fv) {
-    const obj = {};
-    for (const [k, v] of Object.entries(fv.mapValue.fields || {})) {
-      obj[k] = fromFirestoreValue(v);
-    }
-    return obj;
-  }
-  return null;
-}
-
-function toFirestoreDoc(obj) {
-  const fields = {};
-  for (const [k, v] of Object.entries(obj)) {
-    fields[k] = toFirestoreValue(v);
-  }
-  return { fields };
-}
-
-function fromFirestoreDoc(doc) {
-  if (!doc || !doc.fields) return {};
-  const obj = {};
-  for (const [k, v] of Object.entries(doc.fields)) {
-    obj[k] = fromFirestoreValue(v);
-  }
-  return obj;
-}
-
 // ── Cloud Data Operations ──────────────────────────────────────
 
 async function pushDataToCloud(dataKey, data) {
+  await ensureFirebaseConfigLoaded();
   const auth = await getAuthState();
   if (!auth) throw new Error('Not logged in');
   const token = await getValidToken();
@@ -338,6 +374,7 @@ async function pushDataToCloud(dataKey, data) {
 }
 
 async function pullDataFromCloud(dataKey) {
+  await ensureFirebaseConfigLoaded();
   const auth = await getAuthState();
   if (!auth) throw new Error('Not logged in');
   const token = await getValidToken();

@@ -1,0 +1,8 @@
+{
+  "name": "job-autofill-extension",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -637,6 +637,25 @@
                         <span class="card-badge" id="cloud-status-badge">Disconnected</span>
                     </div>
                     <p class="card-hint">Sign in to securely sync your profiles, sites, and applications across all your devices.</p>
+
+                    <!-- Cloud Config -->
+                    <div class="card-hint" style="margin-top: 8px;">Configure your Firebase project once per device.</div>
+                    <div class="form-grid" style="margin-bottom: 12px;">
+                        <div class="form-group">
+                            <label>Firebase API Key</label>
+                            <input type="text" id="cloud-api-key" placeholder="AIzaSy..." />
+                        </div>
+                        <div class="form-group">
+                            <label>Firebase Project ID</label>
+                            <input type="text" id="cloud-project-id" placeholder="your-project-id" />
+                        </div>
+                        <div class="form-group full-width" style="margin-top: 4px;">
+                            <div class="data-actions">
+                                <button class="btn btn-secondary" id="btn-cloud-save-config">Save Config</button>
+                            </div>
+                            <div id="cloud-config-msg" class="status-msg" style="margin-top: 6px;"></div>
+                        </div>
+                    </div>
                     
                     <!-- Not Logged In -->
                     <div id="cloud-auth-forms" class="form-grid">

@@ -5,19 +5,57 @@
 const AI_SETTINGS_KEY = 'ai_settings';
 const APPLICATIONS_KEY = 'applications_data';
 
-// ── Storage Helpers (Account Aware) ────────────────────────────
-async function getAuthState() {
-  const result = await chrome.storage.local.get('cloud_auth');
-  return result['cloud_auth'] || null;
-}
+const AIAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
+  getUserKey: async (baseKey) => baseKey,
+};
+const AIUtils = (globalThis.JobAutofill && JobAutofill.AIUtils) || null;
+const extractJSON = AIUtils?.extractJSON || function (text) {
+  if (!text || typeof text !== 'string') {
+    throw new Error('AI returned empty or non-string response');
+  }
+  const firstBrace = text.indexOf('{');
+  const firstBracket = text.indexOf('[');
+  const firstChar = (firstBrace === -1) ? firstBracket : (firstBracket === -1 ? firstBrace : Math.min(firstBrace, firstBracket));
+  const lastBrace = text.lastIndexOf('}');
+  const lastBracket = text.lastIndexOf(']');
+  const lastChar = Math.max(lastBrace, lastBracket);
+  if (firstChar === -1 || lastChar === -1 || lastChar <= firstChar) {
+    throw new Error('AI response did not contain valid JSON. Preview: ' + text.substring(0, 200));
+  }
+  const clean = text.substring(firstChar, lastChar + 1);
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    throw new Error('AI returned malformed JSON: ' + e.message);
+  }
+};
+const retryWithBackoff = AIUtils?.retryWithBackoff || async function (fn, maxAttempts = 3) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      lastError = err;
+      const msg = err.message || '';
 
-async function getUserKey(baseKey) {
-  const auth = await getAuthState();
-  return auth ? `user_${auth.userId}_${baseKey}` : baseKey;
-}
+      // Do not retry hard limits
+      if (msg.includes('FREE_TIER_EXHAUSTED')) throw err;
+
+      // Only retry on rate-limit / server errors
+      if (msg.includes('429') || Math.max(msg.indexOf('rate'), msg.indexOf('quota')) !== -1 || msg.includes('500') || msg.includes('503') || msg.includes('overloaded')) {
+        const waitMs = Math.min(2000 * Math.pow(2, attempt), 15000);
+        console.warn(`[AI Service] Retry ${attempt + 1}/${maxAttempts} after ${waitMs}ms:`, msg);
+        await new Promise(r => setTimeout(r, waitMs));
+        continue;
+      }
+      throw err; // non-retryable
+    }
+  }
+  throw lastError;
+};
 
 async function getAiSettings() {
-  const key = await getUserKey(AI_SETTINGS_KEY);
+  const key = await AIAuthStore.getUserKey(AI_SETTINGS_KEY);
   const result = await chrome.storage.local.get(key);
   return result[key] || {
     enabled: true,
@@ -28,7 +66,7 @@ async function getAiSettings() {
 }
 
 async function saveAiSettings(settings) {
-  const key = await getUserKey(AI_SETTINGS_KEY);
+  const key = await AIAuthStore.getUserKey(AI_SETTINGS_KEY);
   await chrome.storage.local.set({ [key]: settings });
 }
 
@@ -140,53 +178,6 @@ async function callAI(prompt, options = {}) {
   }
 }
 
-// ── JSON Extraction Helper ────────────────────────────────────
-function extractJSON(text) {
-  if (!text || typeof text !== 'string') {
-    throw new Error('AI returned empty or non-string response');
-  }
-  const firstBrace = text.indexOf('{');
-  const firstBracket = text.indexOf('[');
-  const firstChar = (firstBrace === -1) ? firstBracket : (firstBracket === -1 ? firstBrace : Math.min(firstBrace, firstBracket));
-  const lastBrace = text.lastIndexOf('}');
-  const lastBracket = text.lastIndexOf(']');
-  const lastChar = Math.max(lastBrace, lastBracket);
-  if (firstChar === -1 || lastChar === -1 || lastChar <= firstChar) {
-    throw new Error('AI response did not contain valid JSON. Preview: ' + text.substring(0, 200));
-  }
-  const clean = text.substring(firstChar, lastChar + 1);
-  try {
-    return JSON.parse(clean);
-  } catch (e) {
-    throw new Error('AI returned malformed JSON: ' + e.message);
-  }
-}
-
-// ── Retry Helper ──────────────────────────────────────────────
-async function retryWithBackoff(fn, maxAttempts = 3) {
-  let lastError;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      return await fn(attempt);
-    } catch (err) {
-      lastError = err;
-      const msg = err.message || '';
-
-      // Do not retry hard limits
-      if (msg.includes('FREE_TIER_EXHAUSTED')) throw err;
-
-      // Only retry on rate-limit / server errors
-      if (msg.includes('429') || Math.max(msg.indexOf('rate'), msg.indexOf('quota')) !== -1 || msg.includes('500') || msg.includes('503') || msg.includes('overloaded')) {
-        const waitMs = Math.min(2000 * Math.pow(2, attempt), 15000);
-        console.warn(`[AI Service] Retry ${attempt + 1}/${maxAttempts} after ${waitMs}ms:`, msg);
-        await new Promise(r => setTimeout(r, waitMs));
-        continue;
-      }
-      throw err; // non-retryable
-    }
-  }
-  throw lastError;
-}
 
 // ═══════════════════════════════════════════════════════════════
 // PROVIDER: Chrome Built-in AI (Gemini Nano — Free, On-Device)
@@ -650,13 +641,13 @@ Return ONLY email body (no greeting, no sign-off, no subject line).`;
 // APPLICATION TRACKER
 // ═══════════════════════════════════════════════════════════════
 async function getApplications() {
-  const key = await getUserKey(APPLICATIONS_KEY);
+  const key = await AuthStore.getUserKey(APPLICATIONS_KEY);
   const result = await chrome.storage.local.get(key);
   return result[key] || [];
 }
 
 async function saveApplications(apps) {
-  const key = await getUserKey(APPLICATIONS_KEY);
+  const key = await AuthStore.getUserKey(APPLICATIONS_KEY);
   await chrome.storage.local.set({ [key]: apps });
 }
 

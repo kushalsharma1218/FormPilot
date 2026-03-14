@@ -1158,7 +1158,24 @@ document.getElementById('btn-nuke').addEventListener('click', () => {
 });
 
 // ── Cloud Sync ─────────────────────────────────────────────────
+function withTimeout(promise, ms, fallback = null) {
+    let timeoutId;
+    const timeout = new Promise(resolve => {
+        timeoutId = setTimeout(() => resolve(fallback), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
 async function renderCloudSync() {
+    // Load and display config
+    try {
+        const cfgResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_CONFIG' });
+        if (cfgResp?.ok && cfgResp.config) {
+            document.getElementById('cloud-api-key').value = cfgResp.config.apiKey || '';
+            document.getElementById('cloud-project-id').value = cfgResp.config.projectId || '';
+        }
+    } catch (_) { /* ignore */ }
+
     const statusResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
     const { configured, loggedIn, user, lastSync } = statusResp;
 
@@ -1166,14 +1183,16 @@ async function renderCloudSync() {
     const badge = document.getElementById('cloud-status-badge');
     const authForms = document.getElementById('cloud-auth-forms');
     const loggedInView = document.getElementById('cloud-logged-in');
+    const cfgMsg = document.getElementById('cloud-config-msg');
 
     msgEl.textContent = '';
+    if (cfgMsg) cfgMsg.textContent = '';
     
     if (!configured) {
         badge.textContent = 'Not Configured';
         badge.style.background = 'rgba(239, 68, 68, 0.12)';
         badge.style.color = 'var(--red-400)';
-        msgEl.textContent = 'Cloud sync requires Firebase config in setup.';
+        msgEl.textContent = 'Cloud sync requires Firebase config.';
         return;
     }
 
@@ -1200,6 +1219,36 @@ async function renderCloudSync() {
     }
 }
 
+document.getElementById('btn-cloud-save-config').addEventListener('click', async () => {
+    const apiKey = document.getElementById('cloud-api-key').value.trim();
+    const projectId = document.getElementById('cloud-project-id').value.trim();
+    const msg = document.getElementById('cloud-config-msg');
+
+    if (!apiKey || !projectId) {
+        msg.textContent = '❌ API Key and Project ID are required.';
+        msg.className = 'status-msg error';
+        return;
+    }
+
+    try {
+        const resp = await chrome.runtime.sendMessage({
+            type: 'CLOUD_SAVE_CONFIG',
+            config: { apiKey, projectId }
+        });
+        if (resp?.ok) {
+            msg.textContent = '✓ Config saved';
+            msg.className = 'status-msg success';
+            await renderCloudSync();
+        } else {
+            msg.textContent = resp?.error || '❌ Failed to save config';
+            msg.className = 'status-msg error';
+        }
+    } catch (err) {
+        msg.textContent = err.message || '❌ Failed to save config';
+        msg.className = 'status-msg error';
+    }
+});
+
 document.getElementById('btn-cloud-signin').addEventListener('click', async () => {
     const email = document.getElementById('cloud-email').value;
     const pwd = document.getElementById('cloud-password').value;
@@ -1217,7 +1266,16 @@ document.getElementById('btn-cloud-signin').addEventListener('click', async () =
     msg.className = 'status-msg';
     
     try {
-        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd });
+        const resp = await withTimeout(
+            chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd }).catch(() => null),
+            6000,
+            null
+        );
+        if (!resp) {
+            msg.textContent = '❌ Background not responding. Reload extension.';
+            msg.className = 'status-msg error';
+            return;
+        }
         if (resp.ok) {
             msg.textContent = '✓ Sign in successful!';
             msg.className = 'status-msg success';
@@ -1253,7 +1311,16 @@ document.getElementById('btn-cloud-signup').addEventListener('click', async () =
     msg.className = 'status-msg';
     
     try {
-        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_UP', email, password: pwd });
+        const resp = await withTimeout(
+            chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_UP', email, password: pwd }).catch(() => null),
+            6000,
+            null
+        );
+        if (!resp) {
+            msg.textContent = '❌ Background not responding. Reload extension.';
+            msg.className = 'status-msg error';
+            return;
+        }
         if (resp.ok) {
             msg.textContent = '✓ Account created & logged in!';
             msg.className = 'status-msg success';
@@ -1373,4 +1440,3 @@ function setupDashAuth() {
 // ── Init ───────────────────────────────────────────────────────
 setupDashAuth();
 loadAllData();
-

@@ -35,22 +35,33 @@ service cloud.firestore {
 ```
 *These rules ensure only you can read/write your own data.*
 
-## Step 4: Add Config to Code
+## Step 4: Add Firebase Config (No Code Changes)
 1. Go to your Firebase Project Settings (the gear icon top left).
 2. Under "Your apps", click the **Web `</>`** icon.
 3. Register the app (name it `Job Autofill`).
-4. You will be given a `firebaseConfig` object with your API Key and Project ID.
-5. Open `cloud-sync.js` in the extension code.
-6. Paste your `apiKey` and `projectId` into the `FIREBASE_CONFIG` object at the top of the file:
+4. You will be given a `firebaseConfig` object with your **API Key** and **Project ID**.
+5. Open the extension **Dashboard** → **Cloud Sync**.
+6. Paste **Firebase API Key** and **Project ID**, then click **Save Config**.
 
-```javascript
-const FIREBASE_CONFIG = {
-  apiKey: 'AIzaSyDocX...',
-  projectId: 'job-autofill-sync-123',
-};
-```
+*This stores the config locally in `chrome.storage.local` and keeps it out of the repo.*
 
-## Step 5: (Optional) Enable Google Login
+## Step 5: (Optional) Stable Extension ID (Recommended for Google Login)
+If you want the **same extension ID across devices**, keep a private `manifest.key` file locally.
+
+1. Generate a key (one time):
+   ```bash
+   openssl genrsa -out /tmp/job-autofill-key.pem 2048
+   openssl rsa -in /tmp/job-autofill-key.pem -outform DER | openssl base64 -A > manifest.key
+   ```
+2. Apply the key to `manifest.json`:
+   ```bash
+   node scripts/apply-manifest-key.js
+   ```
+3. Reload the extension. Your ID will now stay the same across machines **as long as you reuse the same `manifest.key`**.
+
+`manifest.key` is ignored by git and should never be committed.
+
+## Step 6: (Optional) Enable Google Login
 
 If you want to use the **Sign in with Google** button:
 
@@ -64,7 +75,7 @@ If you want to use the **Sign in with Google** button:
 8. Open `manifest.json` in your code and replace `"YOUR_GOOGLE_OAUTH_CLIENT_ID"` with your copied ID.
 9. *Note: If publishing the extension, or packing it, ensure you update the Key/Extension ID.*
 
-## Step 6: Reload Extension
+## Step 7: Reload Extension
 1. Go to `chrome://extensions/`
 2. Click the reload icon `↻` on the Job Autofill extension.
 3. Open the extension popup, and you will be asked to sign in to access your data!

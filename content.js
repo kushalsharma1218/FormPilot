@@ -21,6 +21,15 @@ try {
 console.log(`[Job Autofill] Content script loaded on: ${location.hostname} (stored under: ${hostname})`);
 
 let currentGlobalProfile = {};
+let siteData = { enabled: true, fields: {}, mappings: [] };
+let currentSiteKey = '';
+let currentSiteActive = true;
+let currentSiteMappings = [];
+let teachMode = false;
+let teachHandlerAttached = false;
+let pendingCapture = {};
+let captureTimer = null;
+const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
 
 const GLOBAL_HEURISTICS = [
   { pId: 'firstName', regex: /first.?name|given.?name|prenom|nombre/i },
@@ -54,8 +63,9 @@ function getGlobalMatch(fieldKey) {
 // Detect auto-generated/unstable IDs (UUIDs, purely numeric, long opaque hashes)
 // These change every page load so are useless as storage keys.
 function isUnstableId(str) {
+  if (FieldUtils && FieldUtils.isUnstableId) return FieldUtils.isUnstableId(str);
   if (!str) return false;
-  const s = str.trim();
+  const s = String(str).trim();
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) // UUID
     || /^\d+$/.test(s)                          // purely numeric
     || /^[a-z0-9]{20,}$/i.test(s);              // long opaque hash (no separators)
@@ -64,53 +74,300 @@ function isUnstableId(str) {
 // Known sensitive field patterns — never save these
 const SENSITIVE_RE = /ssn|social.?sec|\bsin\b|tax.?id|\bein\b|passport|bank.?acc|routing|\bcvv\b|credit.?card|debit|secret/i;
 
+function getRootNodeFor(el) {
+  try {
+    return el?.getRootNode ? el.getRootNode() : document;
+  } catch (_) {
+    return document;
+  }
+}
+
+function escapeForSelector(value) {
+  if (!value) return '';
+  if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(value);
+  return String(value).replace(/["\\]/g, '\\$&');
+}
+
+function queryInRoot(root, selector) {
+  if (!root || !root.querySelector) return null;
+  try {
+    return root.querySelector(selector);
+  } catch (_) {
+    return null;
+  }
+}
+
+function getNodeTextById(root, id) {
+  if (!id) return '';
+  const safeId = escapeForSelector(id);
+  let el = document.getElementById?.(id) || null;
+  if (!el && root && root !== document) {
+    el = queryInRoot(root, `#${safeId}`);
+  }
+  return el?.innerText?.trim() || '';
+}
+
+function getAncestorLabelText(el) {
+  if (!el || !el.closest) return '';
+  const container = el.closest('[data-automation-label],[data-qa-label],[data-field-label],[data-automation-id],[data-qa],[data-testid],[data-test],[data-name],.form-field,.field,.input-group,.field-wrapper');
+  if (!container) return '';
+  const attrLabel = container.getAttribute('data-automation-label')
+    || container.getAttribute('data-qa-label')
+    || container.getAttribute('data-field-label')
+    || container.getAttribute('aria-label');
+  if (attrLabel && String(attrLabel).trim()) return String(attrLabel).trim();
+  const labelEl = container.querySelector('label, [data-automation-id*="label"], [data-qa*="label"], [data-testid*="label"], [data-test*="label"], .label, .field-label, .input-label');
+  if (labelEl?.innerText?.trim()) return labelEl.innerText.trim();
+  return '';
+}
+
+function collectElements(selector) {
+  const results = [];
+  const seen = new Set();
+  const walk = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    try {
+      root.querySelectorAll(selector).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        results.push(el);
+      });
+    } catch (_) { }
+    root.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    });
+  };
+  walk(document);
+  return results;
+}
+
 function getFieldKey(el) {
+  const root = getRootNodeFor(el);
   // 1. aria-labelledby: resolve the label element's text
   const labelledBy = el.getAttribute('aria-labelledby');
+  let labelledByText = '';
   if (labelledBy) {
-    const labelText = labelledBy.split(' ')
-      .map(id => document.getElementById(id)?.innerText?.trim())
+    labelledByText = labelledBy.split(' ')
+      .map(id => getNodeTextById(root, id))
       .filter(Boolean).join(' ');
-    if (labelText) return labelText;
+  }
+
+  // 1b. aria-describedby (some frameworks use it for label-like text)
+  const describedBy = el.getAttribute('aria-describedby');
+  let describedByText = '';
+  if (describedBy) {
+    describedByText = describedBy.split(' ')
+      .map(id => getNodeTextById(root, id))
+      .filter(Boolean).join(' ');
   }
 
   // 2. label[for="ID"]
+  let labelForText = '';
   if (el.id) {
-    const label = document.querySelector(`label[for="${el.id}"]`);
-    if (label && label.innerText.trim()) return label.innerText.trim();
+    const safeId = escapeForSelector(el.id);
+    const label = queryInRoot(root, `label[for="${safeId}"]`) || document.querySelector(`label[for="${safeId}"]`);
+    if (label && label.innerText.trim()) labelForText = label.innerText.trim();
   }
 
   // 3. Closest label parent
+  let parentLabelText = '';
   const parentLabel = el.closest('label');
-  if (parentLabel && parentLabel.innerText.trim()) return parentLabel.innerText.trim();
+  if (parentLabel && parentLabel.innerText.trim()) parentLabelText = parentLabel.innerText.trim();
 
   // 4. Preceding sibling label (common in simple layouts)
+  let prevLabelText = '';
   const prev = el.previousElementSibling;
   if (prev && (prev.tagName === 'LABEL' || prev.classList.contains('label'))) {
-    if (prev.innerText.trim()) return prev.innerText.trim();
+    if (prev.innerText.trim()) prevLabelText = prev.innerText.trim();
   }
 
   // 5. Ancestor Text Fallback (New)
   // If no direct label found, check the closest container for heading text
   const container = el.closest('.form-group, .field-wrapper, .input-row, [role="group"]');
+  let headingText = '';
   if (container) {
     const heading = container.querySelector('h1, h2, h3, h4, .title, .heading');
-    if (heading && heading.innerText.trim()) return heading.innerText.trim();
+    if (heading && heading.innerText.trim()) headingText = heading.innerText.trim();
   }
 
+  const ancestorLabelText = getAncestorLabelText(el);
+  const ancestorAutomationId = el.closest?.('[data-automation-id]')?.getAttribute('data-automation-id') || '';
+  const ancestorTestId = el.closest?.('[data-testid],[data-test],[data-qa]')?.getAttribute('data-testid')
+    || el.closest?.('[data-testid],[data-test],[data-qa]')?.getAttribute('data-test')
+    || el.closest?.('[data-testid],[data-test],[data-qa]')?.getAttribute('data-qa')
+    || '';
+
   // 6. Prefer name > stable id > aria-label > placeholder
-  const candidates = [
+  const candidates = {
+    labelledByText,
+    describedByText,
+    labelForText,
+    parentLabelText,
+    prevLabelText,
+    headingText,
+    ancestorLabelText,
+    name: el.name,
+    id: el.id,
+    ariaLabel: el.getAttribute('aria-label'),
+    placeholder: el.placeholder,
+    dataAutomationId: el.getAttribute('data-automation-id'),
+    dataQa: el.getAttribute('data-qa'),
+    dataTest: el.getAttribute('data-test') || el.getAttribute('data-testid'),
+    dataName: el.getAttribute('data-name'),
+    ancestorAutomationId,
+    ancestorTestId,
+  };
+
+  if (FieldUtils && FieldUtils.selectFieldKey) {
+    return FieldUtils.selectFieldKey(candidates);
+  }
+
+  // Fallback: simplified selection
+  const fallbackOrder = [
+    labelledByText,
+    describedByText,
+    labelForText,
+    parentLabelText,
+    prevLabelText,
+    headingText,
+    ancestorLabelText,
     el.name,
+    el.getAttribute('data-automation-id'),
+    ancestorAutomationId,
+    el.getAttribute('data-qa'),
+    ancestorTestId,
+    el.getAttribute('data-test') || el.getAttribute('data-testid'),
+    el.getAttribute('data-name'),
     el.id,
     el.getAttribute('aria-label'),
     el.placeholder,
   ];
-  for (const c of candidates) {
-    if (!c || !c.trim()) continue;
-    if (isUnstableId(c.trim())) continue;
-    return c.trim();
+  for (const c of fallbackOrder) {
+    if (!c || !String(c).trim()) continue;
+    if (isUnstableId(c)) continue;
+    return String(c).trim();
   }
   return null;
+}
+
+function getFieldSignature(el) {
+  const type = (el.type || '').toLowerCase();
+  const role = el.getAttribute('role') || '';
+  const label = getFieldKey(el) || '';
+  const name = el.name || '';
+  const id = el.id || '';
+  const aria = el.getAttribute('aria-label') || '';
+  const placeholder = el.placeholder || '';
+  const dataAutomationId = el.getAttribute('data-automation-id') || '';
+  const dataTest = el.getAttribute('data-test') || el.getAttribute('data-testid') || '';
+  const dataQa = el.getAttribute('data-qa') || '';
+  const heading = el.closest('fieldset')?.querySelector('legend')?.innerText?.trim() || '';
+  const path = getDomPath(el);
+  const raw = [
+    label, name, id, aria, placeholder, dataAutomationId, dataTest, dataQa, heading, role, type, path
+  ].map(s => (s || '').toString().trim().toLowerCase()).join('|');
+  return simpleHash(raw);
+}
+
+function getDomPath(el) {
+  const parts = [];
+  let node = el;
+  let depth = 0;
+  while (node && node !== document.body && depth < 5) {
+    const tag = node.tagName ? node.tagName.toLowerCase() : 'node';
+    const role = node.getAttribute?.('role') || '';
+    const name = node.getAttribute?.('name') || '';
+    const id = node.id || '';
+    parts.push([tag, role, name, id].filter(Boolean).join('#'));
+    node = node.parentElement;
+    depth++;
+  }
+  return parts.reverse().join('>');
+}
+
+function simpleHash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    hash = hash & 0xffffffff;
+  }
+  return `h${Math.abs(hash)}`;
+}
+
+function resolveMappedKey(el) {
+  const signature = getFieldSignature(el);
+  const mapping = currentSiteMappings.find(m => m.signature === signature);
+  if (mapping?.mappedKey) {
+    return { key: mapping.mappedKey, signature, mapping };
+  }
+  return { key: null, signature, mapping: null };
+}
+
+function getFieldValue(el) {
+  const tag = el.tagName?.toUpperCase();
+  const type = (el.type || '').toLowerCase();
+  if (type === 'radio') return el.checked ? (el.value || 'true') : '';
+  if (type === 'checkbox') return el.checked ? 'true' : 'false';
+  if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+    return (el.innerText || el.textContent || '').trim();
+  }
+  if (tag === 'SELECT' && el.multiple) {
+    const vals = Array.from(el.selectedOptions).map(o => o.value || o.textContent?.trim()).filter(Boolean);
+    return vals.join(',');
+  }
+  if (tag === 'SELECT') {
+    const opt = el.options[el.selectedIndex];
+    if (!opt) return '';
+    return opt.text?.trim() || opt.value || '';
+  }
+  if (el.getAttribute('role') === 'combobox') {
+    const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
+    if (inputChild?.value) return inputChild.value.trim();
+    const activeId = el.getAttribute('aria-activedescendant');
+    if (activeId) {
+      const root = getRootNodeFor(el);
+      const activeEl = document.getElementById(activeId) || queryInRoot(root, `#${escapeForSelector(activeId)}`);
+      const activeText = activeEl?.innerText?.trim();
+      if (activeText) return activeText;
+    }
+    return el.getAttribute('aria-valuetext')
+      || el.getAttribute('aria-valuenow')
+      || el.getAttribute('data-value')
+      || el.innerText?.trim()
+      || '';
+  }
+  if (el.getAttribute('role') === 'listbox') {
+    const selected = el.querySelectorAll('[role="option"][aria-selected="true"]');
+    if (selected.length === 0) {
+      const activeId = el.getAttribute('aria-activedescendant');
+      if (activeId) {
+        const root = getRootNodeFor(el);
+        const activeEl = document.getElementById(activeId) || queryInRoot(root, `#${escapeForSelector(activeId)}`);
+        const activeText = activeEl?.innerText?.trim();
+        if (activeText) return activeText;
+      }
+    }
+    const vals = Array.from(selected).map(o => o.getAttribute('data-value') || o.getAttribute('value') || o.innerText?.trim()).filter(Boolean);
+    return vals.join(',');
+  }
+  return (el.value || '').trim();
+}
+
+function queueCapture(fields) {
+  if (!fields || Object.keys(fields).length === 0) return;
+  if (!currentSiteActive) return;
+  pendingCapture = { ...pendingCapture, ...fields };
+  if (captureTimer) clearTimeout(captureTimer);
+  captureTimer = setTimeout(async () => {
+    const payload = { ...pendingCapture };
+    pendingCapture = {};
+    try {
+      await chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields: payload });
+      await chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields: payload });
+    } catch (err) {
+      console.warn('[Job Autofill] Capture save failed:', err?.message || err);
+    }
+  }, 700);
 }
 
 // Returns true if a field likely holds sensitive personal data we should never store
@@ -120,6 +377,9 @@ function isSensitiveField(el) {
     ? (el.getAttribute('aria-labelledby').split(' ')
       .map(id => document.getElementById(id)?.innerText || '').join(' '))
     : '';
+  if (FieldUtils && FieldUtils.isSensitiveKey) {
+    return FieldUtils.isSensitiveKey({ key, label });
+  }
   return SENSITIVE_RE.test(key) || SENSITIVE_RE.test(label);
 }
 
@@ -308,42 +568,19 @@ function getFormFields() {
   }
 
   // Exclude: hidden, submit, button, reset, file, PASSWORD (security!), single-char OTPs
-  // ── Deep Tree / Shadow DOM Scan (New) ──
-  // Pierces Shadow Roots and captures fields even in complex web components
-  const allElements = [];
-  const walk = (root) => {
-    const nodes = root.querySelectorAll(selectors + ', [role="combobox"], [role="listbox"], input[type=radio]');
-    nodes.forEach(n => allElements.push(n));
-    // Check for Shadow Roots
-    root.querySelectorAll('*').forEach(el => {
-      if (el.shadowRoot) walk(el.shadowRoot);
-    });
-  };
-  walk(document);
-
-  // Filter out: hidden, submit, button, reset, file, PASSWORD, etc.
-  const queryNodes = (nodes) => {
-    const found = [];
-    nodes.forEach(el => {
-      const type = (el.type || '').toLowerCase();
-      if (type === 'hidden' || type === 'submit' || type === 'password' || type === 'file') return;
-      found.push(el);
-    });
-    return found;
-  };
-  
-  const validElements = queryNodes(allElements);
+  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
 
   // ── Index-aware capture: duplicate keys get suffixed [0], [1], etc. ──
   const elements = [];
-  document.querySelectorAll(selectors).forEach(el => {
+  collectElements(selectors).forEach(el => {
     const type = (el.type || '').toLowerCase();
     if (type === 'radio') return;
     // Skip OTP-style single-character inputs
     if (type === 'text' && el.maxLength === 1) return;
     // Skip sensitive fields (SSN, bank, passport, etc.)
     if (isSensitiveField(el)) return;
-    const key = getFieldKey(el);
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
     if (!key) return;
     elements.push({ el, key, type });
   });
@@ -354,29 +591,27 @@ function getFormFields() {
     keyIndex[key] = (keyIndex[key] || 0);
     const fieldKey = keyCounts[key] > 1 ? `${key}[${keyIndex[key]++}]` : key;
 
-    if (type === 'checkbox') {
-      fields[fieldKey] = el.checked ? 'true' : 'false';
-    } else if (el.tagName === 'SELECT' && el.multiple) {
-      const vals = Array.from(el.selectedOptions).map(o => o.value);
-      if (vals.length) fields[fieldKey] = vals.join(',');
-    } else if (el.tagName === 'SELECT') {
-      const opt = el.options[el.selectedIndex];
-      if (opt && opt.value !== '' && !/^[-\s]*(select|choose|pick)/i.test(opt.text)) {
-        // Store BOTH value and text as a combined string for better matching across sites
-        fields[fieldKey] = opt.text.trim(); 
-      }
-    } else {
-      const value = el.value.trim();
-      if (value && value !== el.placeholder) {
-        fields[fieldKey] = value;
-      }
+    const value = getFieldValue(el);
+    if (value && value !== el.placeholder) {
+      // Skip placeholder-like values
+      if (el.tagName === 'SELECT' && /^[-\s]*(select|choose|pick)/i.test(value)) return;
+      fields[fieldKey] = value;
     }
+  });
+
+  // ── Radio groups ────────────────────────────────────────────
+  collectElements('input[type=radio]:checked').forEach(el => {
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || el.name || getFieldKey(el);
+    if (!key) return;
+    fields[key] = el.value || 'true';
   });
 
   // ── Custom ARIA comboboxes (index-aware) ──
   const comboEls = [];
-  document.querySelectorAll('[role="combobox"]').forEach(el => {
-    const key = getFieldKey(el);
+  collectElements('[role="combobox"]').forEach(el => {
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
     if (!key) return;
     comboEls.push({ el, key });
   });
@@ -386,26 +621,25 @@ function getFormFields() {
   comboEls.forEach(({ el, key }) => {
     comboIndex[key] = (comboIndex[key] || 0);
     const fieldKey = comboCounts[key] > 1 ? `${key}[${comboIndex[key]++}]` : key;
-    const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
-    if (inputChild && inputChild.value.trim()) {
-      fields[fieldKey] = inputChild.value.trim();
-      return;
-    }
-    const text = el.getAttribute('aria-valuenow')
-      || el.getAttribute('data-value')
-      || el.innerText?.trim();
-    if (text) fields[fieldKey] = text;
+    const value = getFieldValue(el);
+    if (value) fields[fieldKey] = value;
   });
 
   // ── ARIA listboxes ──
-  document.querySelectorAll('[role="listbox"]').forEach(listbox => {
-    const key = getFieldKey(listbox);
+  collectElements('[role="listbox"]').forEach(listbox => {
+    const mapped = resolveMappedKey(listbox);
+    const key = mapped.key || getFieldKey(listbox);
     const selected = listbox.querySelectorAll('[role="option"][aria-selected="true"]');
-    if (selected.length === 0 || !key) return;
-    const values = Array.from(selected).map(o =>
-      o.getAttribute('data-value') || o.getAttribute('value') || o.innerText?.trim()
-    ).filter(Boolean);
-    if (values.length) fields[key] = values.join(',');
+    if (!key) return;
+    if (selected.length > 0) {
+      const values = Array.from(selected).map(o =>
+        o.getAttribute('data-value') || o.getAttribute('value') || o.innerText?.trim()
+      ).filter(Boolean);
+      if (values.length) fields[key] = values.join(',');
+    } else {
+      const value = getFieldValue(listbox);
+      if (value) fields[key] = value;
+    }
   });
 
   // ── General display-field capture (for review/confirmation pages) ──
@@ -431,14 +665,28 @@ function setNativeValue(el, val) {
   else el.value = val;
 }
 
-function fillFields(savedFields) {
+function setEditableValue(el, val) {
+  if (!el) return false;
+  if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+    el.innerText = val;
+    triggerEvents(el);
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+    return true;
+  }
+  return false;
+}
+
+function fillFields(savedFields, opts = {}) {
+  const skipObserver = !!opts.skipObserver;
   // Exclude: hidden, submit, button, reset, file, PASSWORD (security!), single-char OTPs
-  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select';
+  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
 
   // Radio buttons
-  document.querySelectorAll('input[type=radio]').forEach(el => {
-    if (!el.name || !(el.name in savedFields)) return;
-    if (el.value === savedFields[el.name]) {
+  collectElements('input[type=radio]').forEach(el => {
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || el.name;
+    if (!key || !(key in savedFields)) return;
+    if (el.value === savedFields[key]) {
       el.checked = true;
       triggerEvents(el);
     }
@@ -446,10 +694,11 @@ function fillFields(savedFields) {
 
   // Build same index-aware key map as in getFormFields so positions match
   const elements = [];
-  document.querySelectorAll(selectors).forEach(el => {
+  collectElements(selectors).forEach(el => {
     const type = (el.type || '').toLowerCase();
     if (type === 'radio') return;
-    const key = getFieldKey(el);
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
     if (!key) return;
     elements.push({ el, key, type });
   });
@@ -496,6 +745,8 @@ function fillFields(savedFields) {
       if (matched) {
         triggerEvents(el);
       }
+    } else if (setEditableValue(el, val)) {
+      return;
     } else {
       const currentVal = el.value.trim();
       if (currentVal) return;
@@ -507,8 +758,9 @@ function fillFields(savedFields) {
 
   // ── Custom ARIA comboboxes (index-aware) ───────────────────────
   const comboboxEls = [];
-  document.querySelectorAll('[role="combobox"]').forEach(el => {
-    const key = getFieldKey(el);
+  collectElements('[role="combobox"]').forEach(el => {
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
     if (!key) return;
     comboboxEls.push({ el, key });
   });
@@ -531,17 +783,22 @@ function fillFields(savedFields) {
     }
     el.click();
     setTimeout(() => {
-      const allOptions = document.querySelectorAll('[role="option"]');
-      for (const opt of allOptions) {
-        const optVal = opt.getAttribute('data-value') || opt.getAttribute('value') || opt.innerText?.trim();
-        if (optVal === val) { opt.click(); break; }
+      const root = getRootNodeFor(el);
+      const optionSets = [root, document].filter((r, idx, arr) => r && arr.indexOf(r) === idx);
+      for (const r of optionSets) {
+        const allOptions = r.querySelectorAll ? r.querySelectorAll('[role="option"]') : [];
+        for (const opt of allOptions) {
+          const optVal = opt.getAttribute('data-value') || opt.getAttribute('value') || opt.innerText?.trim();
+          if (optVal === val) { opt.click(); return; }
+        }
       }
     }, 150);
   });
 
   // ── Custom ARIA listboxes (already expanded) ───────────────────
-  document.querySelectorAll('[role="listbox"]').forEach(listbox => {
-    const key = getFieldKey(listbox);
+  collectElements('[role="listbox"]').forEach(listbox => {
+    const mapped = resolveMappedKey(listbox);
+    const key = mapped.key || getFieldKey(listbox);
     if (!key) return;
     let val = savedFields[key];
     if (val === undefined) val = getGlobalMatch(key);
@@ -555,30 +812,255 @@ function fillFields(savedFields) {
 
   // ── MutationObserver: fill fields added dynamically (conditional logic, "+ Add job") ──
   // Disconnect any previous observer so we don't stack them
-  if (window._jaObserver) window._jaObserver.disconnect();
-  let observerTimer;
-  window._jaObserver = new MutationObserver(() => {
-    clearTimeout(observerTimer);
-    // Debounce: wait for DOM to settle before re-filling
-    observerTimer = setTimeout(() => {
-      fillStandardFields(savedFields);
-    }, 300);
-  });
-  window._jaObserver.observe(document.body, { childList: true, subtree: true, attributes: false });
+  if (!skipObserver) {
+    if (window._jaObserver) window._jaObserver.disconnect();
+    let observerTimer;
+    window._jaObserver = new MutationObserver(() => {
+      clearTimeout(observerTimer);
+      // Debounce: wait for DOM to settle before re-filling
+      observerTimer = setTimeout(() => {
+        fillFields(savedFields, { skipObserver: true });
+      }, 300);
+    });
+    window._jaObserver.observe(document.body, { childList: true, subtree: true, attributes: false });
 
-  // Stop observing after 30s (form is likely done changing by then)
-  setTimeout(() => window._jaObserver?.disconnect(), 30000);
+    // Stop observing after 30s (form is likely done changing by then)
+    setTimeout(() => window._jaObserver?.disconnect(), 30000);
+  }
+}
+
+function attachLiveCapture() {
+  if (window._jaLiveCaptureAttached) return;
+  window._jaLiveCaptureAttached = true;
+  const handler = (e) => {
+    let el = e.target;
+    if (!el) return;
+
+    // If clicking an option inside a custom dropdown, capture on the parent listbox/combobox
+    if (el.getAttribute && el.getAttribute('role') === 'option') {
+      const listbox = el.closest?.('[role="listbox"]');
+      const combo = el.closest?.('[role="combobox"]');
+      el = combo || listbox || el;
+    }
+
+    const tag = (el.tagName || '').toUpperCase();
+    const role = el.getAttribute?.('role');
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && role !== 'combobox' && role !== 'listbox' && role !== 'textbox' && !el.isContentEditable) return;
+    const type = (el.type || '').toLowerCase();
+    if (type === 'password' || type === 'file' || type === 'hidden') return;
+    if (type === 'radio' && !el.checked) return;
+    if (isSensitiveField(el)) return;
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
+    if (!key) return;
+    const value = getFieldValue(el);
+    if (!value) return;
+    if (el.tagName === 'SELECT' && /^[-\s]*(select|choose|pick)/i.test(value)) return;
+    queueCapture({ [key]: value });
+  };
+  document.addEventListener('input', handler, true);
+  document.addEventListener('change', handler, true);
+  document.addEventListener('blur', handler, true);
+  document.addEventListener('click', handler, true);
+}
+
+function startTeachMode() {
+  if (teachMode) return;
+  teachMode = true;
+  showTeachBanner();
+  if (!teachHandlerAttached) {
+    document.addEventListener('click', handleTeachClick, true);
+    document.addEventListener('keydown', handleTeachKeydown, true);
+    teachHandlerAttached = true;
+  }
+}
+
+function stopTeachMode() {
+  teachMode = false;
+  removeTeachBanner();
+  removeTeachOverlay();
+  if (teachHandlerAttached) {
+    document.removeEventListener('click', handleTeachClick, true);
+    document.removeEventListener('keydown', handleTeachKeydown, true);
+    teachHandlerAttached = false;
+  }
+  chrome.runtime.sendMessage({ type: 'TEACH_MODE_DONE' }).catch(() => {});
+}
+
+function handleTeachKeydown(e) {
+  if (e.key === 'Escape') {
+    stopTeachMode();
+  }
+}
+
+function handleTeachClick(e) {
+  if (!teachMode) return;
+  const el = e.target;
+  if (!el) return;
+  const tag = (el.tagName || '').toUpperCase();
+  const role = el.getAttribute('role');
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && role !== 'combobox' && role !== 'listbox' && role !== 'textbox' && !el.isContentEditable) return;
+  if (isSensitiveField(el)) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const label = getFieldKey(el) || el.getAttribute('aria-label') || el.placeholder || 'Field';
+  const signature = getFieldSignature(el);
+  const type = (el.type || el.tagName || '').toLowerCase();
+  const value = getFieldValue(el);
+  showTeachOverlay({ el, label, signature, type, value });
+}
+
+function showTeachBanner() {
+  if (document.getElementById('ja-teach-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'ja-teach-banner';
+  banner.innerHTML = `
+    <style>
+      #ja-teach-banner {
+        position: fixed; bottom: 18px; right: 18px; z-index: 2147483647;
+        background: rgba(17,24,39,0.95); color: #fff; padding: 10px 14px;
+        border-radius: 10px; border: 1px solid rgba(99,102,241,0.4);
+        font-size: 12px; font-family: system-ui, sans-serif;
+        box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+      }
+      #ja-teach-banner strong { color: #a5b4fc; }
+    </style>
+    <div><strong>Teach Mode</strong>: click a field to map it. Press Esc to exit.</div>
+  `;
+  document.body.appendChild(banner);
+}
+
+function removeTeachBanner() {
+  const banner = document.getElementById('ja-teach-banner');
+  if (banner) banner.remove();
+}
+
+function removeTeachOverlay() {
+  const overlay = document.getElementById('ja-teach-overlay');
+  if (overlay) overlay.remove();
+}
+
+function showTeachOverlay({ label, signature, type, value }) {
+  removeTeachOverlay();
+  const overlay = document.createElement('div');
+  overlay.id = 'ja-teach-overlay';
+  const globalKeys = Object.keys(currentGlobalProfile || {});
+  const customKeys = new Set();
+  Object.keys((siteData && siteData.fields) || {}).forEach(k => {
+    if (k.startsWith('custom:')) customKeys.add(k.replace('custom:', ''));
+  });
+  currentSiteMappings.forEach(m => {
+    if (m.mappedKey?.startsWith('custom:')) customKeys.add(m.mappedKey.replace('custom:', ''));
+  });
+  const options = [
+    ...globalKeys.sort().map(k => `<option value="${k}">${k}</option>`),
+    ...Array.from(customKeys).sort().map(k => `<option value="custom:${k}">custom: ${k}</option>`),
+    `<option value="__custom__">+ Add custom field</option>`
+  ].join('');
+
+  overlay.innerHTML = `
+    <style>
+      #ja-teach-overlay {
+        position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+        z-index: 2147483647; background: #0f172a; color: #e2e8f0;
+        border: 1px solid rgba(99,102,241,0.4); border-radius: 12px;
+        padding: 14px; min-width: 280px; max-width: 360px;
+        font-family: system-ui, sans-serif; box-shadow: 0 12px 30px rgba(0,0,0,0.45);
+      }
+      #ja-teach-overlay h4 { margin: 0 0 6px; font-size: 13px; color: #a5b4fc; }
+      #ja-teach-overlay .label { font-size: 12px; margin-bottom: 10px; color: #cbd5f5; }
+      #ja-teach-overlay select, #ja-teach-overlay input {
+        width: 100%; padding: 8px 10px; border-radius: 8px;
+        border: 1px solid rgba(99,102,241,0.3); background: #0b1220; color: #e2e8f0;
+        font-size: 12px; margin-bottom: 8px;
+      }
+      #ja-teach-overlay .actions { display:flex; gap:8px; justify-content:flex-end; }
+      #ja-teach-overlay button {
+        padding: 6px 10px; border-radius: 8px; border: none; cursor: pointer;
+        font-size: 12px; font-weight: 600;
+      }
+      #ja-teach-save { background: #6366f1; color: #fff; }
+      #ja-teach-cancel { background: rgba(255,255,255,0.08); color: #cbd5f5; }
+    </style>
+    <h4>Teach Field</h4>
+    <div class="label">Detected: ${label}</div>
+    <select id="ja-teach-select">${options}</select>
+    <input id="ja-teach-custom" placeholder="Custom field name" style="display:none;" />
+    <div class="actions">
+      <button id="ja-teach-cancel">Cancel</button>
+      <button id="ja-teach-save">Save</button>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+  const select = overlay.querySelector('#ja-teach-select');
+  const customInput = overlay.querySelector('#ja-teach-custom');
+  select.addEventListener('change', () => {
+    if (select.value === '__custom__') {
+      customInput.style.display = 'block';
+      customInput.focus();
+    } else {
+      customInput.style.display = 'none';
+    }
+  });
+
+  overlay.querySelector('#ja-teach-cancel').addEventListener('click', () => {
+    removeTeachOverlay();
+  });
+  overlay.querySelector('#ja-teach-save').addEventListener('click', async () => {
+    let mappedKey = select.value;
+    if (mappedKey === '__custom__') {
+      const customLabel = (customInput.value || '').trim();
+      if (!customLabel) return;
+      mappedKey = `custom:${customLabel}`;
+    }
+    const mapping = { signature, mappedKey, label, type };
+    const resp = await chrome.runtime.sendMessage({ type: 'SAVE_SITE_MAPPING', hostname, mapping }).catch(() => null);
+    if (resp?.mappings) {
+      currentSiteMappings = resp.mappings;
+      siteData.mappings = resp.mappings;
+    } else {
+      const idx = currentSiteMappings.findIndex(m => m.signature === mapping.signature);
+      if (idx >= 0) currentSiteMappings[idx] = { ...currentSiteMappings[idx], ...mapping };
+      else currentSiteMappings.push(mapping);
+      siteData.mappings = currentSiteMappings;
+    }
+    if (value) {
+      const payload = { [mappedKey]: value };
+      await chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields: payload });
+      await chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields: payload });
+    }
+    removeTeachOverlay();
+    showSaveToast('Field learned');
+  });
+}
+
+function showSaveToast(message) {
+  const existing = document.getElementById('ja-teach-toast');
+  if (existing) existing.remove();
+  const t = document.createElement('div');
+  t.id = 'ja-teach-toast';
+  t.textContent = message;
+  t.style.cssText = `
+    position: fixed; bottom: 60px; right: 18px; z-index: 2147483647;
+    background: #111827; color: #e2e8f0; padding: 8px 12px; border-radius: 10px;
+    border: 1px solid rgba(99,102,241,0.4); font-size: 12px;
+  `;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 1800);
 }
 
 // Fills only standard (non-ARIA) fields — used by MutationObserver re-runs
 function fillStandardFields(savedFields) {
-  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select';
+  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
   const elements = [];
-  document.querySelectorAll(selectors).forEach(el => {
+  collectElements(selectors).forEach(el => {
     const type = (el.type || '').toLowerCase();
     if (type === 'radio') return;
     if (type === 'text' && el.maxLength === 1) return;
-    const key = getFieldKey(el);
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
     if (!key) return;
     elements.push({ el, key, type });
   });
@@ -594,6 +1076,8 @@ function fillStandardFields(savedFields) {
     if (type === 'checkbox') {
       el.checked = val === 'true' || val === true;
       triggerEvents(el);
+    } else if (setEditableValue(el, val)) {
+      return;
     } else {
       setNativeValue(el, val);
       triggerEvents(el);
@@ -673,7 +1157,9 @@ function showAutofillBanner(savedFields) {
   };
   document.getElementById('ja-never').onclick = () => {
     sessionStorage.setItem('ja_autofill_dismissed', 'true');
+    currentSiteActive = false;
     chrome.runtime.sendMessage({ type: 'DISABLE_SITE', hostname });
+    chrome.runtime.sendMessage({ type: 'SESSION_CLEAR', hostname }).catch(() => {});
     banner.remove();
   };
 
@@ -755,7 +1241,9 @@ function showSaveDataBanner(fields) {
   document.getElementById('ja-save-never').onmousedown = (e) => {
     e.preventDefault();
     e.stopPropagation();
+    currentSiteActive = false;
     chrome.runtime.sendMessage({ type: 'DISABLE_SITE', hostname });
+    chrome.runtime.sendMessage({ type: 'SESSION_CLEAR', hostname }).catch(() => {});
     banner.remove();
   };
 
@@ -771,6 +1259,8 @@ function showSaveDataBanner(fields) {
 
 // ── Recording: capture on form submit or button click ─────────
 function attachRecorder() {
+  if (window._jaRecorderAttached) return;
+  window._jaRecorderAttached = true;
   // Debounce: prevent double-banner when BOTH mousedown + submit events fire
   // for the same button click (common on native HTML forms)
   let submissionDebounceTimer = null;
@@ -784,6 +1274,7 @@ function attachRecorder() {
     console.log(`[Job Autofill] Captured fields:`, fields);
 
     if (Object.keys(fields).length > 0) {
+      chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields }).catch(() => {});
       // If user previously clicked Save on page 1, silently save page 2+ data
       if (sessionStorage.getItem('ja_prompt_skipped') === 'true') {
         console.log(`[Job Autofill] Banner skipped this session. Silently saving data.`);
@@ -853,7 +1344,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const fields = getFormFields();
       const count = Object.keys(fields).length;
       if (count > 0) {
-        chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields })
+        Promise.all([
+          chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields }),
+          chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields }),
+        ])
           .then(() => sendResponse({ ok: true, count }))
           .catch(() => sendResponse({ ok: false, count: 0 }));
       } else {
@@ -867,10 +1361,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'MANUAL_AUTOFILL') {
-    chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname })
-      .then(resp => {
-        if (resp?.site?.fields && Object.keys(resp.site.fields).length > 0) {
-          fillFields(resp.site.fields);
+    Promise.all([
+      chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }),
+      chrome.runtime.sendMessage({ type: 'SESSION_GET', hostname }).catch(() => ({ ok: false, fields: {} })),
+    ])
+      .then(([resp, sessionResp]) => {
+        const site = resp?.site || { enabled: true, fields: {}, mappings: [] };
+        currentSiteMappings = site.mappings || currentSiteMappings;
+        siteData = site;
+        currentSiteActive = !(site?.disabled || site?.enabled === false);
+        const merged = { ...(site.fields || {}), ...(sessionResp?.fields || {}) };
+        if (Object.keys(merged).length > 0 || Object.keys(currentGlobalProfile || {}).length > 0) {
+          sessionStorage.setItem('ja_autofill_active', 'true');
+          fillFields(merged);
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false });
@@ -880,6 +1383,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.error('[Job Autofill] MANUAL_AUTOFILL error:', err);
         sendResponse({ ok: false });
       });
+    return true;
+  }
+
+  if (msg.type === 'TEACH_MODE_START') {
+    startTeachMode();
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'TEACH_MODE_STOP') {
+    stopTeachMode();
+    sendResponse({ ok: true });
     return true;
   }
 
@@ -920,11 +1435,19 @@ async function init() {
   try {
     console.log(`[Job Autofill] Initializing on ${location.href}`);
 
-    const resp = await chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname });
+    const [resp, profileResp, sessionResp] = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }),
+      chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }),
+      chrome.runtime.sendMessage({ type: 'SESSION_GET', hostname }).catch(() => ({ ok: false, fields: {} }))
+    ]);
     const site = resp?.site;
+    siteData = site || { enabled: true, fields: {}, mappings: [] };
+    currentSiteKey = resp?.siteKey || hostname;
+    currentSiteMappings = siteData.mappings || [];
     
     // 1. If explicitly blocked ("Never") OR toggled off in popup, stop completely
-    if (site?.disabled || site?.enabled === false) {
+    currentSiteActive = !(site?.disabled || site?.enabled === false);
+    if (!currentSiteActive) {
       console.log(`[Job Autofill] Extension inactive for ${hostname} (Disabled: ${!!site?.disabled}, Enabled: ${site?.enabled})`);
       return;
     }
@@ -932,20 +1455,23 @@ async function init() {
     // Always attach the recorder so we can prompt to save on any site that is active
     attachRecorder();
 
-    const profileResp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' });
     currentGlobalProfile = profileResp?.profile || {};
+    const sessionFields = sessionResp?.fields || {};
+    const mergedFields = { ...(site?.fields || {}), ...(sessionFields || {}) };
 
-    const savedCount = Object.keys(site.fields || {}).length;
+    const savedCount = Object.keys(mergedFields || {}).length;
     const globalCount = Object.keys(currentGlobalProfile || {}).length;
     if (savedCount > 0 || globalCount > 0) {
       if (sessionStorage.getItem('ja_autofill_active') === 'true') {
         console.log(`[Job Autofill] Autofill session active. Auto-filling new fields...`);
-        fillFields(site.fields || {});
+        fillFields(mergedFields || {});
       } else {
         // Small delay to let the page fully render
-        setTimeout(() => showAutofillBanner(site.fields || {}), 800);
+        setTimeout(() => showAutofillBanner(mergedFields || {}), 800);
       }
     }
+
+    attachLiveCapture();
   } catch (err) {
     // Extension context invalidated (e.g., extension was updated/reloaded)
     if (err.message?.includes('Extension context invalidated')) {
