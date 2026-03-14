@@ -1,4 +1,4 @@
-# Job Autofill — AI Job Copilot 🤖
+# HireFlow AI — Ultimate Career Copilot 🚀
 
 A powerful, privacy-first Chrome Extension that automates job applications using local data and AI-powered intelligence.
 

@@ -552,17 +552,30 @@ function setupAuthListeners() {
         // 1. Get Google Access Token via Chrome Identity API
         chrome.identity.getAuthToken({ interactive: true }, async (token) => {
           if (chrome.runtime.lastError || !token) {
-            msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
+            const errorMsg = chrome.runtime.lastError?.message || 'Google Auth failed';
+            console.error('[Popup] getAuthToken error:', errorMsg);
+            msg.textContent = errorMsg + (errorMsg.includes('mismatch') ? ' (Check Extension ID)' : '');
             btnGoogle.disabled = false;
             return;
           }
 
           // 2. Pass to Background for Firebase Auth
-          const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN_GOOGLE', accessToken: token });
-          if (resp.ok) {
-            window.location.reload();
-          } else {
-            msg.textContent = resp.error;
+          try {
+            const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN_GOOGLE', accessToken: token });
+            if (resp.ok) {
+              window.location.reload();
+            } else {
+              console.error('[Popup] CLOUD_SIGN_IN_GOOGLE error:', resp.error);
+              // If Firebase rejects the token, it might be expired or cached wrong.
+              // We'll clear the cache so the next click forces a fresh one.
+              if (chrome.identity.removeCachedAuthToken) {
+                chrome.identity.removeCachedAuthToken({ token: token }, () => {});
+              }
+              msg.textContent = resp.error;
+              btnGoogle.disabled = false;
+            }
+          } catch (err) {
+            msg.textContent = 'Connection error. Check background console.';
             btnGoogle.disabled = false;
           }
         });

@@ -282,12 +282,15 @@ async function cloudSignInWithGoogle(googleAccessToken) {
   await ensureFirebaseConfigLoaded();
   if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
 
+  const extensionId = chrome.runtime.id;
+  const requestUri = `https://${extensionId}.chromiumapp.org/`;
+
   const resp = await fetch(authUrl('signInWithIdp'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       postBody: `access_token=${googleAccessToken}&providerId=google.com`,
-      requestUri: 'http://localhost',
+      requestUri: requestUri,
       returnIdpCredential: true,
       returnSecureToken: true
     }),
@@ -295,6 +298,7 @@ async function cloudSignInWithGoogle(googleAccessToken) {
 
   const data = await resp.json();
   if (data.error) {
+    console.error('[Cloud] Firebase Auth Error:', data.error);
     throw new Error(friendlyAuthError(data.error.message));
   }
 

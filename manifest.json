@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Job Autofill — AI Copilot",
+  "name": "HireFlow AI — Ultimate Career Copilot",
   "version": "2.2.0",
-  "description": "AI-powered job application assistant: autofill, resume tailoring, match scoring, interview prep & application tracking. Works with free on-device AI — no API key needed!",
+  "description": "Your AI-powered application powerhouse. Automate forms, tailor resumes instantly, and track every job with smarter intelligence.",
   "permissions": [
     "storage",
     "activeTab",
@@ -12,10 +12,11 @@
     "identity"
   ],
   "oauth2": {
-    "client_id": "1054554783896-s5j85ktakc02ru84l8bccissv5irtg31.apps.googleusercontent.com",
+    "client_id": "1054554783896-cb8dnl7bmq2kag765039iao8n1jd5ubr.apps.googleusercontent.com",
     "scopes": [
       "email",
-      "profile"
+      "profile",
+      "openid"
     ]
   },
   "host_permissions": [
