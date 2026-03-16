@@ -1,10 +1,12 @@
-// dashboard.js — Job Autofill AI Copilot Dashboard
+// dashboard.js — FormPilot AI Copilot Dashboard
 
 // ── State ──────────────────────────────────────────────────────
 let allData = { sites: {}, hostnameMappings: {} };
 let globalProfile = {};
 let applications = [];
 let aiSettings = {};
+let resumeVault = { items: [], defaultId: null };
+let cloudPrefs = { enabled: false, syncProfile: true, syncAutofill: false, syncApplications: false, syncAiSettings: false };
 
 // ── Helpers ────────────────────────────────────────────────────
 function escHtml(str) {
@@ -42,6 +44,20 @@ function getSiteStatusLabel(site) {
     return site?.disabled ? 'Disabled' : site?.enabled ? 'Active' : 'Paused';
 }
 
+function getSiteQuality(site) {
+    const metrics = site?.metrics || {};
+    const score = metrics.avgScore ?? metrics.last?.score;
+    if (score === undefined || score === null || Number.isNaN(Number(score))) return null;
+    return Math.round(Number(score));
+}
+
+function getQualityClass(score) {
+    if (score === null || score === undefined) return '';
+    if (score >= 80) return '';
+    if (score >= 55) return 'mid';
+    return 'low';
+}
+
 function formatDate(dateStr) {
     if (!dateStr) return '—';
     const d = new Date(dateStr);
@@ -56,6 +72,14 @@ function relativeDate(dateStr) {
     if (days < 7) return `${days} days ago`;
     if (days < 30) return `${Math.floor(days / 7)} weeks ago`;
     return formatDate(dateStr);
+}
+
+function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return '0 KB';
+    const kb = bytes / 1024;
+    if (kb < 1024) return `${kb.toFixed(1)} KB`;
+    const mb = kb / 1024;
+    return `${mb.toFixed(1)} MB`;
 }
 
 function setLoading(btn, loading) {
@@ -117,21 +141,7 @@ document.getElementById('btn-view-all-apps').addEventListener('click', () => {
 async function loadAllData() {
     try {
         const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
-        if (!authStatus.loggedIn) {
-            document.getElementById('dashboard-auth-shield').style.display = 'flex';
-            document.getElementById('main-dashboard-app').style.display = 'none';
-            if (!authStatus.configured) {
-                const msg = document.getElementById('dash-auth-setup-msg');
-                msg.innerHTML = 'Firebase config missing. Please read the <a href="#" id="dash-link-setup" style="color:var(--blue-400); text-decoration:none;">setup guide</a>.';
-                const link = document.getElementById('dash-link-setup');
-                if (link) link.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    chrome.tabs.create({ url: chrome.runtime.getURL('SETUP_GUIDE.md') });
-                });
-            }
-            return;
-        }
-
+        // Allow local-only usage without login
         document.getElementById('dashboard-auth-shield').style.display = 'none';
         document.getElementById('main-dashboard-app').style.display = 'flex';
 
@@ -158,6 +168,7 @@ async function loadAllData() {
         renderDisabledSites();
         renderAiSettings();
         renderCloudSync();
+        loadResumeVault();
     } catch (err) {
         console.error('[Dashboard] Render error:', err);
     }
@@ -167,11 +178,19 @@ async function loadAllData() {
 function renderOverview() {
     const sites = Object.keys(allData.sites || {});
     const activeSites = sites.filter(s => allData.sites[s]?.enabled && !allData.sites[s]?.disabled);
+    const qualityScores = sites
+        .map(s => getSiteQuality(allData.sites[s]))
+        .filter(v => typeof v === 'number');
+    const avgQuality = qualityScores.length
+        ? Math.round(qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length)
+        : null;
 
     document.getElementById('stat-total-sites').textContent = sites.length;
     document.getElementById('stat-active-sites').textContent = activeSites.length;
     document.getElementById('stat-applications').textContent = applications.length;
     document.getElementById('stat-ai-status').textContent = aiSettings.enabled ? 'Active' : 'Off';
+    const qualityEl = document.getElementById('stat-quality-score');
+    if (qualityEl) qualityEl.textContent = avgQuality === null ? '--' : `${avgQuality}`;
 
     // Recent Applications
     const list = document.getElementById('recent-apps-list');
@@ -223,6 +242,8 @@ function renderSites(filter = '') {
         const fields = Object.entries(site.fields || {});
         const status = getSiteStatus(site);
         const label = getSiteStatusLabel(site);
+        const quality = getSiteQuality(site);
+        const qualityBadge = quality !== null ? `<span class="site-quality-badge ${getQualityClass(quality)}">Quality ${quality}</span>` : '';
         return `
         <div class="site-card" data-hostname="${hostname}">
             <div class="site-card-header" data-toggle="${hostname}">
@@ -234,6 +255,7 @@ function renderSites(filter = '') {
                     </div>
                 </div>
                 <div class="site-card-right">
+                    ${qualityBadge}
                     <span class="site-status-badge ${status}">${label}</span>
                     <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
                 </div>
@@ -498,6 +520,125 @@ document.getElementById('profile-form').addEventListener('submit', async (e) => 
         showToast('Failed to save profile', 'error');
     }
 });
+
+// ── Resume Vault (Local) ───────────────────────────────────────
+async function loadResumeVault() {
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'RESUME_LIST' });
+        if (resp?.ok) {
+            resumeVault.items = resp.items || [];
+            resumeVault.defaultId = resp.defaultId || null;
+        }
+    } catch (err) {
+        console.warn('[Dashboard] Resume vault load failed:', err);
+    }
+    renderResumeVault();
+}
+
+function renderResumeVault() {
+    const list = document.getElementById('resume-vault-list');
+    if (!list) return;
+    if (!resumeVault.items || resumeVault.items.length === 0) {
+        list.innerHTML = '<div class="empty-state">No resumes saved yet.</div>';
+        return;
+    }
+    list.innerHTML = resumeVault.items.map(item => {
+        const isDefault = resumeVault.defaultId === item.id;
+        const label = item.label ? `<span class="resume-pill">${escHtml(item.label)}</span>` : '';
+        const def = isDefault ? `<span class="resume-pill default">Default</span>` : '';
+        return `
+        <div class="resume-vault-item" data-resume-id="${item.id}">
+            <div class="resume-vault-meta">
+                <div class="resume-vault-name">${escHtml(item.name || 'Resume')}</div>
+                <div class="resume-vault-sub">${formatBytes(item.size)} · ${item.mime || 'file'} · ${relativeDate(item.updatedAt)}</div>
+                <div class="resume-vault-sub">${label} ${def}</div>
+            </div>
+            <div class="resume-vault-actions-row">
+                <input class="resume-label-input" placeholder="Label (e.g., ATS)" value="${escHtml(item.label || '')}" />
+                ${isDefault ? '' : `<button class="btn btn-secondary btn-sm btn-resume-default">Set Default</button>`}
+                <button class="btn btn-danger btn-sm btn-resume-delete">Delete</button>
+            </div>
+        </div>`;
+    }).join('');
+
+    list.querySelectorAll('.resume-vault-item').forEach(el => {
+        const id = el.dataset.resumeId;
+        const input = el.querySelector('.resume-label-input');
+        if (input) {
+            input.addEventListener('change', async () => {
+                try {
+                    const label = input.value.trim();
+                    await chrome.runtime.sendMessage({ type: 'RESUME_ADD', resume: { id, label } });
+                    loadResumeVault();
+                } catch (err) {
+                    showToast('Failed to update label', 'error');
+                }
+            });
+        }
+        const btnDefault = el.querySelector('.btn-resume-default');
+        if (btnDefault) {
+            btnDefault.addEventListener('click', async () => {
+                await chrome.runtime.sendMessage({ type: 'RESUME_SET_DEFAULT', id });
+                loadResumeVault();
+            });
+        }
+        const btnDelete = el.querySelector('.btn-resume-delete');
+        if (btnDelete) {
+            btnDelete.addEventListener('click', async () => {
+                showConfirmModal('Delete resume?', 'This will remove the file from local storage.', async () => {
+                    await chrome.runtime.sendMessage({ type: 'RESUME_DELETE', id });
+                    loadResumeVault();
+                });
+            });
+        }
+    });
+}
+
+async function readFileAsDataUrl(file) {
+    return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+}
+
+const resumeVaultInput = document.getElementById('resume-vault-input');
+const resumeVaultBtn = document.getElementById('btn-resume-vault-upload');
+const resumeVaultStatus = document.getElementById('resume-vault-status');
+const resumeVaultLabel = document.getElementById('resume-vault-label');
+
+if (resumeVaultBtn && resumeVaultInput) {
+    resumeVaultBtn.addEventListener('click', () => resumeVaultInput.click());
+    resumeVaultInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        if (!/\.(pdf|doc|docx)$/i.test(file.name)) {
+            resumeVaultStatus.textContent = '✗ Only PDF/DOC/DOCX supported';
+            resumeVaultStatus.className = 'status-msg error';
+            return;
+        }
+        resumeVaultStatus.textContent = 'Uploading...';
+        resumeVaultStatus.className = 'status-msg';
+        try {
+            const dataUrl = await readFileAsDataUrl(file);
+            const label = (resumeVaultLabel?.value || '').trim();
+            await chrome.runtime.sendMessage({
+                type: 'RESUME_ADD',
+                resume: { name: file.name, label, mime: file.type, size: file.size, dataUrl }
+            });
+            if (resumeVaultLabel) resumeVaultLabel.value = '';
+            resumeVaultStatus.textContent = '✓ Resume saved locally';
+            resumeVaultStatus.className = 'status-msg success';
+            loadResumeVault();
+        } catch (err) {
+            resumeVaultStatus.textContent = '✗ Upload failed';
+            resumeVaultStatus.className = 'status-msg error';
+        } finally {
+            e.target.value = '';
+        }
+    });
+}
 
 // ── Resume Parsing ─────────────────────────────────────────────
 document.getElementById('btn-upload-resume').addEventListener('click', () => {
@@ -1178,12 +1319,15 @@ async function renderCloudSync() {
 
     const statusResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
     const { configured, loggedIn, user, lastSync } = statusResp;
+    const prefsResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_PREFS' }).catch(() => null);
+    if (prefsResp?.prefs) cloudPrefs = prefsResp.prefs;
 
     const msgEl = document.getElementById('cloud-auth-msg');
     const badge = document.getElementById('cloud-status-badge');
     const authForms = document.getElementById('cloud-auth-forms');
     const loggedInView = document.getElementById('cloud-logged-in');
     const cfgMsg = document.getElementById('cloud-config-msg');
+    const prefsWrap = document.getElementById('cloud-sync-prefs');
 
     msgEl.textContent = '';
     if (cfgMsg) cfgMsg.textContent = '';
@@ -1193,6 +1337,7 @@ async function renderCloudSync() {
         badge.style.background = 'rgba(239, 68, 68, 0.12)';
         badge.style.color = 'var(--red-400)';
         msgEl.textContent = 'Cloud sync requires Firebase config.';
+        if (prefsWrap) prefsWrap.style.display = 'none';
         return;
     }
 
@@ -1210,12 +1355,114 @@ async function renderCloudSync() {
             ? new Date(lastSync.lastPushedAt || lastSync.lastPulledAt).toLocaleString() 
             : 'Never';
         document.getElementById('cloud-last-sync').textContent = timeStr;
+        if (prefsWrap) prefsWrap.style.display = 'block';
     } else {
         authForms.style.display = 'grid';
         loggedInView.style.display = 'none';
         badge.textContent = 'Disconnected';
         badge.style.background = 'rgba(251, 191, 36, 0.12)';
         badge.style.color = 'var(--amber-400)';
+        if (prefsWrap) prefsWrap.style.display = 'block';
+    }
+
+    // Apply prefs to UI
+    const enabledEl = document.getElementById('cloud-sync-enabled');
+    const profileEl = document.getElementById('cloud-sync-profile');
+    const autofillEl = document.getElementById('cloud-sync-autofill');
+    const appsEl = document.getElementById('cloud-sync-apps');
+    const aiEl = document.getElementById('cloud-sync-ai');
+    if (enabledEl) enabledEl.checked = !!cloudPrefs.enabled;
+    if (profileEl) profileEl.checked = true;
+    if (autofillEl) autofillEl.checked = !!cloudPrefs.syncAutofill;
+    if (appsEl) appsEl.checked = !!cloudPrefs.syncApplications;
+    if (aiEl) aiEl.checked = !!cloudPrefs.syncAiSettings;
+
+    setupCloudPrefListeners();
+}
+
+function setupCloudPrefListeners() {
+    if (window._cloudPrefsBound) return;
+    window._cloudPrefsBound = true;
+
+    const enabledEl = document.getElementById('cloud-sync-enabled');
+    const autofillEl = document.getElementById('cloud-sync-autofill');
+    const appsEl = document.getElementById('cloud-sync-apps');
+    const aiEl = document.getElementById('cloud-sync-ai');
+    const msg = document.getElementById('cloud-sync-msg');
+
+    async function savePrefs(extra = {}) {
+        try {
+            const resp = await chrome.runtime.sendMessage({
+                type: 'CLOUD_SAVE_PREFS',
+                prefs: {
+                    enabled: enabledEl?.checked,
+                    syncAutofill: autofillEl?.checked,
+                    syncApplications: appsEl?.checked,
+                    syncAiSettings: aiEl?.checked,
+                    ...extra,
+                }
+            });
+            if (resp?.ok) {
+                cloudPrefs = resp.prefs;
+                msg.textContent = '✓ Preferences saved';
+                msg.className = 'status-msg success';
+            } else {
+                msg.textContent = resp?.error || 'Failed to save';
+                msg.className = 'status-msg error';
+            }
+        } catch (err) {
+            msg.textContent = err.message || 'Failed to save';
+            msg.className = 'status-msg error';
+        }
+    }
+
+    [enabledEl, autofillEl, appsEl, aiEl].forEach(el => {
+        if (!el) return;
+        el.addEventListener('change', () => savePrefs());
+    });
+
+    const btnPush = document.getElementById('btn-cloud-push');
+    const btnPull = document.getElementById('btn-cloud-pull');
+    const btnDelete = document.getElementById('btn-cloud-delete');
+
+    if (btnPush) {
+        btnPush.addEventListener('click', async () => {
+            try {
+                const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_PUSH' });
+                msg.textContent = resp.ok ? '✓ Pushed to cloud' : ('❌ ' + resp.error);
+                msg.className = resp.ok ? 'status-msg success' : 'status-msg error';
+            } catch (err) {
+                msg.textContent = err.message || 'Push failed';
+                msg.className = 'status-msg error';
+            }
+        });
+    }
+    if (btnPull) {
+        btnPull.addEventListener('click', async () => {
+            try {
+                const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_PULL' });
+                msg.textContent = resp.ok ? '✓ Pulled from cloud' : ('❌ ' + resp.error);
+                msg.className = resp.ok ? 'status-msg success' : 'status-msg error';
+                await loadAllData();
+            } catch (err) {
+                msg.textContent = err.message || 'Pull failed';
+                msg.className = 'status-msg error';
+            }
+        });
+    }
+    if (btnDelete) {
+        btnDelete.addEventListener('click', () => {
+            showConfirmModal('Delete cloud data?', 'This will remove all your data stored online. Local data will remain.', async () => {
+                try {
+                    const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_DELETE_REMOTE' });
+                    msg.textContent = resp.ok ? '✓ Cloud data deleted' : ('❌ ' + resp.error);
+                    msg.className = resp.ok ? 'status-msg success' : 'status-msg error';
+                } catch (err) {
+                    msg.textContent = err.message || 'Delete failed';
+                    msg.className = 'status-msg error';
+                }
+            });
+        });
     }
 }
 

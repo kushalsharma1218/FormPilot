@@ -1,6 +1,6 @@
 # Cloud Sync Setup Guide
 
-The Job Autofill extension now supports **Cross-Device Cloud Sync** using Firebase. 
+The FormPilot AI extension now supports **Cross-Device Cloud Sync** using Firebase. 
 This allows you to securely sync your profiles, saved sites, and job tracker data across all your browsers and devices.
 
 Because this is a private extension for your own data, you need to create your own free Firebase project.
@@ -38,7 +38,7 @@ service cloud.firestore {
 ## Step 4: Add Firebase Config (No Code Changes)
 1. Go to your Firebase Project Settings (the gear icon top left).
 2. Under "Your apps", click the **Web `</>`** icon.
-3. Register the app (name it `Job Autofill`).
+3. Register the app (name it `FormPilot AI`).
 4. You will be given a `firebaseConfig` object with your **API Key** and **Project ID**.
 5. Open the extension **Dashboard** → **Cloud Sync**.
 6. Paste **Firebase API Key** and **Project ID**, then click **Save Config**.
@@ -70,12 +70,12 @@ If you want to use the **Sign in with Google** button:
 3. Search for "APIs & Services" -> **Credentials**.
 4. You will see an **OAuth 2.0 Client ID** that Firebase auto-generated.
 5. Create a new credential: **OAuth client ID** -> **Chrome app**.
-6. Enter your Chrome Extension ID (found in `chrome://extensions/` under "Job Autofill" with Developer Mode on, e.g., `abcdefghijklmnop...`).
+6. Enter your Chrome Extension ID (found in `chrome://extensions/` under "FormPilot AI" with Developer Mode on, e.g., `abcdefghijklmnop...`).
 7. Copy the generated `Client ID`.
 8. Open `manifest.json` in your code and replace `"YOUR_GOOGLE_OAUTH_CLIENT_ID"` with your copied ID.
 9. *Note: If publishing the extension, or packing it, ensure you update the Key/Extension ID.*
 
 ## Step 7: Reload Extension
 1. Go to `chrome://extensions/`
-2. Click the reload icon `↻` on the Job Autofill extension.
+2. Click the reload icon `↻` on the FormPilot AI extension.
 3. Open the extension popup, and you will be asked to sign in to access your data!

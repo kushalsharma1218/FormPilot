@@ -402,29 +402,57 @@ async function pullDataFromCloud(dataKey) {
 
 // ── Full Sync ──────────────────────────────────────────────────
 
-async function pushAllToCloud() {
+async function pushAllToCloud(prefs = {}) {
   const auth = await getAuthState();
   if (!auth) throw new Error('Not logged in');
 
+  const syncProfile = prefs.syncProfile !== false;
+  const syncAutofill = !!prefs.syncAutofill;
+  const syncApplications = !!prefs.syncApplications;
+  const syncAiSettings = !!prefs.syncAiSettings;
+
   // Gather all local data using partitioned keys
-  const [autofillData, profile, aiSettings, applications] = await Promise.all([
-    chrome.storage.local.get(await getUserKey('autofill_data')).then(r => r[Object.keys(r)[0]] || { sites: {}, hostnameMappings: {} }),
-    chrome.storage.local.get(await getUserKey('global_profile_data')).then(r => r[Object.keys(r)[0]] || {}),
-    chrome.storage.local.get(await getUserKey('ai_settings')).then(r => r[Object.keys(r)[0]] || {}),
-    chrome.storage.local.get(await getUserKey('applications_data')).then(r => r[Object.keys(r)[0]] || []),
-  ]);
+  const tasks = [];
+  let autofillData, profile, aiSettings, applications;
+  if (syncAutofill) {
+    tasks.push(
+      chrome.storage.local.get(await getUserKey('autofill_data'))
+        .then(r => { autofillData = r[Object.keys(r)[0]] || { sites: {}, hostnameMappings: {} }; })
+    );
+  }
+  if (syncProfile) {
+    tasks.push(
+      chrome.storage.local.get(await getUserKey('global_profile_data'))
+        .then(r => { profile = r[Object.keys(r)[0]] || {}; })
+    );
+  }
+  if (syncAiSettings) {
+    tasks.push(
+      chrome.storage.local.get(await getUserKey('ai_settings'))
+        .then(r => { aiSettings = r[Object.keys(r)[0]] || {}; })
+    );
+  }
+  if (syncApplications) {
+    tasks.push(
+      chrome.storage.local.get(await getUserKey('applications_data'))
+        .then(r => { applications = r[Object.keys(r)[0]] || []; })
+    );
+  }
+  await Promise.all(tasks);
 
   // Push each section in parallel
-  await Promise.all([
-    pushDataToCloud('autofill', autofillData),
-    pushDataToCloud('profile', profile),
-    pushDataToCloud('ai_settings', {
+  const pushTasks = [];
+  if (syncAutofill) pushTasks.push(pushDataToCloud('autofill', autofillData));
+  if (syncProfile) pushTasks.push(pushDataToCloud('profile', profile));
+  if (syncAiSettings) {
+    pushTasks.push(pushDataToCloud('ai_settings', {
       ...aiSettings,
       // Don't sync API keys for security — user must set them per device
       apiKey: aiSettings.apiKey || '',
-    }),
-    pushDataToCloud('applications', { list: applications }),
-  ]);
+    }));
+  }
+  if (syncApplications) pushTasks.push(pushDataToCloud('applications', { list: applications }));
+  if (pushTasks.length) await Promise.all(pushTasks);
 
   // Save sync metadata
   await chrome.storage.local.set({
@@ -437,17 +465,23 @@ async function pushAllToCloud() {
   return true;
 }
 
-async function pullAllFromCloud() {
+async function pullAllFromCloud(prefs = {}) {
   const auth = await getAuthState();
   if (!auth) throw new Error('Not logged in');
 
   // Pull each section in parallel
-  const [autofillData, profile, aiSettings, appData] = await Promise.all([
-    pullDataFromCloud('autofill'),
-    pullDataFromCloud('profile'),
-    pullDataFromCloud('ai_settings'),
-    pullDataFromCloud('applications'),
-  ]);
+  const syncProfile = prefs.syncProfile !== false;
+  const syncAutofill = !!prefs.syncAutofill;
+  const syncApplications = !!prefs.syncApplications;
+  const syncAiSettings = !!prefs.syncAiSettings;
+
+  const pullTasks = [];
+  let autofillData, profile, aiSettings, appData;
+  if (syncAutofill) pullTasks.push(pullDataFromCloud('autofill').then(r => { autofillData = r; }));
+  if (syncProfile) pullTasks.push(pullDataFromCloud('profile').then(r => { profile = r; }));
+  if (syncAiSettings) pullTasks.push(pullDataFromCloud('ai_settings').then(r => { aiSettings = r; }));
+  if (syncApplications) pullTasks.push(pullDataFromCloud('applications').then(r => { appData = r; }));
+  if (pullTasks.length) await Promise.all(pullTasks);
 
   // Fetch local keys
   const storageKeys = await Promise.all([
@@ -460,7 +494,7 @@ async function pullAllFromCloud() {
   const localResult = await chrome.storage.local.get(storageKeys);
   const updates = {};
 
-  if (autofillData) {
+  if (syncAutofill && autofillData) {
     const localAutofill = localResult[storageKeys[0]] || { sites: {}, hostnameMappings: {} };
     // Deep merge: cloud sites + local sites (cloud data wins for fields, local disabled status prioritized if it exists)
     const mergedSites = { ...localAutofill.sites };
@@ -486,12 +520,12 @@ async function pullAllFromCloud() {
     };
   }
 
-  if (profile) {
+  if (syncProfile && profile) {
     const localProfile = localResult[storageKeys[1]] || {};
     updates[storageKeys[1]] = { ...localProfile, ...profile };
   }
 
-  if (aiSettings) {
+  if (syncAiSettings && aiSettings) {
     const localAi = localResult[storageKeys[2]] || {};
     updates[storageKeys[2]] = {
       ...localAi,
@@ -500,7 +534,7 @@ async function pullAllFromCloud() {
     };
   }
 
-  if (appData?.list) {
+  if (syncApplications && appData?.list) {
     const localApps = localResult[storageKeys[3]] || [];
     const mergedApps = [...localApps];
     for (const cloudApp of appData.list) {
@@ -526,6 +560,25 @@ async function pullAllFromCloud() {
     },
   });
 
+  return true;
+}
+
+// ── Delete Cloud Data ─────────────────────────────────────────
+async function deleteCloudData(keys = []) {
+  await ensureFirebaseConfigLoaded();
+  const auth = await getAuthState();
+  if (!auth) throw new Error('Not logged in');
+  const token = await getValidToken();
+  const deletions = (keys || []).map(async (key) => {
+    const docPath = `users/${auth.userId}/${key}/data`;
+    const url = firestoreUrl(docPath);
+    const resp = await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
+    if (!resp.ok && resp.status !== 404) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Failed to delete ${key}`);
+    }
+  });
+  await Promise.all(deletions);
   return true;
 }
 

@@ -8,8 +8,10 @@ importScripts('cloud-sync.js');
 
 const STORAGE_KEY = 'autofill_data';
 const GLOBAL_STORAGE_KEY = 'global_profile_data';
+const RESUMES_KEY = 'resumes_data';
 const SESSION_KEY = 'autofill_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CLOUD_PREFS_KEY = 'cloud_sync_prefs';
 
 // ── Storage Helpers (Account Aware) ────────────────────────────
 const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
@@ -29,6 +31,9 @@ async function getData() {
     Object.values(data.sites).forEach(site => {
       if (!site.fields) site.fields = {};
       if (!Array.isArray(site.mappings)) site.mappings = [];
+      if (!site.flags) site.flags = {};
+      if (!site.metrics) site.metrics = {};
+      if (!site.sandbox) site.sandbox = {};
       if (site.enabled === undefined) site.enabled = !site.disabled;
     });
     return data;
@@ -57,6 +62,135 @@ async function getGlobalProfile() {
 async function saveGlobalProfile(profile) {
   const key = await AuthStore.getUserKey(GLOBAL_STORAGE_KEY);
   await chrome.storage.local.set({ [key]: profile });
+}
+
+function clampScore(value) {
+  if (Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function computeQualityScore(stats) {
+  const detected = Math.max(0, Number(stats?.detected || 0));
+  const matched = Math.max(0, Number(stats?.matched || 0));
+  const filled = Math.max(0, Number(stats?.filled || 0));
+  if (!detected) return 0;
+  const matchRatio = matched / detected;
+  const fillRatio = matched ? filled / matched : 0;
+  const score = Math.round(100 * (0.7 * matchRatio + 0.3 * fillRatio));
+  return clampScore(score);
+}
+
+// ── Cloud Sync Preferences ─────────────────────────────────────
+async function getCloudPrefs() {
+  const key = await AuthStore.getUserKey(CLOUD_PREFS_KEY);
+  const result = await chrome.storage.local.get(key);
+  const stored = result[key] || {};
+  const prefs = {
+    enabled: false,
+    syncProfile: true, // always on when enabled
+    syncAutofill: false,
+    syncApplications: false,
+    syncAiSettings: false,
+    ...stored,
+  };
+  if (prefs.enabled) prefs.syncProfile = true;
+  return { key, prefs };
+}
+
+async function saveCloudPrefs(next) {
+  const { key, prefs } = await getCloudPrefs();
+  const merged = { ...prefs, ...(next || {}) };
+  if (merged.enabled) merged.syncProfile = true;
+  await chrome.storage.local.set({ [key]: merged });
+  return merged;
+}
+
+// ── Resume Vault (Local Only) ──────────────────────────────────
+async function getResumesStore() {
+  const key = await AuthStore.getUserKey(RESUMES_KEY);
+  const result = await chrome.storage.local.get(key);
+  const data = result[key] || { items: [], defaultId: null };
+  if (!Array.isArray(data.items)) data.items = [];
+  return { key, data };
+}
+
+async function saveResumesStore(key, data) {
+  await chrome.storage.local.set({ [key]: data });
+}
+
+function sanitizeResumeMeta(item) {
+  return {
+    id: item.id,
+    name: item.name,
+    label: item.label || '',
+    mime: item.mime || '',
+    size: item.size || 0,
+    updatedAt: item.updatedAt || item.createdAt || new Date().toISOString(),
+  };
+}
+
+async function listResumes() {
+  const { data } = await getResumesStore();
+  return { items: data.items.map(sanitizeResumeMeta), defaultId: data.defaultId || null };
+}
+
+async function getResumeById(id) {
+  const { data } = await getResumesStore();
+  return data.items.find(r => r.id === id) || null;
+}
+
+async function addOrUpdateResume(resume) {
+  const { key, data } = await getResumesStore();
+  const now = new Date().toISOString();
+  const id = resume.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 7));
+  const idx = data.items.findIndex(r => r.id === id);
+  if (idx >= 0) {
+    const existing = data.items[idx];
+    const entry = {
+      ...existing,
+      id,
+      name: resume.name || existing.name || 'Resume',
+      label: resume.label !== undefined ? resume.label : (existing.label || ''),
+      mime: resume.mime || existing.mime || '',
+      size: resume.size || existing.size || 0,
+      dataUrl: resume.dataUrl || existing.dataUrl || '',
+      createdAt: existing.createdAt || resume.createdAt || now,
+      updatedAt: now,
+    };
+    data.items[idx] = entry;
+  } else {
+    const entry = {
+      id,
+      name: resume.name || 'Resume',
+      label: resume.label || '',
+      mime: resume.mime || '',
+      size: resume.size || 0,
+      dataUrl: resume.dataUrl || '',
+      createdAt: resume.createdAt || now,
+      updatedAt: now,
+    };
+    data.items.unshift(entry);
+  }
+  if (!data.defaultId) data.defaultId = id;
+  await saveResumesStore(key, data);
+  return data.items.find(r => r.id === id);
+}
+
+async function deleteResume(id) {
+  const { key, data } = await getResumesStore();
+  data.items = data.items.filter(r => r.id !== id);
+  if (data.defaultId === id) data.defaultId = data.items[0]?.id || null;
+  await saveResumesStore(key, data);
+  return data;
+}
+
+async function setDefaultResume(id) {
+  const { key, data } = await getResumesStore();
+  if (data.items.find(r => r.id === id)) {
+    data.defaultId = id;
+    await saveResumesStore(key, data);
+  }
+  return data;
 }
 
 // Resolve the effective site key for a hostname (custom or plain hostname)
@@ -95,16 +229,24 @@ async function saveSessionStore(store) {
   await chrome.storage.local.set({ [key]: store });
 }
 
-async function getSessionFields(hostname) {
+async function getSessionEntry(hostname) {
   const siteKey = await resolveSiteKeyForHost(hostname);
   const store = await getSessionStore();
-  return store[siteKey]?.fields || {};
+  const entry = store[siteKey] || { fields: {}, flags: {} };
+  if (!entry.fields) entry.fields = {};
+  if (!entry.flags) entry.flags = {};
+  return { siteKey, entry, store };
+}
+
+async function getSessionFields(hostname) {
+  const { entry } = await getSessionEntry(hostname);
+  return entry.fields || {};
 }
 
 async function mergeSessionFields(hostname, fields) {
   const siteKey = await resolveSiteKeyForHost(hostname);
   const store = await getSessionStore();
-  const entry = store[siteKey] || { fields: {} };
+  const entry = store[siteKey] || { fields: {}, flags: {} };
   entry.fields = { ...(entry.fields || {}), ...(fields || {}) };
   entry.updatedAt = new Date().toISOString();
   store[siteKey] = entry;
@@ -117,6 +259,15 @@ async function clearSessionFields(hostname) {
   const store = await getSessionStore();
   delete store[siteKey];
   await saveSessionStore(store);
+}
+
+async function setSessionFlags(hostname, flags) {
+  const { siteKey, entry, store } = await getSessionEntry(hostname);
+  entry.flags = { ...(entry.flags || {}), ...(flags || {}) };
+  entry.updatedAt = new Date().toISOString();
+  store[siteKey] = entry;
+  await saveSessionStore(store);
+  return entry.flags;
 }
 
 // ── Message Handler ────────────────────────────────────────────
@@ -149,14 +300,14 @@ async function handleMessage(msg, sender) {
     case 'GET_SITE_DATA': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      const site = data.sites[siteKey] || { enabled: true, fields: {}, mappings: [] };
+      const site = data.sites[siteKey] || { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
       return { site, siteKey };
     }
 
     case 'SET_ENABLED': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {} };
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {}, flags: {}, metrics: {}, sandbox: {} };
       data.sites[siteKey].enabled = !!msg.enabled;
       if (msg.clearDisabled) data.sites[siteKey].disabled = false;
       await saveData(data);
@@ -167,17 +318,79 @@ async function handleMessage(msg, sender) {
     case 'SAVE_FIELDS': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {} };
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, flags: {}, metrics: {}, sandbox: {} };
       data.sites[siteKey].fields = Object.assign({}, data.sites[siteKey].fields, msg.fields || {});
       await saveData(data);
       queueCloudSync();
       return { ok: true };
     }
 
+    case 'SANDBOX_MERGE': {
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
+      const sandbox = data.sites[siteKey].sandbox || {};
+      const fields = msg.fields || {};
+      const sessionId = msg.sessionId || 'default';
+      const now = new Date().toISOString();
+      let promoted = 0;
+
+      Object.entries(fields).forEach(([key, value]) => {
+        if (value === undefined || value === null || value === '') return;
+        const existing = sandbox[key];
+        if (!existing || existing.value !== value) {
+          sandbox[key] = { value, count: 1, lastSessionId: sessionId, updatedAt: now };
+          return;
+        }
+        if (existing.lastSessionId !== sessionId) {
+          existing.count = (existing.count || 1) + 1;
+          existing.lastSessionId = sessionId;
+          existing.updatedAt = now;
+        }
+        if (existing.count >= 2) {
+          data.sites[siteKey].fields[key] = value;
+          delete sandbox[key];
+          promoted += 1;
+        }
+      });
+
+      data.sites[siteKey].sandbox = sandbox;
+      await saveData(data);
+      if (promoted > 0) queueCloudSync();
+      return { ok: true, promoted };
+    }
+
+    case 'SITE_METRICS_UPDATE': {
+      const stats = msg.stats || {};
+      const detected = Number(stats.detected || 0);
+      if (detected < 3) return { ok: false, skipped: true };
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
+      const metrics = data.sites[siteKey].metrics || {};
+      const score = computeQualityScore(stats);
+      const samples = Number(metrics.samples || 0);
+      const nextSamples = samples + 1;
+      const prevAvg = Number(metrics.avgScore || score);
+      const avgScore = Math.round(((prevAvg * samples) + score) / nextSamples);
+      metrics.samples = nextSamples;
+      metrics.avgScore = avgScore;
+      metrics.last = {
+        detected: Number(stats.detected || 0),
+        matched: Number(stats.matched || 0),
+        filled: Number(stats.filled || 0),
+        score,
+        ts: new Date().toISOString(),
+      };
+      data.sites[siteKey].metrics = metrics;
+      await saveData(data);
+      return { ok: true, metrics };
+    }
+
     case 'GET_SITE_MAPPINGS': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      const site = data.sites[siteKey] || { enabled: true, fields: {}, mappings: [] };
+      const site = data.sites[siteKey] || { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
       return { ok: true, mappings: site.mappings || [], siteKey };
     }
 
@@ -185,7 +398,7 @@ async function handleMessage(msg, sender) {
       if (!msg.mapping || !msg.hostname) return { ok: false, error: 'Missing mapping/hostname' };
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [] };
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
       if (!Array.isArray(data.sites[siteKey].mappings)) data.sites[siteKey].mappings = [];
       const mappings = data.sites[siteKey].mappings;
       const idx = mappings.findIndex(m => m.signature === msg.mapping.signature);
@@ -194,10 +407,11 @@ async function handleMessage(msg, sender) {
         mappedKey: msg.mapping.mappedKey,
         label: msg.mapping.label || '',
         type: msg.mapping.type || '',
+        hints: msg.mapping.hints || {},
         updatedAt: new Date().toISOString(),
       };
       if (idx >= 0) {
-        mappings[idx] = { ...mappings[idx], ...normalized };
+        mappings[idx] = { ...mappings[idx], ...normalized, hints: normalized.hints || mappings[idx].hints || {} };
       } else {
         mappings.push(normalized);
       }
@@ -206,14 +420,29 @@ async function handleMessage(msg, sender) {
       return { ok: true, mappings };
     }
 
+    case 'SET_SITE_FLAGS': {
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
+      data.sites[siteKey].flags = { ...(data.sites[siteKey].flags || {}), ...(msg.flags || {}) };
+      await saveData(data);
+      queueCloudSync();
+      return { ok: true, flags: data.sites[siteKey].flags };
+    }
+
     case 'SESSION_GET': {
-      const fields = await getSessionFields(msg.hostname);
-      return { ok: true, fields };
+      const { entry } = await getSessionEntry(msg.hostname);
+      return { ok: true, fields: entry.fields || {}, flags: entry.flags || {} };
     }
 
     case 'SESSION_MERGE': {
       const fields = await mergeSessionFields(msg.hostname, msg.fields || {});
       return { ok: true, fields };
+    }
+
+    case 'SESSION_SET_FLAGS': {
+      const flags = await setSessionFlags(msg.hostname, msg.flags || {});
+      return { ok: true, flags };
     }
 
     case 'SESSION_CLEAR': {
@@ -228,7 +457,7 @@ async function handleMessage(msg, sender) {
     case 'DISABLE_SITE': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {} };
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {}, flags: {}, metrics: {}, sandbox: {} };
       data.sites[siteKey].disabled = true;
       data.sites[siteKey].enabled = false; // Also disable if specifically blocked
       await saveData(data);
@@ -239,7 +468,14 @@ async function handleMessage(msg, sender) {
     case 'CLEAR_SITE': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
-      if (data.sites[siteKey]) data.sites[siteKey].fields = {};
+      if (data.sites[siteKey]) {
+        data.sites[siteKey].fields = {};
+        if (data.sites[siteKey].flags) {
+          delete data.sites[siteKey].flags.neverPrompt;
+        }
+        data.sites[siteKey].metrics = {};
+        data.sites[siteKey].sandbox = {};
+      }
       await saveData(data);
       return { ok: true };
     }
@@ -400,7 +636,62 @@ async function handleMessage(msg, sender) {
       return { ok: true, apps };
     }
 
+    // ── Resume Vault (Local Only) ─────────────────────────────────
+    case 'RESUME_LIST': {
+      const data = await listResumes();
+      return { ok: true, ...data };
+    }
+
+    case 'RESUME_GET': {
+      if (!msg.id) return { ok: false, error: 'Resume ID required' };
+      const resume = await getResumeById(msg.id);
+      if (!resume) return { ok: false, error: 'Resume not found' };
+      return { ok: true, resume };
+    }
+
+    case 'RESUME_ADD': {
+      if (!msg.resume) return { ok: false, error: 'Missing resume data' };
+      if (!msg.resume.dataUrl && !msg.resume.id) {
+        return { ok: false, error: 'Missing resume file' };
+      }
+      const entry = await addOrUpdateResume(msg.resume);
+      return { ok: true, resume: sanitizeResumeMeta(entry) };
+    }
+
+    case 'RESUME_DELETE': {
+      if (!msg.id) return { ok: false, error: 'Resume ID required' };
+      const data = await deleteResume(msg.id);
+      return { ok: true, items: data.items.map(sanitizeResumeMeta), defaultId: data.defaultId || null };
+    }
+
+    case 'RESUME_SET_DEFAULT': {
+      if (!msg.id) return { ok: false, error: 'Resume ID required' };
+      const data = await setDefaultResume(msg.id);
+      return { ok: true, items: data.items.map(sanitizeResumeMeta), defaultId: data.defaultId || null };
+    }
+
     // ── Cloud Sync ────────────────────────────────────────────────
+    case 'CLOUD_GET_PREFS': {
+      const { prefs } = await getCloudPrefs();
+      return { ok: true, prefs };
+    }
+
+    case 'CLOUD_SAVE_PREFS': {
+      const prefs = await saveCloudPrefs(msg.prefs || {});
+      return { ok: true, prefs };
+    }
+
+    case 'CLOUD_DELETE_REMOTE': {
+      const { prefs } = await getCloudPrefs();
+      if (!prefs.enabled) return { ok: false, error: 'Cloud sync is disabled' };
+      const keys = ['autofill', 'profile', 'ai_settings', 'applications'];
+      if (typeof deleteCloudData === 'function') {
+        await deleteCloudData(keys);
+        return { ok: true };
+      }
+      return { ok: false, error: 'Delete not supported' };
+    }
+
     case 'CLOUD_GET_STATUS': {
       if (typeof ensureFirebaseConfigLoaded === 'function') {
         await ensureFirebaseConfigLoaded();
@@ -437,7 +728,10 @@ async function handleMessage(msg, sender) {
       console.log('[Cloud] Sign up attempt:', msg.email);
       const auth = await cloudSignUp(msg.email, msg.password, msg.displayName || '');
       // Auto-push local data to cloud on signup
-      try { await pushAllToCloud(); } catch (e) { console.warn('[Cloud] Post-signup push failed:', e); }
+      try {
+        const { prefs } = await getCloudPrefs();
+        if (prefs.enabled) await pushAllToCloud(prefs);
+      } catch (e) { console.warn('[Cloud] Post-signup push failed:', e); }
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
@@ -446,7 +740,10 @@ async function handleMessage(msg, sender) {
       console.log('[Cloud] Sign in attempt:', msg.email);
       const auth = await cloudSignIn(msg.email, msg.password);
       // Auto-pull cloud data on login
-      try { await pullAllFromCloud(); } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
+      try {
+        const { prefs } = await getCloudPrefs();
+        if (prefs.enabled) await pullAllFromCloud(prefs);
+      } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
@@ -454,7 +751,10 @@ async function handleMessage(msg, sender) {
       if (!msg.accessToken) return { ok: false, error: 'Google Access Token is required' };
       const auth = await cloudSignInWithGoogle(msg.accessToken);
       // Auto-pull cloud data on login
-      try { await pullAllFromCloud(); } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
+      try {
+        const { prefs } = await getCloudPrefs();
+        if (prefs.enabled) await pullAllFromCloud(prefs);
+      } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
@@ -470,19 +770,25 @@ async function handleMessage(msg, sender) {
     }
 
     case 'CLOUD_PUSH': {
-      await pushAllToCloud();
+      const { prefs } = await getCloudPrefs();
+      if (!prefs.enabled) return { ok: false, error: 'Enable cloud sync first' };
+      await pushAllToCloud(prefs);
       return { ok: true };
     }
 
     case 'CLOUD_PULL': {
-      await pullAllFromCloud();
+      const { prefs } = await getCloudPrefs();
+      if (!prefs.enabled) return { ok: false, error: 'Enable cloud sync first' };
+      await pullAllFromCloud(prefs);
       return { ok: true };
     }
 
     case 'CLOUD_SYNC': {
       // Pull first (get latest), then push (upload merged)
-      await pullAllFromCloud();
-      await pushAllToCloud();
+      const { prefs } = await getCloudPrefs();
+      if (!prefs.enabled) return { ok: false, error: 'Enable cloud sync first' };
+      await pullAllFromCloud(prefs);
+      await pushAllToCloud(prefs);
       return { ok: true };
     }
 
@@ -498,12 +804,13 @@ function queueCloudSync() {
   syncTimer = setTimeout(async () => {
     try {
       const auth = await AuthStore.getAuthState();
+      const { prefs } = await getCloudPrefs();
       if (typeof ensureFirebaseConfigLoaded === 'function') {
         await ensureFirebaseConfigLoaded();
       }
-      if (auth && isCloudConfigured()) {
+      if (auth && isCloudConfigured() && prefs.enabled) {
         console.log('[Cloud] Auto-syncing...');
-        await pushAllToCloud();
+        await pushAllToCloud(prefs);
         console.log('[Cloud] Auto-sync complete.');
       }
     } catch (err) {

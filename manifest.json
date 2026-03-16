@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "HireFlow AI — Ultimate Career Copilot",
+  "name": "FormPilot AI — Smart Application Autofill",
   "version": "2.2.0",
-  "description": "Your AI-powered application powerhouse. Automate forms, tailor resumes instantly, and track every job with smarter intelligence.",
+  "description": "Elegant AI-powered autofill for job applications and complex forms. Learn once, fill everywhere.",
   "permissions": [
     "storage",
     "activeTab",
@@ -12,7 +12,7 @@
     "identity"
   ],
   "oauth2": {
-    "client_id": "1054554783896-cb8dnl7bmq2kag765039iao8n1jd5ubr.apps.googleusercontent.com",
+    "client_id": "1054554783896-ll03qgku69vsug14ar55sj73r2erc1lt.apps.googleusercontent.com",
     "scopes": [
       "email",
       "profile",

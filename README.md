@@ -1,6 +1,6 @@
-# HireFlow AI — Ultimate Career Copilot 🚀
+# FormPilot AI — Elegant Application Copilot 🚀
 
-A powerful, privacy-first Chrome Extension that automates job applications using local data and AI-powered intelligence.
+A powerful, privacy-first Chrome Extension that automates job applications and complex forms using local data and AI-powered intelligence.
 
 ## 🚀 Key Features
 

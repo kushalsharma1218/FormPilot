@@ -1,4 +1,4 @@
-// popup.js — Job Autofill Popup (Refactored)
+// popup.js — FormPilot AI Popup (Refactored)
 
 let currentHostname = '';
 let siteData = { enabled: true, fields: {} };
