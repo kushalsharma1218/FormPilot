@@ -399,11 +399,14 @@ document.getElementById('btn-ai-copy').addEventListener('click', async () => {
 });
 
 document.getElementById('btn-ai-upload').addEventListener('click', () => {
+  // Open dashboard at the profile/resume tab
+  const url = chrome.runtime.getURL('dashboard/dashboard.html') + '#tab-profile';
   if (chrome.runtime.openOptionsPage) {
     chrome.runtime.openOptionsPage();
   } else {
-    window.open(chrome.runtime.getURL('dashboard/dashboard.html'));
+    window.open(url);
   }
+  showToast('Opening Dashboard → Profile tab to upload resume', 'info');
 });
 
 document.getElementById('btn-ai-match').addEventListener('click', async () => {
@@ -422,14 +425,22 @@ document.getElementById('btn-ai-match').addEventListener('click', async () => {
     if (resp.ok && resp.score) {
       const s = resp.score;
       const scoreColor = s.overallScore > 75 ? 'var(--green)' : s.overallScore > 50 ? 'var(--amber)' : 'var(--red)';
+      const scoreLabel = s.overallScore > 75 ? '🟢 Strong Fit' : s.overallScore > 50 ? '🟡 Fair Match' : '🔴 Weak Match';
       const html = `
-        <div style="font-size: 24px; font-weight: 800; color: ${scoreColor};">
-          ${Number(s.overallScore) || 0}/100
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
+          <div style="font-size: 32px; font-weight: 800; color: ${scoreColor};">
+            ${Number(s.overallScore) || 0}
+          </div>
+          <div>
+            <div style="font-weight:700; color:${scoreColor}; font-size:13px;">${scoreLabel}</div>
+            <div style="color:var(--text-dim); font-size:11px;">out of 100</div>
+          </div>
         </div>
-        <div style="margin-top: 8px;"><strong>Recommendation:</strong> ${escHtml(s.recommendation)}</div>
-        <div style="margin-top: 8px;"><strong>Strengths:</strong> ${escHtml((s.keyStrengths || []).join(', '))}</div>
-        ${s.gaps && s.gaps.length > 0 ? `<div style="margin-top: 8px;"><strong>Gaps:</strong> ${escHtml(s.gaps.join(', '))}</div>` : ''}
-        ${s.tips && s.tips.length > 0 ? `<div style="margin-top: 8px;"><strong>Tips:</strong> ${escHtml(s.tips.join('; '))}</div>` : ''}
+        <div style="margin-bottom:6px;"><strong>Recommendation:</strong> ${escHtml(s.recommendation)}</div>
+        <div style="margin-bottom:6px;"><strong>Strengths:</strong> ${escHtml((s.keyStrengths || []).join(', '))}</div>
+        ${s.gaps && s.gaps.length > 0 ? `<div style="margin-bottom:6px;"><strong>Gaps:</strong> ${escHtml(s.gaps.join(', '))}</div>` : ''}
+        ${s.tips && s.tips.length > 0 ? `<div style="margin-bottom:6px;"><strong>Tips:</strong> ${escHtml(s.tips.join('; '))}</div>` : ''}
+        <div style="margin-top:8px;padding:6px 8px;background:rgba(99,102,241,0.1);border-radius:6px;font-size:11px;color:var(--text-dim);">🤖 AI learns from every application you track — results improve over time</div>
       `;
       showAiResult('Match Score Result', html, false);
     } else {

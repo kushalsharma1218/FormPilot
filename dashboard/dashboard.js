@@ -786,7 +786,16 @@ function renderTracker() {
         return;
     }
 
-    list.innerHTML = filtered.map(app => `
+    list.innerHTML = filtered.map(app => {
+        const hasMatch = typeof app.matchScore === 'number';
+        const ms = hasMatch ? app.matchScore : null;
+        const msColor = ms !== null ? (ms >= 75 ? '#22c55e' : ms >= 50 ? '#f59e0b' : '#ef4444') : 'var(--text-dim)';
+        const msLabel = ms !== null ? `${ms}%` : '?';
+        const matchBadge = `
+          <div title="AI Match Score" style="display:flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:${msColor};padding:3px 7px;background:${msColor}15;border-radius:20px;border:1px solid ${msColor}33;">
+            🤖 ${msLabel}
+          </div>`;
+        return `
         <div class="app-card" data-app-id="${app.id}">
             <div class="app-card-header" data-apptoggle="${app.id}">
                 <div class="app-card-left">
@@ -797,6 +806,7 @@ function renderTracker() {
                     </div>
                 </div>
                 <div class="app-card-right">
+                    ${matchBadge}
                     <span class="app-card-date">${relativeDate(app.appliedAt)}</span>
                     <span class="app-status-badge ${app.status}">${app.status}</span>
                     <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
@@ -820,6 +830,13 @@ function renderTracker() {
     ).join('')}
                         </select>
                     </div>
+                    ${hasMatch ? `
+                    <div class="app-detail-item">
+                        <span class="app-detail-label">AI Match</span>
+                        <span class="app-detail-value" style="color:${msColor};font-weight:700;">
+                            ${ms}/100 &mdash; ${app.matchDetails?.recommendation ? escHtml(app.matchDetails.recommendation.substring(0, 60)) : ''}
+                        </span>
+                    </div>` : ''}
                     ${app.url ? `<div class="app-detail-item"><span class="app-detail-label">URL</span><a href="${app.url}" target="_blank" style="color:var(--blue-400);font-size:13px;text-decoration:none;">Open →</a></div>` : ''}
                 </div>
                 <div class="app-notes-area">
@@ -827,14 +844,15 @@ function renderTracker() {
                     <textarea data-appnotes="${app.id}" placeholder="Add personal notes...">${escHtml(app.notes || '')}</textarea>
                 </div>
                 <div class="app-card-actions-row">
+                    <button class="btn btn-secondary btn-sm" data-action="rematch" data-app-id="${app.id}" title="Re-run AI match score">🤖 Re-match</button>
                     <button class="btn btn-secondary btn-sm" data-action="interview" data-app-id="${app.id}">💬 Interview Prep</button>
                     <button class="btn btn-secondary btn-sm" data-action="followup" data-app-id="${app.id}">📧 Follow-up</button>
                     <button class="btn btn-secondary btn-sm" data-action="tailor" data-app-id="${app.id}">📄 Tailor Resume</button>
                     <button class="btn btn-danger btn-sm" data-action="deleteapp" data-app-id="${app.id}">🗑 Delete</button>
                 </div>
             </div>
-        </div>
-    `).join('');
+        </div>`;
+    }).join('');
     attachTrackerListeners();
 }
 
@@ -936,6 +954,50 @@ function attachTrackerListeners() {
             } catch (err) {
                 showToast('Failed: ' + err.message, 'error');
             } finally { setLoading(btn, false); }
+        });
+    });
+
+    // ── Re-match: re-run AI match score using stored job description
+    document.querySelectorAll('[data-action="rematch"]').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const app = applications.find(a => a.id === btn.dataset.appId);
+            if (!app) return;
+            const jd = app.jobDescription;
+            if (!jd || jd.length < 50) {
+                showToast('⚠️ No job description stored. Open the job URL and use Match Score first.', 'error');
+                return;
+            }
+            setLoading(btn, true);
+            btn.textContent = '⏳ Scoring...';
+            try {
+                const resp = await chrome.runtime.sendMessage({ type: 'AI_SCORE_MATCH', jobDescription: jd });
+                if (resp?.ok && resp.score) {
+                    const score = resp.score;
+                    const overallScore = Number(score.overallScore) || 0;
+                    const updResp = await chrome.runtime.sendMessage({
+                        type: 'APP_UPDATE',
+                        id: app.id,
+                        updates: {
+                            matchScore: overallScore,
+                            matchDetails: score,
+                            matchedAt: new Date().toISOString()
+                        }
+                    });
+                    if (updResp.ok) {
+                        applications = updResp.apps;
+                        renderTracker();
+                        showToast(`🤖 Match Score: ${overallScore}/100`, 'success');
+                    }
+                } else {
+                    throw new Error(resp?.error || 'Failed to score');
+                }
+            } catch (err) {
+                showToast('Re-match failed: ' + err.message, 'error');
+            } finally {
+                setLoading(btn, false);
+                btn.textContent = '🤖 Re-match';
+            }
         });
     });
 }
@@ -1684,6 +1746,25 @@ function setupDashAuth() {
     });
 }
 
-// ── Init ───────────────────────────────────────────────────────
+// ── Init ───────────────────────────────────────────────
 setupDashAuth();
-loadAllData();
+loadAllData().then(() => {
+    // Handle hash-based tab navigation (e.g. #tab-profile from popup)
+    const hash = window.location.hash;
+    if (hash && hash.startsWith('#tab-')) {
+        const tabId = hash.slice(1); // e.g. 'tab-profile'
+        const tabBtn = document.querySelector(`[data-tab="${tabId.replace('tab-', '')}"]`);
+        if (tabBtn) {
+            setTimeout(() => tabBtn.click(), 300);
+        }
+    }
+});
+
+// Also handle if user navigates with hash after page load
+window.addEventListener('hashchange', () => {
+    const hash = window.location.hash;
+    if (hash && hash.startsWith('#tab-')) {
+        const tabBtn = document.querySelector(`[data-tab="${hash.slice(5)}"]`);
+        if (tabBtn) tabBtn.click();
+    }
+});

@@ -42,7 +42,8 @@ let lastSubmitIntent = null;
 let approvalQueue = [];
 const LEARNING_SESSION_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const ACCURACY_MODE = false;
-const APPROVAL_REQUIRED_LEVEL = 'mid';
+// Low/mid confidence fields are filled immediately; user can correct them after
+const APPROVAL_REQUIRED_LEVEL = 'none';
 const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
 const SELECT_VALUE_PREFIX = '__JA_SELECT__';
 const SESSION_FLAG_KEYS = {
@@ -93,6 +94,175 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+// ── Value Normalization ────────────────────────────────────────
+// Produces an array of candidate values to try (most to least specific)
+function normalizeValueForField(val, el, fieldKey) {
+  if (!val) return [val];
+  const type = inferFieldType(el, fieldKey);
+  const v = String(val).trim();
+
+  // Phone normalization
+  if (type === 'phone') {
+    const digits = v.replace(/\D/g, '');
+    const d10 = digits.slice(-10); // last 10 digits
+    const d11 = digits.length === 11 && digits[0] === '1' ? digits.slice(1) : null;
+    const base = d11 || d10 || digits;
+    const candidates = [
+      v,                                                              // original
+      base,                                                           // raw digits
+      base.replace(/(\d{3})(\d{3})(\d{4})/, '($1) $2-$3'),         // (xxx) xxx-xxxx
+      base.replace(/(\d{3})(\d{3})(\d{4})/, '$1-$2-$3'),           // xxx-xxx-xxxx
+      base.replace(/(\d{3})(\d{3})(\d{4})/, '$1.$2.$3'),           // xxx.xxx.xxxx
+      '+1' + base,                                                   // +1xxxxxxxxxx
+    ];
+    return [...new Set(candidates.filter(Boolean))];
+  }
+
+  // Date normalization
+  if (type === 'date') {
+    try {
+      const d = new Date(v);
+      if (!isNaN(d.getTime())) {
+        const iso = d.toISOString().slice(0, 10);       // YYYY-MM-DD
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        const yyyy = d.getFullYear();
+        const yy = String(yyyy).slice(2);
+        return [...new Set([
+          v, iso,
+          `${mm}/${dd}/${yyyy}`, `${mm}-${dd}-${yyyy}`,
+          `${mm}/${yyyy}`,       `${mm}-${yyyy}`,
+          `${yyyy}-${mm}`,
+          d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+        ].filter(Boolean))];
+      }
+    } catch (_) {}
+  }
+
+  // URL / LinkedIn / GitHub normalization
+  if (type === 'url' || /linkedin|github|portfolio|website/i.test(fieldKey)) {
+    return [
+      v,
+      v.replace(/^https?:\/\//, ''),               // strip protocol
+      v.startsWith('http') ? v : 'https://' + v,   // add protocol
+    ];
+  }
+
+  return [v];
+}
+
+// Boolean / Yes-No smart resolver for select/radio options
+function resolveBooleanOption(savedVal, optionText, optionValue) {
+  const v = String(savedVal).toLowerCase().trim();
+  const trueTokens  = ['yes', 'true', '1', 'y', 'agree', 'authorized', 'citizen', 'eligible', 'will', 'can'];
+  const falseTokens = ['no', 'false', '0', 'n', 'disagree', 'not authorized', 'not eligible', 'cannot'];
+  const isTrue  = trueTokens.some(t => v === t || v.startsWith(t));
+  const isFalse = falseTokens.some(t => v === t || v.startsWith(t));
+  if (!isTrue && !isFalse) return false;
+
+  const optLow = (String(optionText || '') + ' ' + String(optionValue || '')).toLowerCase().trim();
+  const trueMatch  = ['yes', 'y', '1', 'true', 'si', 'oui', 'agree', 'authorize', 'eligible'];
+  const falseMatch = ['no', 'n', '0', 'false', 'non', 'disagree', 'not author', 'not eligible'];
+  if (isTrue  && trueMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
+  if (isFalse && falseMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
+  return false;
+}
+
+// EEO / custom job-specific question detection
+const EEO_PATTERNS = [
+  /how did you hear about/i,
+  /willing to relocate/i,
+  /authorized to work/i,
+  /require.{0,30}sponsor/i,
+  /salary expect|salary require|desired salary|expected compensation/i,
+  /available to start|start date|notice period/i,
+  /veteran status|military status/i,
+  /disability/i,
+  /gender|sex\b/i,
+  /race|ethnicit/i,
+  /work authorization|work permit/i,
+  /background check/i,
+  /drug.{0,10}test/i,
+  /criminal/i,
+];
+function isEEOorCustomQuestion(label) {
+  return EEO_PATTERNS.some(rx => rx.test(label || ''));
+}
+
+// Essay / behavioral question detection
+const ESSAY_PATTERNS = [
+  /why do you want/i,
+  /tell us about yourself/i,
+  /describe (a|an|your)/i,
+  /what makes you/i,
+  /greatest (strength|weakness|achievement|accomplishment)/i,
+  /biggest challenge/i,
+  /briefly (describe|explain)/i,
+  /in a few (words|sentences)/i,
+  /personal statement/i,
+  /cover letter/i,
+  /experience with|experience in/i,
+  /how (have|would) you/i,
+];
+function isEssayQuestion(el, label) {
+  if (el.tagName !== 'TEXTAREA') return false;
+  if ((el.maxLength > 0 && el.maxLength < 100)) return false; // too short for essay
+  return ESSAY_PATTERNS.some(rx => rx.test(label || el.placeholder || ''));
+}
+
+// ── Correction Learning ────────────────────────────────────────
+const CORRECTION_STORE_KEY = 'ja_field_corrections';
+function recordCorrection(fieldKey, originalVal, correctedVal) {
+  if (!fieldKey || !correctedVal || correctedVal === originalVal) return;
+  try {
+    const raw = localStorage.getItem(CORRECTION_STORE_KEY);
+    const corrections = raw ? JSON.parse(raw) : [];
+    // Keep last 200 corrections
+    if (corrections.length >= 200) corrections.shift();
+    corrections.push({
+      fieldKey,
+      originalVal: String(originalVal || '').substring(0, 200),
+      correctedVal: String(correctedVal).substring(0, 200),
+      hostname,
+      ts: Date.now()
+    });
+    localStorage.setItem(CORRECTION_STORE_KEY, JSON.stringify(corrections));
+  } catch (_) {}
+
+  // If this maps to a known global profile field, update it
+  const profileKey = inferProfileKeyFromLabel(fieldKey);
+  if (profileKey) {
+    chrome.runtime.sendMessage({
+      type: 'GET_GLOBAL_PROFILE'
+    }).then(resp => {
+      const profile = resp?.profile || {};
+      if (profile[profileKey] !== correctedVal) {
+        profile[profileKey] = correctedVal;
+        chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => {});
+        console.log(`[FormPilot] AI Learning: profile.${profileKey} updated from correction`);
+      }
+    }).catch(() => {});
+  }
+}
+
+function inferProfileKeyFromLabel(label) {
+  if (!label) return null;
+  const l = label.toLowerCase();
+  if (/first.?name|given.?name/.test(l)) return 'firstName';
+  if (/last.?name|family.?name|surname/.test(l)) return 'lastName';
+  if (/^email|mail address/.test(l)) return 'email';
+  if (/phone|mobile|cell|tel/.test(l)) return 'phone';
+  if (/linkedin/.test(l)) return 'linkedin';
+  if (/github/.test(l)) return 'github';
+  if (/portfolio|website/.test(l)) return 'portfolio';
+  if (/^city$/.test(l)) return 'city';
+  if (/^state$|province/.test(l)) return 'state';
+  if (/zip|postal/.test(l)) return 'zipcode';
+  if (/job title|current title|position/.test(l)) return 'currentTitle';
+  if (/company|employer/.test(l)) return 'currentCompany';
+  return null;
 }
 
 function inferFieldType(el, fieldKey) {
@@ -158,8 +328,8 @@ function classifyConfidence({ mapped, source, globalMeta }) {
 }
 
 function shouldAutofillConfidence(level) {
-  if (!ACCURACY_MODE) return true;
-  return level === 'high';
+  // Always fill — user can review & correct after the fact
+  return true;
 }
 
 function queueApproval(entry) {
@@ -615,8 +785,97 @@ async function maybeAutoTrackApplication(stage) {
     const resp = await chrome.runtime.sendMessage({ type: 'APP_ADD', application });
     if (resp?.ok) {
       setSessionFlag('appAdded', true);
+      // Auto match score after submitting application
+      maybeAutoScoreMatch(pageText, application);
     }
   } catch (_) { }
+}
+
+// Auto-run match scoring after application is tracked
+async function maybeAutoScoreMatch(pageText, application) {
+  if (!pageText || pageText.length < 100) return;
+  try {
+    const scoreResp = await chrome.runtime.sendMessage({ type: 'AI_SCORE_MATCH', jobDescription: pageText });
+    if (scoreResp?.ok && scoreResp.score) {
+      const score = scoreResp.score;
+      const overallScore = Number(score.overallScore) || 0;
+      // Update the application with match data
+      if (application?.companyName) {
+        const appsResp = await chrome.runtime.sendMessage({ type: 'APP_GET_ALL' });
+        const apps = appsResp?.apps || [];
+        const trackedApp = apps.find(a =>
+          a.companyName === application.companyName &&
+          a.jobTitle === application.jobTitle
+        );
+        if (trackedApp?.id) {
+          await chrome.runtime.sendMessage({
+            type: 'APP_UPDATE',
+            id: trackedApp.id,
+            updates: {
+              matchScore: overallScore,
+              matchDetails: score,
+              matchedAt: new Date().toISOString()
+            }
+          });
+          console.log(`[FormPilot] Auto match score: ${overallScore}/100 for ${application.companyName}`);
+          // Show a lightweight notification about the match
+          if (overallScore > 0) {
+            showMatchScoreNotification(overallScore, score.recommendation);
+          }
+        }
+      }
+    }
+  } catch (_) { }
+}
+
+function showMatchScoreNotification(score, recommendation) {
+  const existing = document.getElementById('ja-match-notify');
+  if (existing) existing.remove();
+  const color = score >= 75 ? '#22c55e' : score >= 50 ? '#f59e0b' : '#ef4444';
+  const label = score >= 75 ? 'Great Match!' : score >= 50 ? 'Fair Match' : 'Weak Match';
+  const notify = document.createElement('div');
+  notify.id = 'ja-match-notify';
+  notify.innerHTML = `
+    <style>
+      #ja-match-notify {
+        position: fixed; bottom: 24px; right: 18px; z-index: 2147483647;
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        border: 1px solid ${color}55;
+        border-radius: 14px; padding: 14px 18px;
+        display: flex; align-items: center; gap: 12px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.55);
+        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        color: #e2e8f0; font-size: 13px;
+        animation: ja-slide-up 0.35s cubic-bezier(0.34,1.56,0.64,1);
+        max-width: 320px;
+      }
+      @keyframes ja-slide-up {
+        from { opacity:0; transform: translateY(20px); }
+        to   { opacity:1; transform: translateY(0); }
+      }
+      #ja-match-notify .score-badge {
+        width: 48px; height: 48px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: 15px;
+        background: ${color}22; color: ${color};
+        border: 2px solid ${color}55; flex-shrink:0;
+      }
+      #ja-match-notify .info { flex:1; }
+      #ja-match-notify .title { font-weight:700; color:${color}; }
+      #ja-match-notify .rec { color:#94a3b8; font-size:11px; margin-top:3px; }
+      #ja-match-notify .close { color:#64748b; cursor:pointer; font-size:16px; padding:2px 6px; }
+      #ja-match-notify .close:hover { color:#e2e8f0; }
+    </style>
+    <div class="score-badge">${score}</div>
+    <div class="info">
+      <div class="title">🤖 AI Match: ${label}</div>
+      <div class="rec">${recommendation || 'Application tracked!'}</div>
+    </div>
+    <span class="close" id="ja-match-close">×</span>
+  `;
+  document.body.appendChild(notify);
+  document.getElementById('ja-match-close')?.addEventListener('click', () => notify.remove());
+  setTimeout(() => notify.remove(), 8000);
 }
 
 const GLOBAL_HEURISTICS = [
@@ -649,6 +908,13 @@ function getGlobalMatch(fieldKey) {
 function getGlobalMatchMeta(fieldKey) {
   if (!fieldKey || !currentGlobalProfile) return null;
   const cleanKey = fieldKey.replace(/\[\d+\]$/, '');
+  
+  // 1. Direct profile key match (often happens when AI mapped it)
+  if (currentGlobalProfile[cleanKey] !== undefined) {
+    return { value: currentGlobalProfile[cleanKey], key: cleanKey, score: 1.0 };
+  }
+  
+  // 2. Heuristic fallback
   for (const h of GLOBAL_HEURISTICS) {
     if (h.regex.test(cleanKey) && currentGlobalProfile[h.pId]) {
       const score = Math.max(0.7, scoreStringMatch(cleanKey, h.pId));
@@ -741,40 +1007,98 @@ function isGreenhousePage() {
     || document.querySelector('.application-form, .application-question')
     || document.querySelector('form[action*="greenhouse"]');
 }
-
 function isLeverPage() {
   return /lever\.co/i.test(location.hostname)
     || document.querySelector('.application-form, .application-question');
 }
-
 function isICIMSPage() {
   return /icims\.com/i.test(location.hostname)
     || document.querySelector('.iCIMS_Application');
 }
-
 function isSmartRecruitersPage() {
   return /smartrecruiters\.com/i.test(location.hostname)
     || document.querySelector('[data-qa="job-title"], [data-qa="apply-button"], .sr-apply');
 }
-
 function isWorkablePage() {
   return /workable\.com/i.test(location.hostname)
     || document.querySelector('.application-form, form[action*="workable"]');
 }
-
 function isAshbyPage() {
   return /ashbyhq\.com/i.test(location.hostname)
     || document.querySelector('[data-testid="application-form"], [data-testid="form-field"]');
 }
-
 function isTaleoPage() {
   return /taleo\.net/i.test(location.hostname)
     || document.querySelector('.taleo, [id*="taleo"]');
 }
-
 function isSuccessFactorsPage() {
   return /successfactors\.com/i.test(location.hostname)
     || document.querySelector('[id*="sfApply"], .sfApply');
+}
+// ── NEW: Additional ATS platforms ────────────────────────────
+function isRipplingPage() {
+  return /rippling\.com/i.test(location.hostname)
+    || document.querySelector('[data-testid="application-form"], form[action*="rippling"]');
+}
+function isZohoRecruitPage() {
+  return /zohorecruit\.com|recruit\.zoho/i.test(location.hostname)
+    || document.querySelector('.zrx-apply-form, [data-module="Candidates"]');
+}
+function isBreezyPage() {
+  return /breezy\.hr/i.test(location.hostname)
+    || document.querySelector('.breezy-apply, form[action*="breezy"]');
+}
+function isJazzHRPage() {
+  return /jazzhr\.com|app\.jazz\.co/i.test(location.hostname)
+    || document.querySelector('.jazzhr-job-board, form[action*="jazz"]');
+}
+function isPinpointHQPage() {
+  return /pinpointhq\.com/i.test(location.hostname)
+    || document.querySelector('[data-application-form], .pinpoint-apply');
+}
+function isLinkedInEasyApplyPage() {
+  return /linkedin\.com/i.test(location.hostname)
+    && (document.querySelector('.jobs-easy-apply-modal, .jobs-easy-apply-content') ||
+        document.querySelector('[data-test-modal-id="easy-apply-modal"]'));
+}
+
+// ── NEW: Label extractors for new platforms ────────────────────
+function getRipplingLabel(el) {
+  const field = el.closest?.('[data-testid="form-field"], .form-field, .field, .form-group');
+  if (!field) return '';
+  const lbl = field.querySelector('label, [data-testid="form-label"], .label');
+  return lbl?.innerText?.trim() ? cleanLabelText(lbl.innerText) : '';
+}
+function getZohoLabel(el) {
+  const field = el.closest?.('.zrx-form-group, .form-field, .field, td');
+  if (!field) return '';
+  const lbl = field.querySelector('label, .zrx-label, th');
+  return lbl?.innerText?.trim() ? cleanLabelText(lbl.innerText) : '';
+}
+function getBreezyLabel(el) {
+  const field = el.closest?.('.form-group, .field, .form-field');
+  if (!field) return '';
+  const lbl = field.querySelector('label, .control-label, .field-label');
+  return lbl?.innerText?.trim() ? cleanLabelText(lbl.innerText) : '';
+}
+function getJazzHRLabel(el) {
+  const field = el.closest?.('.field, .form-group, .jazzhr-field');
+  if (!field) return '';
+  const lbl = field.querySelector('label, .label');
+  return lbl?.innerText?.trim() ? cleanLabelText(lbl.innerText) : '';
+}
+function getPinpointLabel(el) {
+  const field = el.closest?.('[data-field], .application-field, .form-field');
+  if (!field) return '';
+  const lbl = field.querySelector('label, .field-label');
+  return lbl?.innerText?.trim() ? cleanLabelText(lbl.innerText) : '';
+}
+function getLinkedInEasyApplyLabel(el) {
+  // LinkedIn Easy Apply: field labels are in fb-form-element__label or aria-label
+  const field = el.closest?.('.fb-form-element, .jobs-easy-apply-form-section__field, .jobs-easy-apply-form-element');
+  if (!field) return '';
+  const lbl = field.querySelector('[data-test-single-typeahead-entity-form-component-title], .fb-form-element-label, label, [class*="label"]');
+  return lbl?.innerText?.trim() ? cleanLabelText(lbl.innerText) : (el.getAttribute('aria-label') || '');
 }
 
 function getWorkdayLabel(el) {
@@ -850,42 +1174,22 @@ function getSuccessFactorsLabel(el) {
 }
 
 function getSiteLabel(el) {
-  if (isWorkdayPage()) {
-    const wd = getWorkdayLabel(el);
-    if (wd) return wd;
-  }
-  if (isGreenhousePage()) {
-    const gh = getGreenhouseLabel(el);
-    if (gh) return gh;
-  }
-  if (isLeverPage()) {
-    const lv = getLeverLabel(el);
-    if (lv) return lv;
-  }
-  if (isICIMSPage()) {
-    const ic = getICIMSLabel(el);
-    if (ic) return ic;
-  }
-  if (isSmartRecruitersPage()) {
-    const sr = getSmartRecruitersLabel(el);
-    if (sr) return sr;
-  }
-  if (isWorkablePage()) {
-    const wk = getWorkableLabel(el);
-    if (wk) return wk;
-  }
-  if (isAshbyPage()) {
-    const ah = getAshbyLabel(el);
-    if (ah) return ah;
-  }
-  if (isTaleoPage()) {
-    const tl = getTaleoLabel(el);
-    if (tl) return tl;
-  }
-  if (isSuccessFactorsPage()) {
-    const sf = getSuccessFactorsLabel(el);
-    if (sf) return sf;
-  }
+  if (isWorkdayPage()) { const v = getWorkdayLabel(el); if (v) return v; }
+  if (isGreenhousePage()) { const v = getGreenhouseLabel(el); if (v) return v; }
+  if (isLeverPage()) { const v = getLeverLabel(el); if (v) return v; }
+  if (isICIMSPage()) { const v = getICIMSLabel(el); if (v) return v; }
+  if (isSmartRecruitersPage()) { const v = getSmartRecruitersLabel(el); if (v) return v; }
+  if (isWorkablePage()) { const v = getWorkableLabel(el); if (v) return v; }
+  if (isAshbyPage()) { const v = getAshbyLabel(el); if (v) return v; }
+  if (isTaleoPage()) { const v = getTaleoLabel(el); if (v) return v; }
+  if (isSuccessFactorsPage()) { const v = getSuccessFactorsLabel(el); if (v) return v; }
+  // ── New platforms
+  if (isRipplingPage()) { const v = getRipplingLabel(el); if (v) return v; }
+  if (isZohoRecruitPage()) { const v = getZohoLabel(el); if (v) return v; }
+  if (isBreezyPage()) { const v = getBreezyLabel(el); if (v) return v; }
+  if (isJazzHRPage()) { const v = getJazzHRLabel(el); if (v) return v; }
+  if (isPinpointHQPage()) { const v = getPinpointLabel(el); if (v) return v; }
+  if (isLinkedInEasyApplyPage()) { const v = getLinkedInEasyApplyLabel(el); if (v) return v; }
   return '';
 }
 
@@ -1564,18 +1868,30 @@ function fillFields(savedFields, opts = {}) {
   // Exclude: hidden, submit, button, reset, file, PASSWORD (security!), single-char OTPs
   const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
 
-  // Radio buttons
+  // Radio buttons — enhanced with fuzzy + boolean matching
   collectElements('input[type=radio]').forEach(el => {
     stats.detected += 1;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el) || el.name;
-    if (!key || !(key in savedFields)) return;
+    if (!key) return;
+    let val = savedFields[key];
+    if (val === undefined) val = getGlobalMatch(key);
+    if (val === undefined || val === null) return;
     stats.matched += 1;
-    const decoded = decodeSelectValue(savedFields[key]);
-    const saved = String(decoded.text || savedFields[key]).toLowerCase().trim();
+    const decoded = decodeSelectValue(val);
+    const saved = String(decoded.text || val).toLowerCase().trim();
     const optionVal = String(el.value || '').toLowerCase().trim();
     const optionLabel = String(getRadioOptionLabel(el) || '').toLowerCase().trim();
-    if ((optionVal && saved === optionVal) || (optionLabel && saved === optionLabel)) {
+    // Exact match
+    const exactMatch = (optionVal && saved === optionVal) || (optionLabel && saved === optionLabel);
+    // Boolean smart match (Yes/No/True/False)
+    const boolMatch = !exactMatch && resolveBooleanOption(saved, optionLabel, optionVal);
+    // Fuzzy partial match (e.g. "authorized" matches "yes, authorized")
+    const fuzzyMatch = !exactMatch && !boolMatch && (
+      (optionLabel && (optionLabel.includes(saved) || saved.includes(optionLabel))) ||
+      (optionVal && (optionVal.includes(saved) || saved.includes(optionVal)))
+    ) && saved.length > 2;
+    if (exactMatch || boolMatch || fuzzyMatch) {
       el.checked = true;
       triggerEvents(el);
       stats.filled += 1;
@@ -1623,11 +1939,33 @@ function fillFields(savedFields, opts = {}) {
       return;
     }
 
-    const filled = applyValueToElement(el, fieldKey, primaryVal, altVal);
+    // Try normalized value candidates (phone, date, URL variants)
+    const valueCandidates = normalizeValueForField(primaryVal, el, fieldKey);
+    let filled = false;
+    for (const candidate of valueCandidates) {
+      filled = applyValueToElement(el, fieldKey, candidate, altVal);
+      if (filled) break;
+    }
     if (filled) {
       stats.filled += 1;
+      // Attach correction tracker so AI can learn from user edits
+      attachCorrectionTracker(el, fieldKey, valueCandidates[0]);
     } else if (el.tagName === 'SELECT') {
-      unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'select' });
+      // Try boolean resolution for Yes/No selects
+      let boolFilled = false;
+      for (let i = 0; i < el.options.length; i++) {
+        const opt = el.options[i];
+        if (resolveBooleanOption(primaryVal, opt.text, opt.value)) {
+          el.selectedIndex = i;
+          triggerEvents(el);
+          stats.filled += 1;
+          boolFilled = true;
+          break;
+        }
+      }
+      if (!boolFilled) {
+        unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'select' });
+      }
     }
   });
 
@@ -1780,6 +2118,25 @@ function reportSiteMetrics(stats) {
   chrome.runtime.sendMessage({ type: 'SITE_METRICS_UPDATE', hostname, stats }).catch(() => { });
 }
 
+// Track corrections: when user changes a field we auto-filled, learn from it
+function attachCorrectionTracker(el, fieldKey, autoFilledVal) {
+  if (!el || !fieldKey) return;
+  // Mark the element so we don't attach twice
+  if (el.__jaCorrectionTracked) return;
+  el.__jaCorrectionTracked = true;
+  el.__jaAutoValue = autoFilledVal;
+
+  const onCorrect = () => {
+    const currentVal = getFieldValue(el);
+    if (currentVal && currentVal !== el.__jaAutoValue && currentVal !== el.placeholder) {
+      recordCorrection(fieldKey, el.__jaAutoValue, currentVal);
+      el.__jaAutoValue = currentVal; // update so we don't re-log same correction
+    }
+  };
+  el.addEventListener('change', onCorrect, { once: false });
+  el.addEventListener('blur', onCorrect, { once: false });
+}
+
 function attachLiveCapture() {
   if (window._jaLiveCaptureAttached) return;
   window._jaLiveCaptureAttached = true;
@@ -1821,6 +2178,81 @@ function attachLiveCapture() {
   document.addEventListener('change', handler, true);
   document.addEventListener('blur', handler, true);
   document.addEventListener('click', handler, true);
+
+  // ── AI Essay Fill Buttons ─────────────────────────────────────
+  // Inject "✨ AI Answer" buttons next to behavioral/essay textareas
+  function maybeInjectEssayButtons() {
+    collectElements('textarea').forEach(el => {
+      if (el.__jaEssayBtn) return;
+      if (!isVisibleElement(el)) return;
+      const label = getFieldKey(el) || getSiteLabel(el) || el.placeholder || '';
+      if (!isEssayQuestion(el, label)) return;
+
+      el.__jaEssayBtn = true;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = '✨ AI Answer';
+      btn.style.cssText = [
+        'position:absolute', 'z-index:2147483640',
+        'background:linear-gradient(135deg,#4f46e5,#7c3aed)',
+        'color:#fff', 'border:none', 'border-radius:8px',
+        'padding:4px 10px', 'font-size:11px', 'font-weight:700',
+        'cursor:pointer', 'box-shadow:0 2px 8px rgba(79,70,229,.4)',
+        'opacity:0.9', 'transition:opacity .15s',
+      ].join(';');
+      btn.onmouseover = () => { btn.style.opacity = '1'; };
+      btn.onmouseout  = () => { btn.style.opacity = '0.9'; };
+
+      // Position relative to the textarea
+      const positionBtn = () => {
+        const rect = el.getBoundingClientRect();
+        btn.style.top  = (rect.top  + window.scrollY + 4) + 'px';
+        btn.style.left = (rect.right + window.scrollX - 110) + 'px';
+      };
+      positionBtn();
+      document.body.appendChild(btn);
+
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const originalText = btn.textContent;
+        btn.textContent = '⏳ Generating...';
+        btn.disabled = true;
+        try {
+          const pageText = (document.body?.innerText || '').substring(0, 4000);
+          const resp = await chrome.runtime.sendMessage({
+            type: 'AI_GENERATE_ANSWER',
+            question: label,
+            jobContext: pageText
+          });
+          if (resp?.ok && resp.answer) {
+            setNativeValue(el, resp.answer);
+            triggerEvents(el);
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+            btn.textContent = '✅ Done';
+            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+          } else {
+            btn.textContent = '❌ Failed';
+            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+          }
+        } catch (_) {
+          btn.textContent = originalText;
+          btn.disabled = false;
+        }
+      });
+
+      // Reposition on scroll/resize
+      window.addEventListener('scroll', positionBtn, { passive: true });
+      window.addEventListener('resize', positionBtn, { passive: true });
+    });
+  }
+
+  // Run after slight delay so page is rendered, and re-run on DOM changes
+  setTimeout(maybeInjectEssayButtons, 1500);
+  const essayObserver = new MutationObserver(() => {
+    clearTimeout(essayObserver._t);
+    essayObserver._t = setTimeout(maybeInjectEssayButtons, 600);
+  });
+  try { essayObserver.observe(document.body, { childList: true, subtree: true }); } catch (_) {}
 }
 
 // ── Resume Attach (Local Resume Vault) ─────────────────────────
@@ -1884,36 +2316,111 @@ function ensureResumeAttachUI() {
   wrap.innerHTML = `
     <style>
       #ja-resume-attach {
-        position: fixed; z-index: 2147483646; font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        position: fixed;
+        z-index: 2147483647;
+        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
       }
       #ja-resume-attach .ja-resume-btn {
-        background: #0f172a; color: #e2e8f0; border: 1px solid rgba(148,163,184,0.3);
-        border-radius: 10px; padding: 8px 12px; font-size: 12px; font-weight: 600;
-        cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-        display: inline-flex; align-items: center; gap: 6px;
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        color: #e2e8f0;
+        border: 1px solid rgba(99,102,241,0.5);
+        border-radius: 10px;
+        padding: 8px 14px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 4px 18px rgba(0,0,0,0.5), 0 0 0 1px rgba(99,102,241,0.2);
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        white-space: nowrap;
+        transition: border-color 0.15s, box-shadow 0.15s;
+        user-select: none;
       }
-      #ja-resume-attach .ja-resume-btn:hover { border-color: rgba(99,102,241,0.6); }
+      #ja-resume-attach .ja-resume-btn:hover {
+        border-color: rgba(99,102,241,0.85);
+        box-shadow: 0 4px 20px rgba(99,102,241,0.35);
+      }
+      #ja-resume-attach .ja-resume-flair {
+        display: inline-block;
+        width: 7px; height: 7px; border-radius: 50%;
+        background: #6366f1;
+        box-shadow: 0 0 5px #6366f1;
+        flex-shrink: 0;
+      }
+      /* Menu — default opens below; [data-open-up=true] flips it above */
       #ja-resume-attach .ja-resume-menu {
-        position: absolute; top: 38px; right: 0; min-width: 240px;
-        background: #0b1220; border: 1px solid rgba(99,102,241,0.35);
-        border-radius: 12px; padding: 8px; display: none;
-        box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+        position: absolute;
+        left: 0;
+        top: calc(100% + 8px);
+        min-width: 260px;
+        background: #0b1220;
+        border: 1px solid rgba(99,102,241,0.4);
+        border-radius: 12px;
+        padding: 6px;
+        display: none;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(99,102,241,0.15);
+        z-index: 2147483647;
+      }
+      #ja-resume-attach[data-open-up="true"] .ja-resume-menu {
+        top: auto;
+        bottom: calc(100% + 8px);
       }
       #ja-resume-attach.open .ja-resume-menu { display: block; }
+      #ja-resume-attach .ja-resume-menu-header {
+        font-size: 10px;
+        font-weight: 700;
+        color: #475569;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        padding: 4px 8px 6px;
+      }
       #ja-resume-attach .ja-resume-item {
-        display: flex; flex-direction: column; gap: 2px; padding: 8px;
-        border-radius: 8px; cursor: pointer; color: #e2e8f0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 10px;
+        border-radius: 8px;
+        cursor: pointer;
+        color: #e2e8f0;
+        transition: background 0.12s;
       }
-      #ja-resume-attach .ja-resume-item:hover { background: rgba(148,163,184,0.12); }
-      #ja-resume-attach .ja-resume-name { font-size: 12px; font-weight: 600; }
-      #ja-resume-attach .ja-resume-meta { font-size: 11px; color: #94a3b8; }
+      #ja-resume-attach .ja-resume-item:hover { background: rgba(99,102,241,0.14); }
+      #ja-resume-attach .ja-resume-icon { font-size: 18px; }
+      #ja-resume-attach .ja-resume-info { flex: 1; min-width: 0; }
+      #ja-resume-attach .ja-resume-name {
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #ja-resume-attach .ja-resume-meta { font-size: 11px; color: #64748b; margin-top: 1px; }
       #ja-resume-attach .ja-resume-pill {
-        display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 999px;
-        background: rgba(59,130,246,0.18); color: #93c5fd; margin-left: 6px;
+        font-size: 10px;
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: rgba(99,102,241,0.2);
+        color: #a5b4fc;
+        font-weight: 600;
+        white-space: nowrap;
       }
-      #ja-resume-attach .ja-resume-empty { font-size: 12px; color: #94a3b8; padding: 8px; }
+      #ja-resume-attach .ja-resume-empty {
+        font-size: 12px;
+        color: #64748b;
+        padding: 12px 10px;
+        text-align: center;
+      }
+      #ja-resume-attach .ja-resume-empty a {
+        color: #6366f1;
+        text-decoration: none;
+        font-weight: 600;
+      }
     </style>
-    <div class="ja-resume-btn">📎 Attach Resume</div>
+    <div class="ja-resume-btn">
+      <span class="ja-resume-flair"></span>
+      📎 Attach Resume
+    </div>
     <div class="ja-resume-menu"></div>
   `;
   document.body.appendChild(wrap);
@@ -1927,6 +2434,7 @@ function ensureResumeAttachUI() {
     }
   });
 
+  // Close on outside click
   document.addEventListener('click', (e) => {
     if (!resumeMenuOpen) return;
     const root = document.getElementById('ja-resume-attach');
@@ -1938,19 +2446,39 @@ function positionResumeAttach(anchor) {
   const wrap = document.getElementById('ja-resume-attach');
   if (!wrap) return;
   wrap.style.display = 'block';
-  wrap.style.bottom = '';
-  wrap.style.right = '';
+
+  // For position:fixed elements, getBoundingClientRect() gives viewport coords directly
+  // — do NOT add scrollY/scrollX
   if (anchor && isVisibleElement(anchor)) {
     const rect = anchor.getBoundingClientRect();
-    const top = Math.max(rect.top - 8, 8);
-    const left = Math.max(rect.right - 170, 8);
-    wrap.style.top = `${top}px`;
-    wrap.style.left = `${left}px`;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // Horizontal: align right edge of button to right edge of anchor, clamped to screen
+    const btnWidth = 160;
+    let left = Math.max(4, Math.min(rect.right - btnWidth, vw - btnWidth - 8));
+
+    // Vertical: place just above the anchor. If too close to top, place below instead.
+    const btnHeight = 36;
+    let top = rect.top - btnHeight - 6;
+    if (top < 8) top = rect.bottom + 6; // flip down
+    top = Math.max(8, Math.min(top, vh - btnHeight - 8));
+
+    wrap.style.top    = `${top}px`;
+    wrap.style.left   = `${left}px`;
+    wrap.style.bottom = '';
+    wrap.style.right  = '';
+
+    // Tell the menu which direction to open
+    const spaceBelow = vh - (top + btnHeight);
+    wrap.dataset.openUp = spaceBelow < 180 ? 'true' : 'false';
   } else {
-    wrap.style.top = '';
-    wrap.style.left = '';
-    wrap.style.bottom = '18px';
-    wrap.style.right = '18px';
+    // Fallback: always-visible corner
+    wrap.style.top    = '';
+    wrap.style.left   = '';
+    wrap.style.bottom = '20px';
+    wrap.style.right  = '20px';
+    wrap.dataset.openUp = 'true'; // open upward from bottom corner
   }
 }
 
@@ -2068,20 +2596,43 @@ async function openResumeMenu() {
   ensureResumeAttachUI();
   const wrap = document.getElementById('ja-resume-attach');
   const menu = wrap.querySelector('.ja-resume-menu');
+  menu.innerHTML = '<div class="ja-resume-empty">Loading resumes…</div>';
+  wrap.classList.add('open');
+  resumeMenuOpen = true;
+
   const { items, defaultId } = await fetchResumeList(true);
+
   if (!items || items.length === 0) {
-    menu.innerHTML = `<div class="ja-resume-empty">No resumes saved. Add one in the extension dashboard.</div>`;
+    menu.innerHTML = `
+      <div class="ja-resume-empty">
+        No resumes saved.<br>
+        <a href="#" id="ja-resume-open-dash">Open Dashboard → Upload One</a>
+      </div>`;
+    menu.querySelector('#ja-resume-open-dash')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => {});
+      if (chrome.runtime.openOptionsPage) chrome.runtime.openOptionsPage();
+      closeResumeMenu();
+    });
   } else {
-    menu.innerHTML = items.map(item => {
-      const def = item.id === defaultId ? '<span class="ja-resume-pill">Default</span>' : '';
-      const label = item.label ? ` · ${item.label}` : '';
-      return `
-        <div class="ja-resume-item" data-resume-id="${item.id}">
-          <div class="ja-resume-name">${item.name || 'Resume'} ${def}</div>
-          <div class="ja-resume-meta">${(item.mime || 'file').toLowerCase()}${label}</div>
-        </div>
-      `;
-    }).join('');
+    menu.innerHTML = `<div class="ja-resume-menu-header">Select Resume to Attach</div>` +
+      items.map(item => {
+        const isDefault = item.id === defaultId;
+        const icon = (item.mime || '').includes('pdf') ? '📴' : '📝';
+        const sizeKb = item.size ? `${Math.round(item.size / 1024)} KB` : '';
+        const label = item.label ? item.label : '';
+        const meta = [sizeKb, label].filter(Boolean).join(' · ');
+        return `
+          <div class="ja-resume-item" data-resume-id="${item.id}">
+            <span class="ja-resume-icon">${icon}</span>
+            <div class="ja-resume-info">
+              <div class="ja-resume-name">${escapeHtml(item.name || 'Resume')}</div>
+              ${meta ? `<div class="ja-resume-meta">${escapeHtml(meta)}</div>` : ''}
+            </div>
+            ${isDefault ? '<span class="ja-resume-pill">Default</span>' : ''}
+          </div>`;
+      }).join('');
+
     menu.querySelectorAll('.ja-resume-item').forEach(el => {
       el.addEventListener('click', async () => {
         const id = el.getAttribute('data-resume-id');
@@ -2094,8 +2645,6 @@ async function openResumeMenu() {
       });
     });
   }
-  wrap.classList.add('open');
-  resumeMenuOpen = true;
 }
 
 function closeResumeMenu() {
@@ -3278,6 +3827,74 @@ function isExtensionValid() {
   }
 }
 
+let isAiMappingRunning = false;
+async function triggerAiMapping(elementsToMap) {
+  if (isAiMappingRunning) return;
+  const unmappedLabels = [];
+  const elMap = new Map();
+  elementsToMap.forEach(el => {
+    const type = (el.type || '').toLowerCase();
+    if (type === 'radio' && el.checked === false) return; // Only map selected radios or just typical text/select
+    if (isSensitiveField(el) || type === 'password') return;
+    
+    const mapped = resolveMappedKey(el);
+    if (!mapped.key) {
+      const label = getFieldKey(el) || getSiteLabel(el) || el.name;
+      if (label) {
+         unmappedLabels.push(label);
+         if (!elMap.has(label)) elMap.set(label, el);
+      }
+    }
+  });
+
+  const uniqueLabels = [...new Set(unmappedLabels)];
+  if (uniqueLabels.length === 0) return;
+
+  isAiMappingRunning = true;
+  try {
+     const aiSettings = await chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }).then(r=>r.settings).catch(()=>null);
+     if (!aiSettings?.enabled || !aiSettings?.apiKey) return;
+     
+     console.log(`[FormPilot] Triggering AI mapping for ${uniqueLabels.length} unknown fields...`);
+     const resp = await chrome.runtime.sendMessage({ type: 'AI_MATCH_FIELDS', fieldLabels: uniqueLabels }).catch(()=>null);
+     if (resp?.ok && resp.mapping) {
+        let added = 0;
+        const newMappings = [];
+        for (const [label, matchedKey] of Object.entries(resp.mapping)) {
+           if (matchedKey && String(matchedKey).trim() && String(matchedKey).trim() !== 'null') { 
+              const el = elMap.get(label);
+              if (el) {
+                 const signature = getFieldSignature(el);
+                 const hints = buildElementHints(el);
+                 const mapping = { signature, mappedKey: matchedKey, label, type: el.type||'text', hints, confidence: 8 };
+                 newMappings.push(mapping);
+                 added++;
+              }
+           }
+        }
+        if (added > 0) {
+           for (const m of newMappings) {
+              await chrome.runtime.sendMessage({ type: 'SAVE_SITE_MAPPING', hostname, mapping: m }).catch(()=>null);
+              const idx = currentSiteMappings.findIndex(map => map.signature === m.signature);
+              if (idx >= 0) currentSiteMappings[idx] = m;
+              else currentSiteMappings.push(m);
+           }
+           siteData.mappings = currentSiteMappings;
+           console.log(`[FormPilot] AI mapping complete. Learned ${added} new fields. Re-running autofill.`);
+           // Trigger fill again silently if active
+           if (getSessionFlag('autofillActive')) {
+              const mergedFields = { ...(siteData?.fields || {}), ...(sessionFlags?.fields || {}) };
+              fillFields(mergedFields, { skipObserver: true });
+           }
+        }
+     }
+  } catch(e) {
+     console.error('[FormPilot] AI mapping failed:', e);
+  } finally {
+     isAiMappingRunning = false;
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────
 let initRunning = false;
 async function init() {
@@ -3339,6 +3956,10 @@ async function init() {
     if (allowAuto) {
       attachLiveCapture();
       initResumeAttach();
+      
+      const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
+      const elementsToMap = collectElements(selectors);
+      triggerAiMapping(elementsToMap);
     }
 
     // If job context wasn't ready yet (SPA or late render), re-check once.

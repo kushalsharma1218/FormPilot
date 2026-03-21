@@ -1,0 +1,142 @@
+44:// Low/mid confidence fields are filled immediately; user can correct them after
+46:const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
+49:autofillActive: 'ja_autofill_active',
+50:autofillDismissed: 'ja_autofill_dismissed',
+325:if (source === 'global' && (globalMeta?.score || 0) >= 0.7) return 'mid';
+329:function shouldAutofillConfidence(level) {
+330:// Always fill — user can review & correct after the fact
+357:#ja-approval-fill { background: #0a66c2; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+361:<div style="color:#94a3b8; margin-top:4px;">We’ll only fill medium‑confidence fields if you approve.</div>
+363:<button id="ja-approval-fill">Fill Now</button>
+369:banner.querySelector('#ja-approval-fill')?.addEventListener('click', () => {
+456:function scoreStringMatch(a, b) {
+508:function scoreHintMatch(mappingHints, elementHints) {
+509:if (!mappingHints || !elementHints) return { score: 0, ratio: 0 };
+528:let score = 0;
+534:const match = scoreStringMatch(m, e);
+535:if (match) score += weight * match;
+537:return { score, ratio: max ? score / max : 0 };
+625:let score = 0;
+627:if (JOB_HOST_PATTERNS.some(rx => rx.test(host))) score += 3;
+629:if (JOB_TEXT_REGEX.test(title)) score += 2;
+631:if (JOB_TEXT_REGEX.test(sample)) score += 2;
+633:if (labelHits >= 2) score += 2;
+634:if (labelHits >= 4) score += 1;
+635:if (hasResumeUploadSignal()) score += 2;
+637:if (fieldCount >= 6) score += 1;
+638:return score;
+787:// Auto match score after submitting application
+793:// Auto-run match scoring after application is tracked
+797:const scoreResp = await chrome.runtime.sendMessage({ type: 'AI_SCORE_MATCH', jobDescription: pageText });
+798:if (scoreResp?.ok && scoreResp.score) {
+799:const score = scoreResp.score;
+800:const overallScore = Number(score.overallScore) || 0;
+801:// Update the application with match data
+814:matchScore: overallScore,
+815:matchDetails: score,
+816:matchedAt: new Date().toISOString()
+819:console.log(`[FormPilot] Auto match score: ${overallScore}/100 for ${application.companyName}`);
+820:// Show a lightweight notification about the match
+822:showMatchScoreNotification(overallScore, score.recommendation);
+830:function showMatchScoreNotification(score, recommendation) {
+831:const existing = document.getElementById('ja-match-notify');
+833:const color = score >= 75 ? '#22c55e' : score >= 50 ? '#f59e0b' : '#ef4444';
+834:const label = score >= 75 ? 'Great Match!' : score >= 50 ? 'Fair Match' : 'Weak Match';
+836:notify.id = 'ja-match-notify';
+839:#ja-match-notify {
+855:#ja-match-notify .score-badge {
+862:#ja-match-notify .info { flex:1; }
+863:#ja-match-notify .title { font-weight:700; color:${color}; }
+864:#ja-match-notify .rec { color:#94a3b8; font-size:11px; margin-top:3px; }
+865:#ja-match-notify .close { color:#64748b; cursor:pointer; font-size:16px; padding:2px 6px; }
+866:#ja-match-notify .close:hover { color:#e2e8f0; }
+868:<div class="score-badge">${score}</div>
+873:<span class="close" id="ja-match-close">×</span>
+876:document.getElementById('ja-match-close')?.addEventListener('click', () => notify.remove());
+897:// Strip any array index like [0] from the key for heuristic matching
+912:const score = Math.max(0.7, scoreStringMatch(cleanKey, h.pId));
+913:return { value: currentGlobalProfile[h.pId], key: h.pId, score };
+1408:const score = scoreHintMatch(m.hints, hints);
+1409:const entry = { mapping: m, score: score.score, ratio: score.ratio };
+1410:if (!best || entry.score > best.score) {
+1413:} else if (!second || entry.score > second.score) {
+1417:if (best && best.score >= 6 && best.ratio >= 0.35 && (!second || best.score >= (second.score + 2))) {
+1418:return { key: best.mapping.mappedKey, signature, mapping: best.mapping, confidence: best.score };
+1852:function fillFields(savedFields, opts = {}) {
+1854:const stats = { detected: 0, matched: 0, filled: 0 };
+1863:// Radio buttons — enhanced with fuzzy + boolean matching
+1872:stats.matched += 1;
+1877:// Exact match
+1879:// Boolean smart match (Yes/No/True/False)
+1881:// Fuzzy partial match (e.g. "authorized" matches "yes, authorized")
+1889:stats.filled += 1;
+1893:// Build same index-aware key map as in getFormFields so positions match
+1920:stats.matched += 1;
+1927:if (!shouldAutofillConfidence(confidence)) {
+1936:let filled = false;
+1938:filled = applyValueToElement(el, fieldKey, candidate, altVal);
+1939:if (filled) break;
+1941:if (filled) {
+1942:stats.filled += 1;
+1953:stats.filled += 1;
+1991:stats.matched += 1;
+1997:if (!shouldAutofillConfidence(confidence)) {
+2009:stats.filled += 1;
+2020:stats.filled += 1;
+2028:console.warn('[FormPilot] Combobox fill error:', err?.message || err);
+2046:stats.matched += 1;
+2051:if (!shouldAutofillConfidence(confidence)) {
+2059:let matched = false;
+2065:stats.filled += 1;
+2066:matched = true;
+2069:if (!matched) {
+2074:// ── MutationObserver: fill fields added dynamically (conditional logic, "+ Add job") ──
+2081:// Debounce: wait for DOM to settle before re-filling
+2083:fillFields(savedFields, { skipObserver: true });
+2113:// Track corrections: when user changes a field we auto-filled, learn from it
+2537:let best = { el: null, score: 0 };
+2541:let score = 0;
+2543:score = Math.max(score, scoreStringMatch(text, t) * 3);
+2544:score = Math.max(score, scoreStringMatch(value, t) * 2);
+2546:if (score > best.score) best = { el: opt, score };
+2548:if (best.el && best.score >= 1.2) {
+3131:let filled = 0;
+3143:if (!isEmpty) filled += 1;
+3151:return { total, filled, missing };
+3188:<div class="ja-review-sub">Filled ${stats.filled} of ${stats.total} fields.</div>
+3326:const matched = stats.matched || 0;
+3327:const filled = stats.filled || 0;
+3329:const matchRatio = detected ? matched / detected : 1;
+3330:const fillRatio = matched ? filled / matched : 1;
+3331:if (matchRatio >= 0.85 && fillRatio >= 0.85) return;
+3357:<div><strong>Autofill Coverage</strong></div>
+3358:<div class="stats">${filled}/${matched}/${detected}</div>
+3380:function fillStandardFields(savedFields) {
+3411:let matched = false;
+3418:matched = true;
+3422:if (!matched && targetText) {
+3427:matched = true;
+3432:if (matched) {
+3446:function showAutofillBanner(savedFields) {
+3452:if (getSessionFlag('autofillDismissed')) {
+3453:console.log('[FormPilot] Autofill banner already dismissed this session, skipping.');
+3508:setSessionFlag('autofillDismissed', true);
+3509:setSessionFlag('autofillActive', true); // Enable auto-fill for this session
+3510:fillFields(savedFields);
+3514:setSessionFlag('autofillDismissed', true);
+3518:setSessionFlag('autofillDismissed', true);
+3527:setSessionFlag('autofillDismissed', true);
+3648:// Multi-step flow: on "Next/Continue", enable session autofill but don't prompt to save
+3650:setSessionFlag('autofillActive', true);
+3769:setSessionFlag('autofillActive', true);
+3770:fillFields(merged);
+3868:console.log('[FormPilot] Aggressive autofill enabled. Auto-filling now.');
+3869:setSessionFlag('autofillActive', true);
+3870:fillFields(mergedFields || {});
+3871:} else if (getSessionFlag('autofillActive')) {
+3872:console.log(`[FormPilot] Autofill session active. Auto-filling new fields...`);
+3873:fillFields(mergedFields || {});
+3876:setTimeout(() => showAutofillBanner(mergedFields || {}), 800);
+3898:if (getSessionFlag('autofillActive')) {
+3899:fillFields(mergedFields || {});
+3901:showAutofillBanner(mergedFields || {});
