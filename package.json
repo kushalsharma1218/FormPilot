@@ -4,5 +4,8 @@
   "type": "commonjs",
   "scripts": {
     "test": "node --test"
+  },
+  "dependencies": {
+    "jsdom": "^29.0.1"
   }
 }

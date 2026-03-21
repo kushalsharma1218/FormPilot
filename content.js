@@ -910,7 +910,8 @@ function getGlobalMatchMeta(fieldKey) {
   const cleanKey = fieldKey.replace(/\[\d+\]$/, '');
   
   // 1. Direct profile key match (often happens when AI mapped it)
-  if (currentGlobalProfile[cleanKey] !== undefined) {
+  // Ensure it's an actual property, not a prototype method like 'valueOf'
+  if (Object.prototype.hasOwnProperty.call(currentGlobalProfile, cleanKey) && currentGlobalProfile[cleanKey] !== undefined) {
     return { value: currentGlobalProfile[cleanKey], key: cleanKey, score: 1.0 };
   }
   
@@ -3925,10 +3926,11 @@ async function init() {
       return;
     }
 
-    const jobContextOk = isJobContextPage();
-    const allowAuto = jobContextOk && !getSiteFlag('neverPrompt');
+    // Relaxed job context restriction: allow autofill on any form like before.
+    const jobContextOk = true; // Was: isJobContextPage();
+    const allowAuto = !getSiteFlag('neverPrompt');
 
-    // Only attach recorders on job-application contexts (privacy + fewer false prompts)
+    // Only attach recorders on tracked contexts or if allowed
     if (allowAuto) {
       attachRecorder();
     }
