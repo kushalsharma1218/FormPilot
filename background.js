@@ -22,8 +22,18 @@ const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
 async function getData() {
   try {
     const key = await AuthStore.getUserKey(STORAGE_KEY);
-    const result = await chrome.storage.local.get(key);
-    const data = result[key] || {};
+    const result = await chrome.storage.local.get([key, STORAGE_KEY]);
+    let data = result[key] || {};
+    
+    // ── MIGRATION: Copy anonymous site data to logged-in user if empty ──
+    if (key !== STORAGE_KEY && Object.keys(data.sites || {}).length === 0) {
+      const anonData = result[STORAGE_KEY];
+      if (anonData && Object.keys(anonData.sites || {}).length > 0) {
+        console.log(`[Background] Migrating ${Object.keys(anonData.sites).length} sites from anonymous storage to user ${key}`);
+        data = anonData;
+        await chrome.storage.local.set({ [key]: data });
+      }
+    }
     // Ensure structure exists
     if (!data.sites) data.sites = {};
     if (!data.hostnameMappings) data.hostnameMappings = {};
@@ -51,8 +61,19 @@ async function saveData(data) {
 async function getGlobalProfile() {
   try {
     const key = await AuthStore.getUserKey(GLOBAL_STORAGE_KEY);
-    const result = await chrome.storage.local.get(key);
-    return result[key] || {};
+    const result = await chrome.storage.local.get([key, GLOBAL_STORAGE_KEY]);
+    let profile = result[key] || {};
+    
+    // ── MIGRATION: Copy anonymous profile to logged-in user if empty ──
+    if (key !== GLOBAL_STORAGE_KEY && Object.keys(profile).length === 0) {
+      const anonProfile = result[GLOBAL_STORAGE_KEY];
+      if (anonProfile && Object.keys(anonProfile).length > 0) {
+        console.log(`[Background] Migrating global profile from anonymous storage to user ${key}`);
+        profile = anonProfile;
+        await chrome.storage.local.set({ [key]: profile });
+      }
+    }
+    return profile;
   } catch (err) {
     console.error('[Background] getGlobalProfile error:', err);
     return {};

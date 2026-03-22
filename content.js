@@ -42,6 +42,7 @@ let lastSubmitIntent = null;
 let approvalQueue = [];
 const LEARNING_SESSION_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const ACCURACY_MODE = false;
+const DEBUG_AUTOFILL = true; // ← set false to silence debug logs
 // Low/mid confidence fields are filled immediately; user can correct them after
 const APPROVAL_REQUIRED_LEVEL = 'none';
 const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
@@ -391,18 +392,27 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   if (!shouldFillValue(el, fieldKey, primaryVal)) return false;
   const tag = el.tagName?.toUpperCase();
   const type = (el.type || '').toLowerCase();
+
+  // ── Checkbox ────────────────────────────────────────────────────
   if (type === 'checkbox') {
-    el.checked = primaryVal === 'true' || primaryVal === true;
-    triggerEvents(el);
+    // Prefer clicking the element (works for both native + Radix)
+    const wantChecked = primaryVal === 'true' || primaryVal === true || primaryVal === '1';
+    if (el.checked !== wantChecked) el.click();
     return true;
   }
+
+  // ── Multi-select ────────────────────────────────────────────────
   if (tag === 'SELECT' && el.multiple) {
     const vals = String(primaryVal).split(',');
     Array.from(el.options).forEach(opt => { opt.selected = vals.includes(opt.value) || vals.includes(opt.text.trim()); });
     triggerEvents(el);
     return true;
   }
+
+  // ── Native select ───────────────────────────────────────────────
   if (tag === 'SELECT') {
+    // Skip Radix UI / framework fake selects that are aria-hidden
+    if (el.getAttribute('aria-hidden') === 'true') return false;
     const targetText = String(primaryVal).toLowerCase().trim();
     const targetValue = String(altVal || primaryVal).toLowerCase().trim();
     for (let i = 0; i < el.options.length; i++) {
@@ -417,12 +427,13 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
     }
     return false;
   }
+
+  // ── Contenteditable ─────────────────────────────────────────────
   if (setEditableValue(el, primaryVal)) return true;
-  const currentVal = el.value?.trim?.() || '';
-  if (currentVal) return true;
-  setNativeValue(el, primaryVal);
-  triggerEvents(el);
-  el.dispatchEvent(new Event('blur', { bubbles: true }));
+
+  // ── Text / email / tel / textarea ───────────────────────────────
+  // Use the universal fill (execCommand → native setter fallback)
+  universalFillText(el, primaryVal);
   return true;
 }
 
@@ -785,97 +796,8 @@ async function maybeAutoTrackApplication(stage) {
     const resp = await chrome.runtime.sendMessage({ type: 'APP_ADD', application });
     if (resp?.ok) {
       setSessionFlag('appAdded', true);
-      // Auto match score after submitting application
-      maybeAutoScoreMatch(pageText, application);
     }
   } catch (_) { }
-}
-
-// Auto-run match scoring after application is tracked
-async function maybeAutoScoreMatch(pageText, application) {
-  if (!pageText || pageText.length < 100) return;
-  try {
-    const scoreResp = await chrome.runtime.sendMessage({ type: 'AI_SCORE_MATCH', jobDescription: pageText });
-    if (scoreResp?.ok && scoreResp.score) {
-      const score = scoreResp.score;
-      const overallScore = Number(score.overallScore) || 0;
-      // Update the application with match data
-      if (application?.companyName) {
-        const appsResp = await chrome.runtime.sendMessage({ type: 'APP_GET_ALL' });
-        const apps = appsResp?.apps || [];
-        const trackedApp = apps.find(a =>
-          a.companyName === application.companyName &&
-          a.jobTitle === application.jobTitle
-        );
-        if (trackedApp?.id) {
-          await chrome.runtime.sendMessage({
-            type: 'APP_UPDATE',
-            id: trackedApp.id,
-            updates: {
-              matchScore: overallScore,
-              matchDetails: score,
-              matchedAt: new Date().toISOString()
-            }
-          });
-          console.log(`[FormPilot] Auto match score: ${overallScore}/100 for ${application.companyName}`);
-          // Show a lightweight notification about the match
-          if (overallScore > 0) {
-            showMatchScoreNotification(overallScore, score.recommendation);
-          }
-        }
-      }
-    }
-  } catch (_) { }
-}
-
-function showMatchScoreNotification(score, recommendation) {
-  const existing = document.getElementById('ja-match-notify');
-  if (existing) existing.remove();
-  const color = score >= 75 ? '#22c55e' : score >= 50 ? '#f59e0b' : '#ef4444';
-  const label = score >= 75 ? 'Great Match!' : score >= 50 ? 'Fair Match' : 'Weak Match';
-  const notify = document.createElement('div');
-  notify.id = 'ja-match-notify';
-  notify.innerHTML = `
-    <style>
-      #ja-match-notify {
-        position: fixed; bottom: 24px; right: 18px; z-index: 2147483647;
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        border: 1px solid ${color}55;
-        border-radius: 14px; padding: 14px 18px;
-        display: flex; align-items: center; gap: 12px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.55);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
-        color: #e2e8f0; font-size: 13px;
-        animation: ja-slide-up 0.35s cubic-bezier(0.34,1.56,0.64,1);
-        max-width: 320px;
-      }
-      @keyframes ja-slide-up {
-        from { opacity:0; transform: translateY(20px); }
-        to   { opacity:1; transform: translateY(0); }
-      }
-      #ja-match-notify .score-badge {
-        width: 48px; height: 48px; border-radius: 50%;
-        display: flex; align-items: center; justify-content: center;
-        font-weight: 800; font-size: 15px;
-        background: ${color}22; color: ${color};
-        border: 2px solid ${color}55; flex-shrink:0;
-      }
-      #ja-match-notify .info { flex:1; }
-      #ja-match-notify .title { font-weight:700; color:${color}; }
-      #ja-match-notify .rec { color:#94a3b8; font-size:11px; margin-top:3px; }
-      #ja-match-notify .close { color:#64748b; cursor:pointer; font-size:16px; padding:2px 6px; }
-      #ja-match-notify .close:hover { color:#e2e8f0; }
-    </style>
-    <div class="score-badge">${score}</div>
-    <div class="info">
-      <div class="title">🤖 AI Match: ${label}</div>
-      <div class="rec">${recommendation || 'Application tracked!'}</div>
-    </div>
-    <span class="close" id="ja-match-close">×</span>
-  `;
-  document.body.appendChild(notify);
-  document.getElementById('ja-match-close')?.addEventListener('click', () => notify.remove());
-  setTimeout(() => notify.remove(), 8000);
 }
 
 const GLOBAL_HEURISTICS = [
@@ -1423,7 +1345,7 @@ function resolveMappedKey(el) {
       second = entry;
     }
   }
-  if (best && best.score >= 6 && best.ratio >= 0.35 && (!second || best.score >= (second.score + 2))) {
+  if (best && best.score >= 2 && best.ratio >= 0.15 && (!second || best.score >= (second.score + 1))) {
     return { key: best.mapping.mappedKey, signature, mapping: best.mapping, confidence: best.score };
   }
   return { key: null, signature, mapping: null };
@@ -1834,8 +1756,86 @@ function getFormFields() {
 }
 
 function triggerEvents(el) {
+  // React needs InputEvent (not plain Event) to fire synthetic onChange
   el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.value }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new Event('keyup', { bubbles: true }));
+}
+
+// Universal text fill: works with React, Vue, Angular, native HTML
+// Uses execCommand('insertText') which goes through the browser's real
+// text-input pipeline that all frameworks hook into.
+function universalFillText(el, value) {
+  try {
+    el.focus();
+    // Select all so we replace existing content, but avoid throwing on email/number types
+    const noSelectTypes = ['email', 'number', 'tel', 'date', 'month', 'week', 'time', 'datetime-local'];
+    const type = (el.type || '').toLowerCase();
+    
+    if (noSelectTypes.includes(type)) {
+      // Direct replace for types that don't support selection
+      // We still use execCommand if possible to fire proper events
+      el.value = '';
+    } else {
+      if (typeof el.select === 'function') el.select();
+      else el.setSelectionRange?.(0, el.value?.length || 0);
+    }
+    
+    // execCommand fires the correct browser events that React/Vue listen to
+    const ok = document.execCommand('insertText', false, String(value));
+    if (ok && el.value === String(value)) return true;
+  } catch (_) { }
+  // Fallback: native setter + InputEvent
+  const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  if (setter) setter.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(value), inputType: 'insertText' }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new Event('blur', { bubbles: true }));
+  return true;
+}
+
+// Click-based Radix UI (and similar) combobox filler.
+// Works on: Bolt (Greenhouse v3), Ashby, some Lever forms.
+// Strategy: click the trigger to open the listbox, then click matching option.
+async function fillRadixCombobox(triggerBtn, desiredValue) {
+  const desired = String(desiredValue).toLowerCase().trim();
+  triggerBtn.click();
+  // Wait up to 600ms for the listbox/popup to appear
+  for (let i = 0; i < 12; i++) {
+    await new Promise(r => setTimeout(r, 50));
+    // Radix portals render into document.body; look for any visible listbox/option
+    const options = document.querySelectorAll(
+      '[role="option"]:not([aria-hidden="true"]), [role="listbox"] [data-value], .rt-SelectItem, [data-radix-select-item]'
+    );
+    if (!options.length) continue;
+    let picked = null;
+    // Exact match first
+    for (const opt of options) {
+      const text = (opt.textContent || '').toLowerCase().trim();
+      const val  = (opt.dataset.value || opt.getAttribute('value') || '').toLowerCase().trim();
+      if (text === desired || val === desired) { picked = opt; break; }
+    }
+    // Partial match fallback
+    if (!picked) {
+      for (const opt of options) {
+        const text = (opt.textContent || '').toLowerCase().trim();
+        if (text.includes(desired) || desired.includes(text)) { picked = opt; break; }
+      }
+    }
+    if (picked) {
+      picked.click();
+      // Also dispatch pointer events some frameworks need
+      picked.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      picked.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      return true;
+    }
+    // If options appeared but no match, close and bail
+    if (i > 4) { document.body.click(); return false; }
+  }
+  return false;
 }
 
 function setNativeValue(el, val) {
@@ -1860,6 +1860,15 @@ function setEditableValue(el, val) {
 
 function fillFields(savedFields, opts = {}) {
   const skipObserver = !!opts.skipObserver;
+  if (DEBUG_AUTOFILL && !skipObserver) {
+    console.group('[FormPilot DEBUG] fillFields() called');
+    console.log('  savedFields keys:', Object.keys(savedFields || {}));
+    console.log('  savedFields values:', { ...savedFields });
+    console.log('  globalProfile keys:', Object.keys(currentGlobalProfile || {}));
+    console.log('  globalProfile values:', { ...currentGlobalProfile });
+    console.log('  currentSiteMappings:', currentSiteMappings);
+    console.groupEnd();
+  }
   const stats = { detected: 0, matched: 0, filled: 0 };
   const unresolvedDropdowns = [];
   if (!skipObserver) {
@@ -1925,13 +1934,27 @@ function fillFields(savedFields, opts = {}) {
       val = globalMeta?.value;
       source = 'global';
     }
+
+    if (DEBUG_AUTOFILL) {
+      const tag = el.tagName + (el.type ? `[${el.type}]` : '');
+      console.log(
+        `[FP DEBUG] field="${fieldKey}" tag=${tag} src=${source} val=${val === undefined ? 'MISS' : JSON.stringify(String(val).slice(0,60))}`
+      );
+    }
+
     if (val === undefined || val === null) return;
     stats.matched += 1;
     const decoded = decodeSelectValue(val);
     const primaryVal = decoded.text || val;
     const altVal = decoded.value || primaryVal;
     const confidence = classifyConfidence({ mapped, source, globalMeta });
-    if (!shouldFillValue(el, fieldKey, primaryVal)) return;
+    const canFill = shouldFillValue(el, fieldKey, primaryVal);
+
+    if (DEBUG_AUTOFILL) {
+      console.log(`  → confidence=${confidence} canFill=${canFill} primaryVal=${JSON.stringify(String(primaryVal).slice(0,60))}`);
+    }
+
+    if (!canFill) return;
 
     if (!shouldAutofillConfidence(confidence)) {
       if (confidence === 'mid') {
@@ -1946,6 +1969,9 @@ function fillFields(savedFields, opts = {}) {
     for (const candidate of valueCandidates) {
       filled = applyValueToElement(el, fieldKey, candidate, altVal);
       if (filled) break;
+    }
+    if (DEBUG_AUTOFILL) {
+      console.log(`  → filled=${filled}`);
     }
     if (filled) {
       stats.filled += 1;
@@ -1970,11 +1996,14 @@ function fillFields(savedFields, opts = {}) {
     }
   });
 
-  // ── Custom ARIA comboboxes (index-aware) ───────────────────────
+  // ── Custom ARIA comboboxes — click-based universal approach ───────
+  // Works for Radix UI (Bolt/Greenhouse v3), Headless UI, Reach UI, etc.
+  // These frameworks use <button role="combobox"> triggers and render option
+  // lists into document.body portals — so we must CLICK to open then CLICK option.
   try {
     const comboboxEls = [];
     collectElements('[role="combobox"], [aria-haspopup="listbox"]').forEach(el => {
-      if (el.tagName === 'INPUT') return;
+      if (el.tagName === 'INPUT') return; // input comboboxes handled in main loop
       const mapped = resolveMappedKey(el);
       const key = mapped.key || getFieldKey(el);
       if (!key) return;
@@ -1983,56 +2012,64 @@ function fillFields(savedFields, opts = {}) {
     const comboKeyCounts = {};
     comboboxEls.forEach(({ key }) => { comboKeyCounts[key] = (comboKeyCounts[key] || 0) + 1; });
     const comboKeyIndex = {};
-    comboboxEls.forEach(({ el, key }) => {
-      stats.detected += 1;
-      const isDuplicate = comboKeyCounts[key] > 1;
-      comboKeyIndex[key] = (comboKeyIndex[key] || 0);
-      const fieldKey = isDuplicate ? `${key}[${comboKeyIndex[key]++}]` : key;
-      let val = savedFields[fieldKey];
-      let source = 'site';
-      let globalMeta = null;
-      if (val === undefined) {
-        globalMeta = getGlobalMatchMeta(fieldKey);
-        val = globalMeta?.value;
-        source = 'global';
-      }
-      if (val === undefined || val === null) return;
-      stats.matched += 1;
-      const decoded = decodeSelectValue(val);
-      const primaryVal = decoded.text || val;
-      const altVal = decoded.value || primaryVal;
-      const confidence = classifyConfidence({ mapped: resolveMappedKey(el), source, globalMeta });
-      if (!shouldFillValue(el, fieldKey, primaryVal)) return;
-      if (!shouldAutofillConfidence(confidence)) {
-        if (confidence === 'mid') {
-          queueApproval({ el, fieldKey, val: primaryVal, altVal });
-        }
-        return;
-      }
 
-      const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
-      if (inputChild) {
-        setNativeValue(inputChild, primaryVal);
-        triggerEvents(inputChild);
-        if (inputChild.value || !primaryVal) {
-          stats.filled += 1;
-          return;
+    // Process sequentially with small delay so portals don't stack
+    (async () => {
+      for (const { el, key } of comboboxEls) {
+        stats.detected += 1;
+        const isDuplicate = comboKeyCounts[key] > 1;
+        comboKeyIndex[key] = (comboKeyIndex[key] || 0);
+        const fieldKey = isDuplicate ? `${key}[${comboKeyIndex[key]++}]` : key;
+        let val = savedFields[fieldKey];
+        let source = 'site';
+        let globalMeta = null;
+        if (val === undefined) {
+          globalMeta = getGlobalMatchMeta(fieldKey);
+          val = globalMeta?.value;
+          source = 'global';
         }
-      }
-      el.click();
-      setTimeout(() => {
-        const root = getRootNodeFor(el);
-        const optionSets = [root, document].filter((r, idx, arr) => r && arr.indexOf(r) === idx);
-        for (const r of optionSets) {
-          const picked = selectBestOption([primaryVal, altVal], r);
-          if (picked) {
-            stats.filled += 1;
-            return;
+        if (val === undefined || val === null) continue;
+        stats.matched += 1;
+        const decoded = decodeSelectValue(val);
+        const primaryVal = decoded.text || val;
+        const altVal = decoded.value || primaryVal;
+        const confidence = classifyConfidence({ mapped: resolveMappedKey(el), source, globalMeta });
+        if (!shouldFillValue(el, fieldKey, primaryVal)) continue;
+        if (!shouldAutofillConfidence(confidence)) {
+          if (confidence === 'mid') queueApproval({ el, fieldKey, val: primaryVal, altVal });
+          continue;
+        }
+
+        if (DEBUG_AUTOFILL) {
+          console.log(`[FP DEBUG] combobox="${fieldKey}" trying to fill="${primaryVal}"`);
+        }
+
+        // First try: if it has an input child, fill that (search-style comboboxes)
+        const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
+        if (inputChild) {
+          universalFillText(inputChild, primaryVal);
+          await new Promise(r => setTimeout(r, 80));
+          const root = getRootNodeFor(el);
+          const optionSets = [root, document].filter((r, idx, arr) => r && arr.indexOf(r) === idx);
+          let found = false;
+          for (const r of optionSets) {
+            if (selectBestOption([primaryVal, altVal], r)) { stats.filled += 1; found = true; break; }
           }
+          if (found) continue;
         }
-        unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'combobox' });
-      }, 150);
-    });
+
+        // Second try: click-based (Radix UI / portal-based dropdowns)
+        const filled = await fillRadixCombobox(el, primaryVal);
+        if (filled) {
+          stats.filled += 1;
+        } else {
+          unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'combobox' });
+        }
+
+        // Small pause between dropdowns so portals don't interfere
+        await new Promise(r => setTimeout(r, 120));
+      }
+    })();
   } catch (err) {
     console.warn('[FormPilot] Combobox fill error:', err?.message || err);
   }
@@ -3774,11 +3811,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         siteFlags = site.flags || {};
         currentSiteActive = !(site?.disabled || site?.enabled === false);
         const merged = { ...(site.fields || {}), ...(sessionResp?.fields || {}) };
+
+        console.group('[FormPilot DEBUG] MANUAL_AUTOFILL triggered');
+        console.log('  hostname:', hostname);
+        console.log('  site.enabled:', site.enabled, '| site.disabled:', site.disabled);
+        console.log('  site.fields count:', Object.keys(site.fields || {}).length, Object.keys(site.fields || {}));
+        console.log('  session.fields count:', Object.keys(sessionResp?.fields || {}).length, Object.keys(sessionResp?.fields || {}));
+        console.log('  globalProfile count:', Object.keys(currentGlobalProfile || {}).length, Object.keys(currentGlobalProfile || {}));
+        console.log('  merged fields count:', Object.keys(merged).length);
+        console.log('  mappings count:', currentSiteMappings.length);
+        console.groupEnd();
+
         if (Object.keys(merged).length > 0 || Object.keys(currentGlobalProfile || {}).length > 0) {
           setSessionFlag('autofillActive', true);
           fillFields(merged);
           sendResponse({ ok: true });
         } else {
+          console.warn('[FormPilot DEBUG] No merged fields and no globalProfile — nothing to fill!');
           sendResponse({ ok: false });
         }
       })
@@ -3941,6 +3990,23 @@ async function init() {
 
     const savedCount = Object.keys(mergedFields || {}).length;
     const globalCount = Object.keys(currentGlobalProfile || {}).length;
+
+    // ── DIAGNOSTIC LOG (remove when working) ─────────────────────
+    console.group('[FormPilot] INIT SUMMARY');
+    console.log('  hostname (storage key):', hostname);
+    console.log('  site.enabled:', site?.enabled, '| site.disabled:', site?.disabled);
+    console.log('  site.fields count:', Object.keys(site?.fields || {}).length, Object.keys(site?.fields || {}));
+    console.log('  session.fields count:', Object.keys(sessionFields).length, Object.keys(sessionFields));
+    console.log('  globalProfile count:', globalCount, Object.keys(currentGlobalProfile));
+    console.log('  merged fields:', savedCount, Object.keys(mergedFields));
+    console.log('  allowAuto:', allowAuto, '| currentSiteActive:', currentSiteActive);
+    if (savedCount === 0 && globalCount === 0) {
+      console.warn('  ⚠️ NO DATA to autofill! Fill the form manually first, then click SAVE in the popup.');
+      console.warn('  ⚠️ OR upload your resume in Dashboard to populate global profile.');
+    }
+    console.groupEnd();
+    // ─────────────────────────────────────────────────────────────
+
     if (allowAuto && (savedCount > 0 || globalCount > 0)) {
       if (!ACCURACY_MODE) {
         console.log('[FormPilot] Aggressive autofill enabled. Auto-filling now.');
@@ -3953,6 +4019,8 @@ async function init() {
         // Small delay to let the page fully render
         setTimeout(() => showAutofillBanner(mergedFields || {}), 800);
       }
+    } else if (allowAuto && savedCount === 0 && globalCount === 0) {
+      console.warn('[FormPilot] Autofill skipped — no saved fields and no global profile data.');
     }
 
     if (allowAuto) {
