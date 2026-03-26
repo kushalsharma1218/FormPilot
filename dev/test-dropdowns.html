@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Application – Dropdown Test</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; background: #f7f7fb; }
+      .card { background: #fff; padding: 20px; border-radius: 10px; max-width: 900px; margin: 0 auto 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+      label { display: block; font-weight: 600; margin: 12px 0 6px; }
+      select, input { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #ccc; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+      .combo { position: relative; }
+      .combo button { width: 100%; text-align: left; background: #fff; border: 1px solid #ccc; padding: 8px 10px; border-radius: 6px; }
+      .combo-list { display: none; position: absolute; top: 40px; left: 0; right: 0; background: #fff; border: 1px solid #ccc; border-radius: 6px; max-height: 160px; overflow: auto; z-index: 2; }
+      .combo-list[aria-hidden="false"] { display: block; }
+      .combo-list [role="option"] { padding: 8px 10px; cursor: pointer; }
+      .combo-list [role="option"]:hover { background: #f0f0ff; }
+      .listbox { border: 1px solid #ccc; border-radius: 6px; padding: 6px; max-width: 360px; }
+      .listbox [role="option"] { padding: 6px 8px; cursor: pointer; }
+      .listbox [role="option"][aria-selected="true"] { background: #e0e7ff; }
+    </style>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "QA Engineer",
+        "hiringOrganization": { "@type": "Organization", "name": "Example Corp" },
+        "jobLocationType": "TELECOMMUTE",
+        "description": "Apply now."
+      }
+    </script>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Job Application – Dropdowns</h1>
+      <div class="row">
+        <div>
+          <label for="country">Country</label>
+          <select id="country">
+            <option value="">Select…</option>
+            <option value="us">United States</option>
+            <option value="ca">Canada</option>
+            <option value="mx">Mexico</option>
+          </select>
+        </div>
+        <div>
+          <label for="workMode">Work Mode</label>
+          <select id="workMode">
+            <option value="">Choose…</option>
+            <option value="remote">Remote</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="onsite">On Site</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="skills">Skills (Multi-select)</label>
+      <select id="skills" multiple size="4">
+        <option value="js">JavaScript</option>
+        <option value="ts">TypeScript</option>
+        <option value="react">React</option>
+        <option value="node">Node.js</option>
+      </select>
+
+      <h2>ARIA Combobox</h2>
+      <div class="combo" id="roleCombo">
+        <label id="prefRoleLabel">Preferred Role</label>
+        <button type="button" role="combobox" aria-haspopup="listbox" aria-expanded="false" id="roleBtn" aria-labelledby="prefRoleLabel">Select…</button>
+        <div class="combo-list" id="roleList" role="listbox" aria-hidden="true" aria-labelledby="prefRoleLabel">
+          <div role="option" data-value="frontend">Frontend Engineer</div>
+          <div role="option" data-value="backend">Backend Engineer</div>
+          <div role="option" data-value="fullstack">Full Stack Engineer</div>
+          <div role="option" data-value="ml">ML Engineer</div>
+        </div>
+      </div>
+
+      <h2>ARIA Listbox</h2>
+      <div class="listbox" role="listbox" id="levelList">
+        <div role="option" data-value="junior">Junior</div>
+        <div role="option" data-value="mid">Mid</div>
+        <div role="option" data-value="senior">Senior</div>
+        <div role="option" data-value="lead">Lead</div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const btn = document.getElementById('roleBtn');
+        const list = document.getElementById('roleList');
+        btn.addEventListener('click', () => {
+          const expanded = btn.getAttribute('aria-expanded') === 'true';
+          btn.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+          list.setAttribute('aria-hidden', expanded ? 'true' : 'false');
+        });
+        list.addEventListener('click', (e) => {
+          const opt = e.target.closest('[role="option"]');
+          if (!opt) return;
+          btn.textContent = opt.textContent.trim();
+          btn.setAttribute('data-value', opt.getAttribute('data-value'));
+          btn.setAttribute('aria-expanded', 'false');
+          list.setAttribute('aria-hidden', 'true');
+        });
+        const lb = document.getElementById('levelList');
+        lb.addEventListener('click', (e) => {
+          const opt = e.target.closest('[role="option"]');
+          if (!opt) return;
+          lb.querySelectorAll('[role="option"]').forEach(o => o.setAttribute('aria-selected', 'false'));
+          opt.setAttribute('aria-selected', 'true');
+        });
+      })();
+    </script>
+  </body>
+</html>

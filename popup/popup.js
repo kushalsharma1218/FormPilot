@@ -194,11 +194,7 @@ async function init() {
         return;
       }
       if (!authStatus.configured) {
-        document.getElementById('auth-error-msg').innerHTML = 'Firebase config missing. Please read the <a href="#" id="auth-link-setup-error" style="color:var(--blue-400)">setup guide</a>.';
-        document.getElementById('auth-link-setup-error').addEventListener('click', (e) => {
-          e.preventDefault();
-          chrome.tabs.create({ url: chrome.runtime.getURL('SETUP_GUIDE.md') });
-        });
+        document.getElementById('auth-error-msg').textContent = 'Cloud sync is not configured for this build.';
       }
       initInFlight = false;
       return; // Stop here, don't load main UI
@@ -248,6 +244,10 @@ document.getElementById('enable-toggle').addEventListener('change', async (e) =>
       enabled: siteData.enabled,
       clearDisabled: siteData.enabled
     });
+    const tab = await getActiveTab();
+    if (tab?.id) {
+      await sendToTab(tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: siteData.enabled });
+    }
     updateStatusUI();
     showToast(siteData.enabled ? '✓ Enabled for ' + currentHostname : '✗ Disabled for ' + currentHostname);
   } catch (err) {

@@ -7,7 +7,7 @@ const manifestPath = path.join(root, 'manifest.json');
 const keyPath = path.join(root, 'manifest.key');
 
 if (!fs.existsSync(keyPath)) {
-  console.error('Missing manifest.key. Create it first (see SETUP_GUIDE.md).');
+  console.error('Missing manifest.key. Create it first before running this script.');
   process.exit(1);
 }
 

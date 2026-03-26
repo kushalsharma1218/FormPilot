@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Autofill – Test Index</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; background: #f7f7fb; }
+      .card { background: #fff; padding: 20px; border-radius: 10px; max-width: 900px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+      h1 { margin-top: 0; }
+      ul { padding-left: 18px; }
+      li { margin: 6px 0; }
+      code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Job Autofill – Test Pages</h1>
+      <p>Open each file and validate behavior. These are local files, so ensure the extension has <strong>Allow access to file URLs</strong> enabled.</p>
+      <ul>
+        <li><a href="./test-job-form.html">Basic Job Form</a> – standard inputs + resume + select + custom combobox</li>
+        <li><a href="./test-job-form-dynamic.html">Dynamic Job Form</a> – fields added after delay (mutation observer)</li>
+        <li><a href="./test-job-form-advanced.html">Advanced Job Form</a> – multi-step + custom combobox + contenteditable</li>
+        <li><a href="./test-job-form-aria.html">ARIA Job Form</a> – listbox/combobox + aria-labelledby + multi-select</li>
+        <li><a href="./test-ats-workday.html">Workday-like Form</a> – data-automation-id patterns</li>
+        <li><a href="./test-ats-greenhouse.html">Greenhouse-like Form</a> – greenhouse-ish labels & structure</li>
+        <li><a href="./test-dropdowns.html">Dropdowns & Listboxes</a> – native select, multiselect, ARIA listbox/combobox</li>
+        <li><a href="./test-contact-form.html">Contact Form (Non-job)</a> – should NOT trigger autofill</li>
+        <li><a href="./test-checkout-form.html">Checkout Form (Non-job)</a> – should NOT trigger autofill</li>
+        <li><a href="./test-login-form.html">Login Form</a> – should NOT trigger autofill</li>
+        <li><a href="./test-otp-form.html">OTP Form</a> – should NOT trigger autofill</li>
+      </ul>
+      <p>Debug overlay: add <code>?ja_debug=1</code> to any URL to see reasons.</p>
+    </div>
+  </body>
+</html>

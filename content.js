@@ -40,6 +40,9 @@ let pendingDropdownResolve = null;
 let dropdownResolverOpen = false;
 let lastSubmitIntent = null;
 let approvalQueue = [];
+let jobContextState = { status: 'unknown', signature: '', jobScore: 0, formScore: 0, loginScore: 0, ts: 0 };
+let debugInfo = {};
+let debugOverlayEnabled = false;
 const LEARNING_SESSION_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const ACCURACY_MODE = false;
 const DEBUG_AUTOFILL = true; // ← set false to silence debug logs
@@ -47,6 +50,7 @@ const DEBUG_AUTOFILL = true; // ← set false to silence debug logs
 const APPROVAL_REQUIRED_LEVEL = 'none';
 const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
 const SELECT_VALUE_PREFIX = '__JA_SELECT__';
+const MAX_OPTION_SNAPSHOT = 40;
 const SESSION_FLAG_KEYS = {
   autofillActive: 'ja_autofill_active',
   autofillDismissed: 'ja_autofill_dismissed',
@@ -79,8 +83,226 @@ const JOB_HOST_PATTERNS = [
   /adp\.com$/i,
 ];
 
-const JOB_TEXT_REGEX = /job application|apply now|apply for|candidate|applicant|resume|cv|cover letter|work authorization|sponsorship|position|role|career|employment|work experience|education|degree|compensation|salary|relocation|availability|notice period|preferred start|github|portfolio|workday|greenhouse|lever|icims|smartrecruiters|jobvite|taleo|successfactors|ashby|workable|recruitee|teamtailor|bamboohr/i;
-const LOGIN_TEXT_REGEX = /sign in|log in|login|password|forgot password|two-factor|2fa|verification code/i;
+const JOB_TEXT_REGEX = /job application|application form|apply now|apply for|submit application|candidate|applicant|resume|cv|cover letter|work authorization|sponsorship|position|role|career|employment|work experience|education|degree|compensation|salary|relocation|availability|notice period|preferred start|github|portfolio|workday|greenhouse|lever|icims|smartrecruiters|jobvite|taleo|successfactors|ashby|workable|recruitee|teamtailor|bamboohr|hiring|recruit/i;
+const JOB_FIELD_REGEX = /first name|last name|full name|email|phone|mobile|resume|cv|cover letter|linkedin|github|portfolio|work authorization|sponsor|sponsorship|visa|citizen|citizenship|pronoun|veteran|disability|gender|ethnicity|race|equal opportunity|eeo|self[-\s]?identify|education|degree|gpa|school|university|employer|employment history|work history|salary|compensation|start date|notice period|availability|relocation|reference|referral/i;
+const JOB_STRONG_FIELD_REGEX = /resume|cv|cover letter|linkedin|github|portfolio|work authorization|sponsor|sponsorship|visa|citizen|citizenship|veteran|disability|gender|ethnicity|race|equal opportunity|eeo|self[-\s]?identify|education|degree|gpa|school|university|employer|employment history|work history|salary|compensation|notice period|relocation|reference|referral/i;
+const JOB_HEADING_REGEX = /job application|application questions|apply now|submit application|candidate profile|employment application|equal opportunity|workday|greenhouse|lever|icims|smartrecruiters|jobvite|taleo|successfactors|ashby|workable|recruitee|teamtailor|bamboohr/i;
+const NON_JOB_TEXT_REGEX = /contact us|help center|support|newsletter|subscribe|checkout|billing|shipping|order|payment|card number|cvv|cvc|donation|appointment|reservation|rsvp|survey|feedback|get a quote|request a quote|lead form/i;
+const LOGIN_TEXT_REGEX = /sign in|log in|login|password|forgot password|reset password|two-factor|2fa|mfa|verification code|one[-\s]?time|otp|create account|sign up|signup|register|single sign[-\s]?on|sso|continue with/i;
+const LOGIN_URL_REGEX = /login|signin|sign-in|signup|sign-up|register|account|password|verify|otp|sso|session/i;
+const JOB_URL_REGEX = /apply|application|job|jobs|career|careers|candidate|applicant|applynow|submit|resume|cv|cover-letter|recruit/i;
+
+function isTopFrame() {
+  try {
+    return window.top === window.self;
+  } catch (_) {
+    return true;
+  }
+}
+
+function shouldShowUi() {
+  if (isSiteDisabled()) return false;
+  if (!isTopFrame()) return false;
+  if (!isJobContextPage()) return false;
+  return true;
+}
+
+function isDebugOverlayEnabled() {
+  if (debugOverlayEnabled) return true;
+  try {
+    if (sessionStorage.getItem('ja_debug_overlay') === 'true') {
+      debugOverlayEnabled = true;
+      return true;
+    }
+  } catch (_) { }
+  if (/[?&]ja_debug=1\b/i.test(location.search)) {
+    debugOverlayEnabled = true;
+    try { sessionStorage.setItem('ja_debug_overlay', 'true'); } catch (_) { }
+    return true;
+  }
+  if (/[?&]ja_debug=0\b/i.test(location.search)) {
+    debugOverlayEnabled = false;
+    try { sessionStorage.removeItem('ja_debug_overlay'); } catch (_) { }
+  }
+  return debugOverlayEnabled;
+}
+
+function updateDebugInfo(patch) {
+  debugInfo = { ...debugInfo, ...(patch || {}) };
+  if (isDebugOverlayEnabled()) renderDebugOverlay();
+}
+
+function renderDebugOverlay() {
+  if (!isDebugOverlayEnabled()) return;
+  let panel = document.getElementById('ja-debug-overlay');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'ja-debug-overlay';
+    panel.style.cssText = `
+      position: fixed; bottom: 18px; left: 18px; z-index: 2147483646;
+      background: #0b1220; color: #e2e8f0; border: 1px solid rgba(148,163,184,0.35);
+      border-radius: 12px; padding: 10px 12px; max-width: 360px;
+      font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; font-size: 11px;
+      box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+    `;
+    document.body.appendChild(panel);
+  }
+  const status = debugInfo?.jobContext?.status || jobContextState?.status || 'unknown';
+  const score = debugInfo?.jobContext?.jobScore ?? jobContextState?.jobScore ?? 0;
+  const fscore = debugInfo?.jobContext?.formScore ?? jobContextState?.formScore ?? 0;
+  const lscore = debugInfo?.jobContext?.loginScore ?? jobContextState?.loginScore ?? 0;
+  const sig = debugInfo?.jobContext?.signature || jobContextState?.signature || '';
+  const siteState = debugInfo?.site || {};
+  const counts = debugInfo?.counts || {};
+  const stats = debugInfo?.stats || {};
+
+  panel.innerHTML = `
+    <div style="font-weight:600; margin-bottom:6px;">Job Autofill Debug</div>
+    <div>Context: <strong>${escapeHtml(status)}</strong> · jobScore ${escapeHtml(String(score))} · formScore ${escapeHtml(String(fscore))} · loginScore ${escapeHtml(String(lscore))}</div>
+    <div>Signature: ${escapeHtml(sig || 'n/a')}</div>
+    <div>Site: ${escapeHtml(siteState.hostname || location.hostname || '')}</div>
+    <div>Active: ${siteState.active ? 'yes' : 'no'} · neverPrompt: ${siteState.neverPrompt ? 'yes' : 'no'}</div>
+    <div>JobContextOk: ${siteState.jobContextOk ? 'yes' : 'no'} · allowAuto: ${siteState.allowAuto ? 'yes' : 'no'}</div>
+    <div>Site fields: ${escapeHtml(String(counts.siteFields || 0))} · Session fields: ${escapeHtml(String(counts.sessionFields || 0))} · Global: ${escapeHtml(String(counts.global || 0))}</div>
+    <div>Fill stats: detected ${escapeHtml(String(stats.detected || 0))}, matched ${escapeHtml(String(stats.matched || 0))}, filled ${escapeHtml(String(stats.filled || 0))}, unresolvedDD ${escapeHtml(String(stats.unresolvedDropdowns || 0))}</div>
+    <div style="margin-top:6px;">
+      <button id="ja-debug-hide" style="background: rgba(255,255,255,0.08); color:#cbd5f5; border:none; border-radius:6px; padding:4px 8px; cursor:pointer; font-size:11px;">Hide</button>
+    </div>
+  `;
+  panel.querySelector('#ja-debug-hide')?.addEventListener('click', () => {
+    debugOverlayEnabled = false;
+    try { sessionStorage.removeItem('ja_debug_overlay'); } catch (_) { }
+    panel.remove();
+  });
+}
+
+function shouldShowJobContextPrompt() {
+  if (isSiteDisabled()) return false;
+  if (!isTopFrame()) return false;
+  if (!jobContextState || jobContextState.status !== 'unknown') return false;
+  const sig = jobContextState.signature;
+  if (!sig) return false;
+  const pref = getFormPreference(sig);
+  if (pref) return false;
+  const key = `ja_prompted_${sig}`;
+  try {
+    if (sessionStorage.getItem(key)) return false;
+  } catch (_) { }
+  return true;
+}
+
+function setFormPreference(signature, approved) {
+  if (!signature) return;
+  const approvedForms = { ...(siteFlags?.approvedForms || {}) };
+  const ignoredForms = { ...(siteFlags?.ignoredForms || {}) };
+  if (approved) {
+    approvedForms[signature] = { ts: Date.now(), path: location.pathname };
+    delete ignoredForms[signature];
+  } else {
+    ignoredForms[signature] = { ts: Date.now(), path: location.pathname };
+    delete approvedForms[signature];
+  }
+  setSiteFlag('approvedForms', approvedForms);
+  setSiteFlag('ignoredForms', ignoredForms);
+  if (isJobContextPage.cache) isJobContextPage.cache = null;
+}
+
+function showJobContextPrompt() {
+  if (document.getElementById('ja-job-context-prompt')) return;
+  if (!shouldShowJobContextPrompt()) return;
+  const sig = jobContextState.signature;
+  try { sessionStorage.setItem(`ja_prompted_${sig}`, 'true'); } catch (_) { }
+
+  const wrap = document.createElement('div');
+  wrap.id = 'ja-job-context-prompt';
+  wrap.innerHTML = `
+    <style>
+      #ja-job-context-prompt {
+        position: fixed; bottom: 18px; right: 18px; z-index: 2147483646;
+        background: #0b1220; color: #e2e8f0;
+        border: 1px solid rgba(10, 102, 194, 0.35);
+        border-radius: 12px; padding: 12px 14px; max-width: 320px;
+        box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-size: 12px;
+      }
+      #ja-job-context-prompt .title { font-weight: 600; }
+      #ja-job-context-prompt .actions { display:flex; gap:8px; margin-top: 8px; }
+      #ja-job-yes { background: #0a66c2; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+      #ja-job-no { background: rgba(255,255,255,0.08); color: #cbd5f5; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+      #ja-job-dismiss { background: transparent; color: #94a3b8; border: none; padding: 6px 6px; cursor: pointer; }
+    </style>
+    <div class="title">Is this a job application form?</div>
+    <div style="color:#94a3b8; margin-top:4px;">We’ll remember your choice for this form.</div>
+    <div class="actions">
+      <button id="ja-job-yes">Yes</button>
+      <button id="ja-job-no">No, never</button>
+      <button id="ja-job-dismiss">Not now</button>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  wrap.querySelector('#ja-job-yes')?.addEventListener('click', () => {
+    setFormPreference(sig, true);
+    setSessionFlag('jobContextConfirmed', true);
+    wrap.remove();
+    debouncedInit();
+  });
+  wrap.querySelector('#ja-job-no')?.addEventListener('click', () => {
+    setFormPreference(sig, false);
+    wrap.remove();
+    removeUiOverlays();
+  });
+  wrap.querySelector('#ja-job-dismiss')?.addEventListener('click', () => {
+    wrap.remove();
+  });
+}
+
+function isSiteDisabled() {
+  return !!(
+    !currentSiteActive ||
+    siteData?.disabled ||
+    siteData?.enabled === false ||
+    getSiteFlag('neverPrompt')
+  );
+}
+
+function removeUiOverlays() {
+  const ids = [
+    'ja-banner',
+    'ja-save-banner',
+    'ja-coverage-banner',
+    'ja-approval-banner',
+    'ja-job-context-prompt',
+    'ja-teach-banner',
+    'ja-teach-overlay',
+    'ja-teach-hover',
+    'ja-confidence-layer',
+    'ja-dropdown-resolver',
+    'ja-review-panel',
+  ];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  });
+  hideResumeAttach();
+}
+
+function suppressSiteUi() {
+  removeUiOverlays();
+  setSessionFlag('autofillDismissed', true);
+  setSessionFlag('promptSkipped', true);
+  setSessionFlag('coverageDismissed', true);
+  setSessionFlag('confidenceDismissed', true);
+  try { window._jaObserver?.disconnect?.(); } catch (_) { }
+  window._jaObserver = null;
+  dropdownResolverOpen = false;
+  approvalQueue = [];
+  pendingCapture = {};
+  if (teachMode) {
+    try { stopTeachMode(); } catch (_) { }
+  }
+}
 
 function cleanLabelText(text) {
   if (FieldUtils && FieldUtils.cleanLabelText) return FieldUtils.cleanLabelText(text);
@@ -266,6 +488,14 @@ function inferProfileKeyFromLabel(label) {
   return null;
 }
 
+function humanizeKey(key) {
+  if (!key) return '';
+  return String(key)
+    .replace(/[_-]+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .trim();
+}
+
 function inferFieldType(el, fieldKey) {
   const type = (el?.type || '').toLowerCase();
   if (type === 'email') return 'email';
@@ -340,6 +570,7 @@ function queueApproval(entry) {
 function showApprovalBanner() {
   if (!approvalQueue.length) return;
   if (document.getElementById('ja-approval-banner')) return;
+  if (!shouldShowUi()) return;
   if (getSessionFlag('promptSkipped')) return;
   if (!isJobContextPage()) return;
   const banner = document.createElement('div');
@@ -413,17 +644,22 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   if (tag === 'SELECT') {
     // Skip Radix UI / framework fake selects that are aria-hidden
     if (el.getAttribute('aria-hidden') === 'true') return false;
-    const targetText = String(primaryVal).toLowerCase().trim();
-    const targetValue = String(altVal || primaryVal).toLowerCase().trim();
-    for (let i = 0; i < el.options.length; i++) {
-      const opt = el.options[i];
-      const optVal = opt.value.toLowerCase().trim();
-      const optText = opt.text.toLowerCase().trim();
-      if (optVal === targetText || optText === targetText || optVal === targetValue || optText === targetValue) {
-        el.selectedIndex = i;
+    const targets = [primaryVal, altVal].filter(Boolean);
+    if (!targets.length || isPlaceholderText(targets[0])) return false;
+    const candidates = buildSelectCandidates(el);
+    if (!candidates.length) return false;
+    for (const c of candidates) {
+      if (computeOptionMatchScore(c.text, c.value, targets) >= 1) {
+        el.selectedIndex = c.index;
         triggerEvents(el);
         return true;
       }
+    }
+    const best = pickBestCandidate(candidates, targets);
+    if (best.candidate && best.score >= 0.92) {
+      el.selectedIndex = best.candidate.index;
+      triggerEvents(el);
+      return true;
     }
     return false;
   }
@@ -437,12 +673,126 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   return true;
 }
 
-function encodeSelectValue(text, value) {
+function isPlaceholderText(text) {
+  const t = (text || '').toString().trim();
+  if (!t) return true;
+  return /^[-\s]*(select|choose|pick|--|option)/i.test(t);
+}
+
+const OPTION_NORMALIZE_MAP = {
+  'us': 'united states',
+  'u s': 'united states',
+  'usa': 'united states',
+  'u s a': 'united states',
+  'u.s.': 'united states',
+  'united states of america': 'united states',
+  'yes': 'yes',
+  'y': 'yes',
+  'true': 'yes',
+  'no': 'no',
+  'n': 'no',
+  'false': 'no',
+  'male': 'male',
+  'm': 'male',
+  'female': 'female',
+  'f': 'female',
+  'on site': 'onsite',
+  'on-site': 'onsite',
+  'onsite': 'onsite',
+  'remote': 'remote',
+  'hybrid': 'hybrid',
+};
+
+function normalizeOptionText(str) {
+  const n = normalizeHint(str);
+  if (!n) return '';
+  return OPTION_NORMALIZE_MAP[n] || n;
+}
+
+function buildOptionsSnapshotFromList(list, totalCount) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const options = [];
+  const normalized = [];
+  const seen = new Set();
+  for (const item of list) {
+    const text = (item?.text ?? item?.label ?? item?.value ?? '').toString().trim();
+    const value = (item?.value ?? '').toString().trim();
+    if (!text && !value) continue;
+    if (isPlaceholderText(text) && !value) continue;
+    const key = `${text}||${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    options.push({ text, value });
+    normalized.push(normalizeOptionText(text || value));
+    if (options.length >= MAX_OPTION_SNAPSHOT) break;
+  }
+  if (!options.length) return null;
+  const fingerprint = hashString(normalized.filter(Boolean).join('|'));
+  return {
+    options,
+    fingerprint,
+    count: typeof totalCount === 'number' ? totalCount : options.length,
+  };
+}
+
+function buildOptionsSnapshotFromSelect(selectEl) {
+  if (!selectEl || !selectEl.options) return null;
+  const list = Array.from(selectEl.options || []).map(opt => ({
+    text: opt.text?.trim() || opt.label?.trim() || '',
+    value: opt.value ?? '',
+  }));
+  const snap = buildOptionsSnapshotFromList(list, selectEl.options.length);
+  if (snap) snap.selectedIndex = selectEl.selectedIndex;
+  return snap;
+}
+
+function buildOptionsSnapshotFromOptionElements(optionEls) {
+  if (!optionEls || optionEls.length === 0) return null;
+  const list = optionEls.map(opt => ({
+    text: getOptionText(opt) || opt.textContent || '',
+    value: getOptionValue(opt) || opt.getAttribute?.('value') || '',
+  }));
+  return buildOptionsSnapshotFromList(list, optionEls.length);
+}
+
+function getDropdownMeta(el) {
+  if (!el) return null;
+  const tag = el.tagName?.toUpperCase();
+  const role = el.getAttribute?.('role') || '';
+  const hasPopupListbox = el.getAttribute?.('aria-haspopup') === 'listbox';
+  if (tag === 'SELECT') return buildOptionsSnapshotFromSelect(el);
+
+  let listbox = null;
+  if (role === 'listbox') listbox = el;
+  if (!listbox && (role === 'combobox' || hasPopupListbox)) {
+    const controlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+    if (controlId) listbox = document.getElementById(controlId);
+    if (!listbox) listbox = el.querySelector?.('[role="listbox"]');
+    if (!listbox) {
+      const root = getRootNodeFor(el);
+      listbox = queryInRoot(root, '[role="listbox"]');
+    }
+  }
+  const optionEls = listbox
+    ? Array.from(listbox.querySelectorAll('[role="option"]'))
+    : findVisibleOptions();
+  return buildOptionsSnapshotFromOptionElements(optionEls);
+}
+
+function encodeSelectValue(text, value, meta) {
   const t = (text || '').toString().trim();
   const v = (value || '').toString().trim();
-  if (!v || v === t) return t;
+  if (!t && !v) return '';
+  const payload = { text: t, value: v || t };
+  if (meta && (meta.options || meta.fingerprint || meta.count || typeof meta.selectedIndex === 'number')) {
+    if (meta.options) payload.options = meta.options.slice(0, MAX_OPTION_SNAPSHOT);
+    if (meta.fingerprint) payload.fingerprint = meta.fingerprint;
+    if (meta.count) payload.count = meta.count;
+    if (typeof meta.selectedIndex === 'number') payload.selectedIndex = meta.selectedIndex;
+  }
+  if (!meta && (!v || v === t)) return t;
   try {
-    return SELECT_VALUE_PREFIX + btoa(JSON.stringify({ text: t, value: v }));
+    return SELECT_VALUE_PREFIX + btoa(JSON.stringify(payload));
   } catch (_) {
     return t || v;
   }
@@ -454,7 +804,14 @@ function decodeSelectValue(val) {
   try {
     const json = atob(val.slice(SELECT_VALUE_PREFIX.length));
     const data = JSON.parse(json);
-    return { text: data.text || '', value: data.value || data.text || '' };
+    return {
+      text: data.text || '',
+      value: data.value || data.text || '',
+      options: Array.isArray(data.options) ? data.options : null,
+      fingerprint: data.fingerprint || '',
+      count: data.count || 0,
+      selectedIndex: typeof data.selectedIndex === 'number' ? data.selectedIndex : null,
+    };
   } catch (_) {
     return { text: val, value: val };
   }
@@ -588,6 +945,10 @@ function setSiteFlag(flag, value) {
   siteFlags[flag] = value;
   siteData.flags = { ...(siteData.flags || {}), [flag]: value };
   chrome.runtime.sendMessage({ type: 'SET_SITE_FLAGS', hostname, flags: { [flag]: value } }).catch(() => { });
+  if (flag === 'neverPrompt' && value) {
+    currentSiteActive = false;
+    suppressSiteUi();
+  }
 }
 
 function getPageTextSample() {
@@ -623,73 +984,378 @@ function hasResumeUploadSignal() {
   return labels.some(el => /resume|cv|cover letter/i.test(el.innerText || ''));
 }
 
-function countJobLabelSignals() {
-  const labels = collectElements('label, .label, .field-label, [data-automation-id="questionText"], [data-automation-id="promptText"]');
+function getLabelTextSignals(regex) {
   let hits = 0;
+  const labels = collectElements('label, .label, .field-label, [data-automation-id="questionText"], [data-automation-id="promptText"]');
   labels.forEach(el => {
     const text = cleanLabelText(el.innerText || '');
-    if (JOB_TEXT_REGEX.test(text)) hits += 1;
+    if (regex.test(text)) hits += 1;
+  });
+  // Also check placeholders/aria-labels for inputs
+  const fields = collectElements('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]');
+  fields.forEach(el => {
+    const parts = [
+      el.getAttribute?.('aria-label') || '',
+      el.getAttribute?.('placeholder') || '',
+      el.name || '',
+      el.id || '',
+    ];
+    const text = cleanLabelText(parts.filter(Boolean).join(' '));
+    if (text && regex.test(text)) hits += 1;
   });
   return hits;
+}
+
+function getButtonTextSignals(regex) {
+  const buttons = collectElements('button, input[type="submit"], input[type="button"], [role="button"]');
+  let hits = 0;
+  buttons.forEach(btn => {
+    if (!isVisibleElement(btn)) return;
+    const text = cleanLabelText(btn.innerText || btn.value || '');
+    if (text && regex.test(text)) hits += 1;
+  });
+  return hits;
+}
+
+function collectElementsInRoot(root, selector) {
+  const results = [];
+  if (!root || !root.querySelectorAll) return results;
+  try {
+    root.querySelectorAll(selector).forEach(el => results.push(el));
+  } catch (_) { }
+  try {
+    root.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) {
+        try {
+          el.shadowRoot.querySelectorAll(selector).forEach(n => results.push(n));
+        } catch (_) { }
+      }
+    });
+  } catch (_) { }
+  return results;
+}
+
+function hashString(input) {
+  let hash = 5381;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash) + input.charCodeAt(i);
+    hash |= 0; // force 32-bit
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function getFieldLabelText(el) {
+  if (!el) return '';
+  const aria = el.getAttribute?.('aria-label');
+  if (aria) return cleanLabelText(aria);
+  const placeholder = el.getAttribute?.('placeholder');
+  if (placeholder) return cleanLabelText(placeholder);
+  const name = el.getAttribute?.('name') || el.name || '';
+  if (name) return cleanLabelText(name);
+  const id = el.getAttribute?.('id') || el.id || '';
+  if (id) {
+    const label = document.querySelector(`label[for="${escapeForSelector(id)}"]`);
+    if (label?.innerText) return cleanLabelText(label.innerText);
+    return cleanLabelText(id);
+  }
+  return '';
+}
+
+function getTextSignalsInRoot(root, regex) {
+  let hits = 0;
+  const labels = collectElementsInRoot(root, 'label, .label, .field-label, [data-automation-id="questionText"], [data-automation-id="promptText"]');
+  labels.forEach(el => {
+    const text = cleanLabelText(el.innerText || '');
+    if (text && regex.test(text)) hits += 1;
+  });
+  const fields = collectElementsInRoot(root, 'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]');
+  fields.forEach(el => {
+    const text = getFieldLabelText(el);
+    if (text && regex.test(text)) hits += 1;
+  });
+  return hits;
+}
+
+function getVisibleInputCountInRoot(root) {
+  const selector = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]), textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]';
+  const elements = collectElementsInRoot(root, selector);
+  let count = 0;
+  elements.forEach(el => {
+    const type = (el.type || '').toLowerCase();
+    if (type === 'password') return;
+    if (!isVisibleElement(el)) return;
+    count += 1;
+  });
+  return count;
+}
+
+function hasResumeUploadSignalInRoot(root) {
+  const fileInput = collectElementsInRoot(root, 'input[type="file"]').find(el => isVisibleElement(el));
+  if (fileInput) return true;
+  const labels = collectElementsInRoot(root, 'label, .label, .field-label, [data-automation-id="questionText"], [data-automation-id="promptText"]');
+  return labels.some(el => /resume|cv|cover letter/i.test(el.innerText || ''));
+}
+
+function getBestFormIntent() {
+  const forms = collectElements('form');
+  const candidates = forms.length ? forms : [document.body];
+  let best = { score: 0, fieldCount: 0, labelHits: 0, strongLabelHits: 0, hasFile: false, loginHits: 0, root: document.body };
+
+  candidates.forEach(root => {
+    const fieldCount = getVisibleInputCountInRoot(root);
+    if (fieldCount === 0) return;
+    const labelHits = getTextSignalsInRoot(root, JOB_FIELD_REGEX);
+    const strongLabelHits = getTextSignalsInRoot(root, JOB_STRONG_FIELD_REGEX);
+    const loginHits = getTextSignalsInRoot(root, LOGIN_TEXT_REGEX);
+    const hasFile = hasResumeUploadSignalInRoot(root);
+    const passwordInside = collectElementsInRoot(root, 'input[type="password"]').some(el => isVisibleElement(el));
+
+    let score = 0;
+    if (fieldCount >= 4) score += 1;
+    if (fieldCount >= 8) score += 1;
+    score += Math.min(labelHits, 4);
+    score += Math.min(strongLabelHits * 2, 6);
+    if (hasFile) score += 3;
+    if (passwordInside) score -= 6;
+    if (loginHits >= 2) score -= 4;
+    else if (loginHits >= 1) score -= 2;
+
+    if (score > best.score) {
+      best = { score, fieldCount, labelHits, strongLabelHits, hasFile, loginHits, root };
+    }
+  });
+
+  // Build a stable signature from best root
+  let signature = '';
+  if (best.root) {
+    const fields = collectElementsInRoot(best.root, 'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]');
+    const labelTexts = [];
+    fields.forEach(el => {
+      const type = (el.type || '').toLowerCase();
+      if (type === 'password' || type === 'hidden') return;
+      const text = getFieldLabelText(el);
+      if (text) labelTexts.push(text);
+    });
+    const labels = collectElementsInRoot(best.root, 'label, .label, .field-label, [data-automation-id="questionText"], [data-automation-id="promptText"]');
+    labels.forEach(el => {
+      const text = cleanLabelText(el.innerText || '');
+      if (text) labelTexts.push(text);
+    });
+    const uniq = Array.from(new Set(labelTexts)).slice(0, 18);
+    if (uniq.length >= 3 || best.fieldCount >= 3) {
+      const sigRaw = `${location.hostname}|${location.pathname}|${best.fieldCount}|${uniq.join('|')}`;
+      signature = hashString(sigRaw);
+    }
+  }
+
+  return { ...best, signature };
+}
+
+function getFormPreference(signature) {
+  if (!signature) return null;
+  const ignored = siteFlags?.ignoredForms || {};
+  const approved = siteFlags?.approvedForms || {};
+  if (approved && approved[signature]) return 'approved';
+  if (ignored && ignored[signature]) return 'ignored';
+  return null;
+}
+
+function hasJobPostingSchema() {
+  const micro = document.querySelector('[itemtype*="schema.org/JobPosting"]');
+  if (micro) return true;
+  const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+  for (const s of scripts) {
+    const text = s.textContent?.trim();
+    if (!text) continue;
+    try {
+      const json = JSON.parse(text);
+      const nodes = Array.isArray(json) ? json : [json];
+      for (const node of nodes) {
+        const graph = node?.['@graph'];
+        const pool = Array.isArray(graph) ? graph : [node];
+        for (const entry of pool) {
+          const t = entry?.['@type'];
+          if (Array.isArray(t) ? t.includes('JobPosting') : t === 'JobPosting') {
+            return true;
+          }
+        }
+      }
+    } catch (_) { }
+  }
+  return false;
+}
+
+function getHeadingTextSignals(regex) {
+  const headings = collectElements('h1, h2, h3, [role="heading"]');
+  let hits = 0;
+  headings.forEach(h => {
+    const text = cleanLabelText(h.innerText || '');
+    if (text && regex.test(text)) hits += 1;
+  });
+  return hits;
+}
+
+function hasAtsApplyMarkers() {
+  return !!document.querySelector(
+    '[data-automation-id*="apply"], [data-automation-id*="application"], [data-automation-id*="job"], ' +
+    '[data-qa*="apply"], [data-qa*="application"], [data-testid*="apply"], [data-testid*="application"], ' +
+    '[data-test*="apply"], [data-test*="application"], form[action*="apply"], form[action*="application"]'
+  );
+}
+
+function getNonJobSignalScore() {
+  const sample = `${document.title || ''} ${getPageTextSample()}`;
+  let score = 0;
+  if (NON_JOB_TEXT_REGEX.test(sample)) score += 3;
+  const headingHits = getHeadingTextSignals(NON_JOB_TEXT_REGEX);
+  if (headingHits >= 1) score += 2;
+  const labelHits = getLabelTextSignals(NON_JOB_TEXT_REGEX);
+  if (labelHits >= 1) score += 2;
+  return score;
 }
 
 function getJobSignalScore() {
   let score = 0;
   const host = location.hostname || '';
-  if (JOB_HOST_PATTERNS.some(rx => rx.test(host))) score += 3;
+  const path = `${location.pathname || ''}${location.search || ''}${location.hash || ''}`;
+  const hostMatch = JOB_HOST_PATTERNS.some(rx => rx.test(host));
+  if (hostMatch) score += 5;
+  if (JOB_URL_REGEX.test(path)) score += 3;
   const title = document.title || '';
-  if (JOB_TEXT_REGEX.test(title)) score += 2;
+  if (JOB_TEXT_REGEX.test(title)) score += 1;
   const sample = getPageTextSample();
   if (JOB_TEXT_REGEX.test(sample)) score += 2;
-  const labelHits = countJobLabelSignals();
-  if (labelHits >= 2) score += 2;
+  const headingHits = getHeadingTextSignals(JOB_HEADING_REGEX);
+  if (headingHits >= 1) score += 2;
+  if (headingHits >= 2) score += 1;
+  const labelHits = getLabelTextSignals(JOB_FIELD_REGEX);
+  const strongLabelHits = getLabelTextSignals(JOB_STRONG_FIELD_REGEX);
+  if (labelHits >= 2) score += 3;
   if (labelHits >= 4) score += 1;
-  if (hasResumeUploadSignal()) score += 2;
+  if (strongLabelHits >= 1) score += 2;
+  const resumeSignal = hasResumeUploadSignal();
+  if (resumeSignal) score += 3;
   const fieldCount = getVisibleInputCount();
-  if (fieldCount >= 6) score += 1;
-  return score;
+  if (fieldCount >= 4) score += 1;
+  if (fieldCount >= 8) score += 1;
+  const atsMarkers = hasAtsApplyMarkers();
+  if (atsMarkers) score += 3;
+  const schemaSignal = hasJobPostingSchema();
+  if (schemaSignal) score += 4;
+  const formIntent = getBestFormIntent();
+  if (formIntent.score >= 6) score += 3;
+  else if (formIntent.score >= 4) score += 2;
+  else if (formIntent.score >= 2) score += 1;
+  return { score, hostMatch, headingHits, labelHits, strongLabelHits, resumeSignal, fieldCount, atsMarkers, schemaSignal, formIntent };
 }
 
-function isLikelyLoginForm(jobScore) {
-  const passwordInput = collectElements('input[type="password"]').find(el => isVisibleElement(el));
-  if (!passwordInput) return false;
+function getLoginSignalScore() {
+  let score = 0;
+  const path = `${location.pathname || ''}${location.search || ''}${location.hash || ''}`;
   const sample = `${document.title || ''} ${getPageTextSample()}`;
-  const loginText = LOGIN_TEXT_REGEX.test(sample);
+  const passwordInput = collectElements('input[type="password"]').find(el => isVisibleElement(el));
+  if (passwordInput) score += 6;
+  if (LOGIN_URL_REGEX.test(path)) score += 3;
+  if (LOGIN_TEXT_REGEX.test(sample)) score += 3;
+  const loginLabelHits = getLabelTextSignals(LOGIN_TEXT_REGEX);
+  if (loginLabelHits >= 1) score += 2;
+  if (loginLabelHits >= 2) score += 1;
+  const loginBtnHits = getButtonTextSignals(/sign in|log in|login|sign up|signup|register|create account|continue/i);
+  if (loginBtnHits > 0) score += 2;
+  if (loginBtnHits > 1) score += 1;
+  const formLoginAction = collectElements('form[action]').some(f => /login|signin|auth|session|register/i.test(f.getAttribute('action') || ''));
+  if (formLoginAction) score += 2;
+
   const fieldCount = getVisibleInputCount();
-  if (loginText && jobScore < 4) return true;
-  if (fieldCount <= 3 && jobScore < 4) return true;
-  return false;
+  if (fieldCount <= 2) score += 1;
+  const otpLike = collectElements('input').some(el => {
+    const type = (el.type || '').toLowerCase();
+    if (type === 'password') return false;
+    if (el.maxLength === 1) return true;
+    const name = `${el.name || ''} ${el.id || ''} ${el.getAttribute?.('aria-label') || ''} ${el.placeholder || ''}`.toLowerCase();
+    return /otp|code|verification|2fa|mfa/.test(name);
+  });
+  if (otpLike) score += 2;
+
+  return { score, passwordInput, otpLike, fieldCount };
+}
+
+function isLikelyLoginForm() {
+  const login = getLoginSignalScore();
+  if (login.passwordInput) return true;
+  return login.score >= 6;
 }
 
 function isJobContextPage() {
   const now = Date.now();
   const host = location.hostname || '';
-  const path = location.pathname || '';
-  if (/linkedin\.com$/i.test(host)) {
-    if (!/\/jobs\//i.test(path)) {
-      isJobContextPage.cache = { value: false, ts: now };
-      return false;
-    }
-  }
-  const bypassCache = /linkedin\.com$/i.test(host) && /\/jobs\//i.test(path);
-  if (!bypassCache && isJobContextPage.cache && (now - isJobContextPage.cache.ts) < 10000) {
+  const path = `${location.pathname || ''}${location.search || ''}${location.hash || ''}`;
+  const cacheKey = `${host}${path}`;
+  if (isJobContextPage.cache && isJobContextPage.cache.key === cacheKey && (now - isJobContextPage.cache.ts) < 8000) {
     return isJobContextPage.cache.value;
   }
-  const jobScore = getJobSignalScore();
-  if (isLikelyLoginForm(jobScore)) {
-    isJobContextPage.cache = { value: false, ts: now };
+
+  // Explicit LinkedIn guard
+  if (/linkedin\.com$/i.test(host) && !/\/jobs\//i.test(path)) {
+    jobContextState = { status: 'nonjob', signature: '', jobScore: 0, formScore: 0, loginScore: 0, ts: now };
+    isJobContextPage.cache = { value: false, ts: now, key: cacheKey };
     return false;
   }
-  if (getSessionFlag('jobContextConfirmed')) {
-    isJobContextPage.cache = { value: true, ts: now };
+
+  const login = getLoginSignalScore();
+  const job = getJobSignalScore();
+  const formIntent = job.formIntent || getBestFormIntent();
+  const formScore = formIntent?.score || 0;
+  const jobStrong = job.atsMarkers || job.resumeSignal || job.schemaSignal || job.strongLabelHits >= 1 || job.labelHits >= 4 || job.score >= (job.hostMatch ? 4 : 6);
+  const loginDominant = (login.passwordInput && !jobStrong && formScore < 4) || (login.score >= 7 && job.score < 5 && formScore < 4);
+  if (loginDominant) {
+    jobContextState = { status: 'login', signature: formIntent.signature || '', jobScore: job.score || 0, formScore, loginScore: login.score || 0, ts: now };
+    isJobContextPage.cache = { value: false, ts: now, key: cacheKey };
+    return false;
+  }
+  const pref = getFormPreference(formIntent.signature);
+  if (pref === 'approved') {
+    jobContextState = { status: 'job', signature: formIntent.signature || '', jobScore: job.score || 0, formScore: formIntent.score || 0, loginScore: login.score || 0, ts: now };
+    isJobContextPage.cache = { value: true, ts: now, key: cacheKey };
     return true;
   }
-  if (jobScore >= 3) {
+  if (pref === 'ignored') {
+    jobContextState = { status: 'nonjob', signature: formIntent.signature || '', jobScore: job.score || 0, formScore: formIntent.score || 0, loginScore: login.score || 0, ts: now };
+    isJobContextPage.cache = { value: false, ts: now, key: cacheKey };
+    return false;
+  }
+
+  let jobScore = job.score || 0;
+  const nonJobScore = getNonJobSignalScore();
+  const hasJobFields = job.strongLabelHits >= 1 || job.labelHits >= 4 || job.resumeSignal || job.atsMarkers || job.schemaSignal;
+  const hasFormLike = job.fieldCount >= 3 || (job.fieldCount >= 1 && (job.resumeSignal || job.atsMarkers || job.hostMatch || job.schemaSignal));
+  const strongJob = job.atsMarkers || job.resumeSignal || job.strongLabelHits >= 1 || job.headingHits >= 2 || job.schemaSignal;
+  if (formScore >= 6) jobScore += 2;
+  else if (formScore >= 4) jobScore += 1;
+
+  // If page looks like a generic non-job form and job signals are weak, bail out
+  if (nonJobScore >= 4 && jobScore < 6 && !job.hostMatch) {
+    jobContextState = { status: 'nonjob', signature: formIntent.signature || '', jobScore, formScore, loginScore: login.score || 0, ts: now };
+    isJobContextPage.cache = { value: false, ts: now, key: cacheKey };
+    return false;
+  }
+
+  if (getSessionFlag('jobContextConfirmed') && (jobScore >= 3 || hasFormLike)) {
+    jobContextState = { status: 'job', signature: formIntent.signature || '', jobScore, formScore, loginScore: login.score || 0, ts: now };
+    isJobContextPage.cache = { value: true, ts: now, key: cacheKey };
+    return true;
+  }
+
+  const threshold = job.hostMatch ? 4 : 6;
+  if ((jobScore >= threshold && hasFormLike && (hasJobFields || strongJob || job.hostMatch)) || (hasJobFields && hasFormLike)) {
     setSessionFlag('jobContextConfirmed', true);
-    isJobContextPage.cache = { value: true, ts: now };
+    jobContextState = { status: 'job', signature: formIntent.signature || '', jobScore, formScore, loginScore: login.score || 0, ts: now };
+    isJobContextPage.cache = { value: true, ts: now, key: cacheKey };
     return true;
   }
-  isJobContextPage.cache = { value: false, ts: now };
+
+  jobContextState = { status: (formScore >= 3 || jobScore >= 4) ? 'unknown' : 'nonjob', signature: formIntent.signature || '', jobScore, formScore, loginScore: login.score || 0, ts: now };
+  isJobContextPage.cache = { value: false, ts: now, key: cacheKey };
   return false;
 }
 
@@ -752,6 +1418,7 @@ function extractJobInfoLocal() {
 }
 
 async function maybeAutoTrackApplication(stage) {
+  if (isSiteDisabled()) return;
   if (stage !== 'final') return;
   if (getSessionFlag('appAdded')) return;
   if (!isJobContextPage()) return;
@@ -836,12 +1503,34 @@ function getGlobalMatchMeta(fieldKey) {
   if (Object.prototype.hasOwnProperty.call(currentGlobalProfile, cleanKey) && currentGlobalProfile[cleanKey] !== undefined) {
     return { value: currentGlobalProfile[cleanKey], key: cleanKey, score: 1.0 };
   }
+
+  // 1b. Infer common keys from label
+  const inferred = inferProfileKeyFromLabel(cleanKey);
+  if (inferred && currentGlobalProfile[inferred] !== undefined) {
+    return { value: currentGlobalProfile[inferred], key: inferred, score: 0.9 };
+  }
   
   // 2. Heuristic fallback
   for (const h of GLOBAL_HEURISTICS) {
     if (h.regex.test(cleanKey) && currentGlobalProfile[h.pId]) {
       const score = Math.max(0.7, scoreStringMatch(cleanKey, h.pId));
       return { value: currentGlobalProfile[h.pId], key: h.pId, score };
+    }
+  }
+
+  // 3. Fuzzy match against any profile key (camelCase-aware)
+  const target = normalizeHint(humanizeKey(cleanKey));
+  if (target) {
+    let best = { key: '', score: 0 };
+    Object.keys(currentGlobalProfile).forEach(k => {
+      const val = currentGlobalProfile[k];
+      if (val === undefined || val === null) return;
+      if (typeof val === 'object') return; // avoid arrays/objects for generic text fields
+      const score = scoreStringMatch(target, humanizeKey(k));
+      if (score > best.score) best = { key: k, score };
+    });
+    if (best.key && best.score >= 0.6) {
+      return { value: currentGlobalProfile[best.key], key: best.key, score: best.score };
     }
   }
   return null;
@@ -1416,7 +2105,8 @@ function getStoredValue(el) {
     const opt = el.options?.[el.selectedIndex];
     const text = opt?.text?.trim() || '';
     const value = opt?.value || '';
-    return encodeSelectValue(text || value, value);
+    const meta = getDropdownMeta(el);
+    return encodeSelectValue(text || value, value, meta);
   }
   if (role === 'listbox') {
     const selectedAll = el.querySelectorAll('[role="option"][aria-selected="true"]');
@@ -1427,7 +2117,8 @@ function getStoredValue(el) {
     const selected = selectedAll[0];
     const text = selected?.innerText?.trim() || getFieldValue(el);
     const value = selected?.getAttribute('data-value') || selected?.getAttribute('value') || '';
-    return encodeSelectValue(text || value, value || text);
+    const meta = getDropdownMeta(el);
+    return encodeSelectValue(text || value, value || text, meta);
   }
   if (role === 'combobox' || hasPopupListbox) {
     const activeId = el.getAttribute('aria-activedescendant');
@@ -1437,18 +2128,20 @@ function getStoredValue(el) {
       if (activeEl) {
         const text = activeEl.innerText?.trim() || getFieldValue(el);
         const value = activeEl.getAttribute('data-value') || activeEl.getAttribute('value') || '';
-        return encodeSelectValue(text || value, value || text);
+        const meta = getDropdownMeta(el);
+        return encodeSelectValue(text || value, value || text, meta);
       }
     }
     const text = getFieldValue(el);
-    return encodeSelectValue(text, text);
+    const meta = getDropdownMeta(el);
+    return encodeSelectValue(text, text, meta);
   }
   return getFieldValue(el);
 }
 
 function queueCapture(fields) {
   if (!fields || Object.keys(fields).length === 0) return;
-  if (!currentSiteActive) return;
+  if (isSiteDisabled()) return;
   pendingCapture = { ...pendingCapture, ...fields };
   if (captureTimer) clearTimeout(captureTimer);
   captureTimer = setTimeout(async () => {
@@ -1758,9 +2451,25 @@ function getFormFields() {
 function triggerEvents(el) {
   // React needs InputEvent (not plain Event) to fire synthetic onChange
   el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.value }));
+  if (typeof InputEvent !== 'undefined') {
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.value }));
+  }
   el.dispatchEvent(new Event('change', { bubbles: true }));
   el.dispatchEvent(new Event('keyup', { bubbles: true }));
+}
+
+function getValueSetter(el) {
+  if (!el) return null;
+  const tag = el.tagName?.toUpperCase();
+  let proto = null;
+  if (tag === 'SELECT') {
+    proto = (typeof HTMLSelectElement !== 'undefined') ? HTMLSelectElement.prototype : Object.getPrototypeOf(el);
+  } else if (tag === 'TEXTAREA') {
+    proto = (typeof HTMLTextAreaElement !== 'undefined') ? HTMLTextAreaElement.prototype : Object.getPrototypeOf(el);
+  } else {
+    proto = (typeof HTMLInputElement !== 'undefined') ? HTMLInputElement.prototype : Object.getPrototypeOf(el);
+  }
+  return Object.getOwnPropertyDescriptor(proto, 'value')?.set || null;
 }
 
 // Universal text fill: works with React, Vue, Angular, native HTML
@@ -1787,11 +2496,14 @@ function universalFillText(el, value) {
     if (ok && el.value === String(value)) return true;
   } catch (_) { }
   // Fallback: native setter + InputEvent
-  const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  const setter = getValueSetter(el);
   if (setter) setter.call(el, value);
   else el.value = value;
-  el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(value), inputType: 'insertText' }));
+  if (typeof InputEvent !== 'undefined') {
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(value), inputType: 'insertText' }));
+  } else {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
   el.dispatchEvent(new Event('change', { bubbles: true }));
   el.dispatchEvent(new Event('blur', { bubbles: true }));
   return true;
@@ -1800,8 +2512,8 @@ function universalFillText(el, value) {
 // Click-based Radix UI (and similar) combobox filler.
 // Works on: Bolt (Greenhouse v3), Ashby, some Lever forms.
 // Strategy: click the trigger to open the listbox, then click matching option.
-async function fillRadixCombobox(triggerBtn, desiredValue) {
-  const desired = String(desiredValue).toLowerCase().trim();
+async function fillRadixCombobox(triggerBtn, desiredValues, minScore = 0.9) {
+  const targets = Array.isArray(desiredValues) ? desiredValues : [desiredValues];
   triggerBtn.click();
   // Wait up to 600ms for the listbox/popup to appear
   for (let i = 0; i < 12; i++) {
@@ -1811,25 +2523,19 @@ async function fillRadixCombobox(triggerBtn, desiredValue) {
       '[role="option"]:not([aria-hidden="true"]), [role="listbox"] [data-value], .rt-SelectItem, [data-radix-select-item]'
     );
     if (!options.length) continue;
-    let picked = null;
-    // Exact match first
+    let picked = { el: null, score: 0 };
     for (const opt of options) {
-      const text = (opt.textContent || '').toLowerCase().trim();
-      const val  = (opt.dataset.value || opt.getAttribute('value') || '').toLowerCase().trim();
-      if (text === desired || val === desired) { picked = opt; break; }
+      const text = opt.textContent || '';
+      const val  = opt.dataset.value || opt.getAttribute('value') || '';
+      if (isPlaceholderText(text) && !val) continue;
+      const score = computeOptionMatchScore(text, val, targets);
+      if (score > picked.score) picked = { el: opt, score };
     }
-    // Partial match fallback
-    if (!picked) {
-      for (const opt of options) {
-        const text = (opt.textContent || '').toLowerCase().trim();
-        if (text.includes(desired) || desired.includes(text)) { picked = opt; break; }
-      }
-    }
-    if (picked) {
-      picked.click();
+    if (picked.el && picked.score >= minScore) {
+      picked.el.click();
       // Also dispatch pointer events some frameworks need
-      picked.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-      picked.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      picked.el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      picked.el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
       return true;
     }
     // If options appeared but no match, close and bail
@@ -1839,10 +2545,7 @@ async function fillRadixCombobox(triggerBtn, desiredValue) {
 }
 
 function setNativeValue(el, val) {
-  const proto = el.tagName === 'SELECT' ? HTMLSelectElement.prototype
-    : el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype
-      : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  const setter = getValueSetter(el);
   if (setter) setter.call(el, val);
   else el.value = val;
 }
@@ -1858,7 +2561,128 @@ function setEditableValue(el, val) {
   return false;
 }
 
+function buildSelectCandidates(selectEl) {
+  const out = [];
+  if (!selectEl || !selectEl.options) return out;
+  Array.from(selectEl.options).forEach((opt, idx) => {
+    const text = opt.text?.trim() || opt.label?.trim() || '';
+    const value = (opt.value ?? '').toString().trim();
+    if (!text && !value) return;
+    if (isPlaceholderText(text) && !value) return;
+    out.push({ el: opt, text, value, index: idx });
+  });
+  return out;
+}
+
+function buildListboxCandidates(listboxEl) {
+  const out = [];
+  if (!listboxEl) return out;
+  listboxEl.querySelectorAll('[role="option"]').forEach((opt, idx) => {
+    const text = getOptionText(opt) || opt.textContent || '';
+    const value = getOptionValue(opt) || opt.getAttribute?.('value') || '';
+    if (!text && !value) return;
+    if (isPlaceholderText(text) && !value) return;
+    out.push({ el: opt, text, value, index: idx });
+  });
+  return out;
+}
+
+function pickBestCandidate(candidates, targets) {
+  let best = { candidate: null, score: 0 };
+  candidates.forEach(c => {
+    const score = computeOptionMatchScore(c.text, c.value, targets);
+    if (score > best.score) best = { candidate: c, score };
+  });
+  return best;
+}
+
+function getDropdownMatchThreshold(decoded, meta) {
+  const sameList = decoded?.fingerprint && meta?.fingerprint && decoded.fingerprint === meta.fingerprint;
+  return sameList ? 0.7 : 0.92;
+}
+
+function trySelectCandidate(selectEl, candidate) {
+  if (!selectEl || !candidate) return false;
+  selectEl.selectedIndex = candidate.index;
+  triggerEvents(selectEl);
+  return true;
+}
+
+function fillSelectSafely(selectEl, decoded, fieldKey, unresolvedDropdowns) {
+  const meta = getDropdownMeta(selectEl);
+  const targets = [decoded.text, decoded.value].filter(Boolean);
+  if (!targets.length || isPlaceholderText(targets[0])) return false;
+  const candidates = buildSelectCandidates(selectEl);
+  if (!candidates.length) return false;
+
+  // Boolean match (Yes/No)
+  for (const c of candidates) {
+    if (resolveBooleanOption(targets[0], c.text, c.value)) {
+      trySelectCandidate(selectEl, c);
+      return true;
+    }
+  }
+
+  const sameList = decoded.fingerprint && meta?.fingerprint && decoded.fingerprint === meta.fingerprint;
+  if (sameList && typeof decoded.selectedIndex === 'number') {
+    const byIndex = candidates.find(c => c.index === decoded.selectedIndex);
+    if (byIndex && computeOptionMatchScore(byIndex.text, byIndex.value, targets) >= 0.7) {
+      trySelectCandidate(selectEl, byIndex);
+      return true;
+    }
+  }
+
+  // Exact or high-confidence match
+  for (const c of candidates) {
+    if (computeOptionMatchScore(c.text, c.value, targets) >= 1) {
+      trySelectCandidate(selectEl, c);
+      return true;
+    }
+  }
+
+  const best = pickBestCandidate(candidates, targets);
+  const minScore = getDropdownMatchThreshold(decoded, meta);
+  if (best.candidate && best.score >= minScore) {
+    trySelectCandidate(selectEl, best.candidate);
+    return true;
+  }
+
+  if (unresolvedDropdowns) {
+    unresolvedDropdowns.push({ el: selectEl, key: fieldKey, desired: targets[0], type: 'select' });
+  }
+  return false;
+}
+
+function fillListboxSafely(listboxEl, decoded, fieldKey, unresolvedDropdowns) {
+  const meta = getDropdownMeta(listboxEl);
+  const raw = decoded.text || decoded.value || '';
+  const targets = [decoded.text, decoded.value].filter(Boolean);
+  if (!targets.length || isPlaceholderText(targets[0])) return false;
+  const candidates = buildListboxCandidates(listboxEl);
+  if (!candidates.length) return false;
+  const minScore = getDropdownMatchThreshold(decoded, meta);
+
+  // Multi-select values split by comma
+  const desiredVals = String(raw).split(',').map(v => v.trim()).filter(Boolean);
+  let matchedAny = false;
+  for (const desired of desiredVals) {
+    const best = pickBestCandidate(candidates, [desired]);
+    if (best.candidate && best.score >= minScore) {
+      if (best.candidate.el?.getAttribute('aria-selected') !== 'true') {
+        best.candidate.el?.click?.();
+      }
+      matchedAny = true;
+    }
+  }
+
+  if (!matchedAny && unresolvedDropdowns) {
+    unresolvedDropdowns.push({ el: listboxEl, key: fieldKey, desired: raw, type: 'listbox' });
+  }
+  return matchedAny;
+}
+
 function fillFields(savedFields, opts = {}) {
+  if (isSiteDisabled()) return;
   const skipObserver = !!opts.skipObserver;
   if (DEBUG_AUTOFILL && !skipObserver) {
     console.group('[FormPilot DEBUG] fillFields() called');
@@ -1885,6 +2709,13 @@ function fillFields(savedFields, opts = {}) {
     const key = mapped.key || getFieldKey(el) || el.name;
     if (!key) return;
     let val = savedFields[key];
+    if (val !== undefined && val !== null) {
+      const decodedTemp = decodeSelectValue(val);
+      const rawTemp = decodedTemp?.text || decodedTemp?.value || val;
+      if (typeof rawTemp === 'string' && (!rawTemp.trim() || isPlaceholderText(rawTemp))) {
+        val = undefined;
+      }
+    }
     if (val === undefined) val = getGlobalMatch(key);
     if (val === undefined || val === null) return;
     stats.matched += 1;
@@ -1926,9 +2757,23 @@ function fillFields(savedFields, opts = {}) {
     const isDuplicate = keyCounts[key] > 1;
     keyIndex[key] = (keyIndex[key] || 0);
     const fieldKey = isDuplicate ? `${key}[${keyIndex[key]++}]` : key;
+    const role = el.getAttribute?.('role') || '';
+    const hasPopupListbox = el.getAttribute?.('aria-haspopup') === 'listbox';
     let val = savedFields[fieldKey];
     let source = 'site';
     let globalMeta = null;
+    if (val === undefined) {
+      globalMeta = getGlobalMatchMeta(fieldKey);
+      val = globalMeta?.value;
+      source = 'global';
+    }
+    if (val !== undefined && val !== null) {
+      const decodedTemp = decodeSelectValue(val);
+      const rawTemp = decodedTemp?.text || decodedTemp?.value || val;
+      if (typeof rawTemp === 'string' && (!rawTemp.trim() || isPlaceholderText(rawTemp))) {
+        val = undefined;
+      }
+    }
     if (val === undefined) {
       globalMeta = getGlobalMatchMeta(fieldKey);
       val = globalMeta?.value;
@@ -1947,6 +2792,7 @@ function fillFields(savedFields, opts = {}) {
     const decoded = decodeSelectValue(val);
     const primaryVal = decoded.text || val;
     const altVal = decoded.value || primaryVal;
+    const mapped = resolveMappedKey(el);
     const confidence = classifyConfidence({ mapped, source, globalMeta });
     const canFill = shouldFillValue(el, fieldKey, primaryVal);
 
@@ -1959,6 +2805,20 @@ function fillFields(savedFields, opts = {}) {
     if (!shouldAutofillConfidence(confidence)) {
       if (confidence === 'mid') {
         queueApproval({ el, fieldKey, val: primaryVal, altVal });
+      }
+      return;
+    }
+
+    if (el.tagName === 'INPUT' && (role === 'combobox' || hasPopupListbox)) {
+      // Defer combobox inputs to the combobox handler for safer selection
+      return;
+    }
+
+    if (el.tagName === 'SELECT') {
+      const filledSelect = fillSelectSafely(el, decoded, fieldKey, unresolvedDropdowns);
+      if (filledSelect) {
+        stats.filled += 1;
+        attachCorrectionTracker(el, fieldKey, primaryVal);
       }
       return;
     }
@@ -1977,22 +2837,6 @@ function fillFields(savedFields, opts = {}) {
       stats.filled += 1;
       // Attach correction tracker so AI can learn from user edits
       attachCorrectionTracker(el, fieldKey, valueCandidates[0]);
-    } else if (el.tagName === 'SELECT') {
-      // Try boolean resolution for Yes/No selects
-      let boolFilled = false;
-      for (let i = 0; i < el.options.length; i++) {
-        const opt = el.options[i];
-        if (resolveBooleanOption(primaryVal, opt.text, opt.value)) {
-          el.selectedIndex = i;
-          triggerEvents(el);
-          stats.filled += 1;
-          boolFilled = true;
-          break;
-        }
-      }
-      if (!boolFilled) {
-        unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'select' });
-      }
     }
   });
 
@@ -2003,7 +2847,6 @@ function fillFields(savedFields, opts = {}) {
   try {
     const comboboxEls = [];
     collectElements('[role="combobox"], [aria-haspopup="listbox"]').forEach(el => {
-      if (el.tagName === 'INPUT') return; // input comboboxes handled in main loop
       const mapped = resolveMappedKey(el);
       const key = mapped.key || getFieldKey(el);
       if (!key) return;
@@ -2028,6 +2871,18 @@ function fillFields(savedFields, opts = {}) {
           val = globalMeta?.value;
           source = 'global';
         }
+        if (val !== undefined && val !== null) {
+          const decodedTemp = decodeSelectValue(val);
+          const rawTemp = decodedTemp?.text || decodedTemp?.value || val;
+          if (typeof rawTemp === 'string' && (!rawTemp.trim() || isPlaceholderText(rawTemp))) {
+            val = undefined;
+          }
+        }
+        if (val === undefined) {
+          globalMeta = getGlobalMatchMeta(fieldKey);
+          val = globalMeta?.value;
+          source = 'global';
+        }
         if (val === undefined || val === null) continue;
         stats.matched += 1;
         const decoded = decodeSelectValue(val);
@@ -2044,22 +2899,29 @@ function fillFields(savedFields, opts = {}) {
           console.log(`[FP DEBUG] combobox="${fieldKey}" trying to fill="${primaryVal}"`);
         }
 
+        const meta = getDropdownMeta(el);
+        const minScore = getDropdownMatchThreshold(decoded, meta);
+
         // First try: if it has an input child, fill that (search-style comboboxes)
         const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
         if (inputChild) {
+          const originalVal = inputChild.value;
           universalFillText(inputChild, primaryVal);
           await new Promise(r => setTimeout(r, 80));
           const root = getRootNodeFor(el);
           const optionSets = [root, document].filter((r, idx, arr) => r && arr.indexOf(r) === idx);
           let found = false;
           for (const r of optionSets) {
-            if (selectBestOption([primaryVal, altVal], r)) { stats.filled += 1; found = true; break; }
+            if (selectBestOption([primaryVal, altVal], r, minScore)) { stats.filled += 1; found = true; break; }
           }
           if (found) continue;
+          // Revert if we didn't pick a valid option
+          setNativeValue(inputChild, originalVal);
+          triggerEvents(inputChild);
         }
 
         // Second try: click-based (Radix UI / portal-based dropdowns)
-        const filled = await fillRadixCombobox(el, primaryVal);
+        const filled = await fillRadixCombobox(el, [primaryVal, altVal], minScore);
         if (filled) {
           stats.filled += 1;
         } else {
@@ -2088,6 +2950,18 @@ function fillFields(savedFields, opts = {}) {
       val = globalMeta?.value;
       source = 'global';
     }
+    if (val !== undefined && val !== null) {
+      const decodedTemp = decodeSelectValue(val);
+      const rawTemp = decodedTemp?.text || decodedTemp?.value || val;
+      if (typeof rawTemp === 'string' && (!rawTemp.trim() || isPlaceholderText(rawTemp))) {
+        val = undefined;
+      }
+    }
+    if (val === undefined) {
+      globalMeta = getGlobalMatchMeta(key);
+      val = globalMeta?.value;
+      source = 'global';
+    }
     if (val === undefined || val === null) return;
     stats.matched += 1;
     const decoded = decodeSelectValue(val);
@@ -2100,21 +2974,8 @@ function fillFields(savedFields, opts = {}) {
       }
       return;
     }
-    const vals = String(raw).split(',').map(v => v.toLowerCase().trim()).filter(Boolean);
-    const altVals = String(alt).split(',').map(v => v.toLowerCase().trim()).filter(Boolean);
-    let matched = false;
-    listbox.querySelectorAll('[role="option"]').forEach(opt => {
-      const optValRaw = opt.getAttribute('data-value') || opt.getAttribute('value') || opt.innerText?.trim() || '';
-      const optVal = optValRaw.toLowerCase().trim();
-      if ((vals.includes(optVal) || altVals.includes(optVal)) && opt.getAttribute('aria-selected') !== 'true') {
-        opt.click();
-        stats.filled += 1;
-        matched = true;
-      }
-    });
-    if (!matched) {
-      unresolvedDropdowns.push({ el: listbox, key, desired: raw, type: 'listbox' });
-    }
+    const matched = fillListboxSafely(listbox, decoded, key, unresolvedDropdowns);
+    if (matched) stats.filled += 1;
   });
 
   // ── MutationObserver: fill fields added dynamically (conditional logic, "+ Add job") ──
@@ -2144,6 +3005,21 @@ function fillFields(savedFields, opts = {}) {
     if (approvalQueue.length > 0) {
       showApprovalBanner();
     }
+    updateDebugInfo({
+      stats: {
+        detected: stats.detected,
+        matched: stats.matched,
+        filled: stats.filled,
+        unresolvedDropdowns: unresolvedDropdowns.length,
+      },
+      jobContext: {
+        status: jobContextState?.status || 'unknown',
+        jobScore: jobContextState?.jobScore || 0,
+        formScore: jobContextState?.formScore || 0,
+        loginScore: jobContextState?.loginScore || 0,
+        signature: jobContextState?.signature || '',
+      },
+    });
   }
 }
 
@@ -2179,7 +3055,7 @@ function attachLiveCapture() {
   if (window._jaLiveCaptureAttached) return;
   window._jaLiveCaptureAttached = true;
   const handler = (e) => {
-    if (getSiteFlag('neverPrompt')) return;
+    if (isSiteDisabled()) return;
     if (!isJobContextPage()) return;
     let el = e.target;
     if (!el) return;
@@ -2577,21 +3453,43 @@ function findVisibleOptions() {
   return options.filter(isVisibleElement);
 }
 
-function selectBestOption(targets, container) {
+function computeOptionMatchScore(optText, optValue, targets) {
+  const tText = (optText || '').toString();
+  const tVal = (optValue || '').toString();
+  const optNorm = normalizeOptionText(tText);
+  const optValNorm = normalizeOptionText(tVal);
+  let best = 0;
+  (targets || []).forEach(t => {
+    const targetNorm = normalizeOptionText(t);
+    if (!targetNorm) return;
+    if ((optNorm && optNorm === targetNorm) || (optValNorm && optValNorm === targetNorm)) {
+      best = Math.max(best, 1);
+      return;
+    }
+    if (
+      (optNorm && (optNorm.includes(targetNorm) || targetNorm.includes(optNorm))) ||
+      (optValNorm && (optValNorm.includes(targetNorm) || targetNorm.includes(optValNorm)))
+    ) {
+      best = Math.max(best, 0.85);
+    }
+    const fuzzy = scoreStringMatch(optNorm, targetNorm);
+    if (fuzzy) best = Math.max(best, Math.min(0.6, fuzzy * 0.7));
+  });
+  return best;
+}
+
+function selectBestOption(targets, container, minScore = 0.9) {
   const options = container ? Array.from(container.querySelectorAll('[role="option"]')) : findVisibleOptions();
   if (!options.length) return false;
   let best = { el: null, score: 0 };
   for (const opt of options) {
     const text = getOptionText(opt);
     const value = getOptionValue(opt);
-    let score = 0;
-    targets.forEach(t => {
-      score = Math.max(score, scoreStringMatch(text, t) * 3);
-      score = Math.max(score, scoreStringMatch(value, t) * 2);
-    });
+    if (isPlaceholderText(text) && !value) continue;
+    const score = computeOptionMatchScore(text, value, targets);
     if (score > best.score) best = { el: opt, score };
   }
-  if (best.el && best.score >= 1.2) {
+  if (best.el && best.score >= minScore) {
     best.el.click();
     return true;
   }
@@ -2599,6 +3497,7 @@ function selectBestOption(targets, container) {
 }
 
 function showResumeToast(message, isError = false) {
+  if (!shouldShowUi()) return;
   const existing = document.getElementById('ja-resume-toast');
   if (existing) existing.remove();
   const t = document.createElement('div');
@@ -2705,6 +3604,7 @@ function initResumeAttach() {
   ensureResumeAttachUI();
 
   document.addEventListener('focusin', (e) => {
+    if (isSiteDisabled()) return;
     const input = findFileInputFromTarget(e.target);
     if (!input) return;
     lastFileInput = input;
@@ -2712,6 +3612,7 @@ function initResumeAttach() {
   }, true);
 
   document.addEventListener('click', (e) => {
+    if (isSiteDisabled()) return;
     const input = findFileInputFromTarget(e.target);
     if (!input) return;
     lastFileInput = input;
@@ -2719,6 +3620,10 @@ function initResumeAttach() {
   }, true);
 
   const obs = new MutationObserver(() => {
+    if (isSiteDisabled()) {
+      hideResumeAttach();
+      return;
+    }
     const first = getFirstFileInput();
     if (!first && lastFileInput) {
       lastFileInput = null;
@@ -2761,8 +3666,8 @@ function attachTeachHover() {
   teachHoverAttached = true;
   const onHover = (e) => {
     if (!teachMode) return;
-    const el = e.target;
-    if (!isTeachTarget(el) || isSensitiveField(el)) {
+    const el = resolveTeachTarget(e.target);
+    if (!el || !isTeachTarget(el) || isSensitiveField(el)) {
       hideTeachHover();
       return;
     }
@@ -2770,7 +3675,8 @@ function attachTeachHover() {
   };
   const onLeave = (e) => {
     if (!teachMode) return;
-    if (!e.relatedTarget || !isTeachTarget(e.relatedTarget)) hideTeachHover();
+    const rel = resolveTeachTarget(e.relatedTarget);
+    if (!rel || !isTeachTarget(rel)) hideTeachHover();
   };
   document.addEventListener('mouseover', onHover, true);
   document.addEventListener('mouseout', onLeave, true);
@@ -2788,6 +3694,7 @@ function detachTeachHover() {
 
 function showTeachHover(el) {
   if (!el) return;
+  if (!shouldShowUi()) return;
   let hover = document.getElementById('ja-teach-hover');
   if (!hover) {
     hover = document.createElement('div');
@@ -2814,8 +3721,40 @@ function hideTeachHover() {
   if (hover) hover.style.display = 'none';
 }
 
+function resolveTeachTarget(startEl) {
+  if (!startEl) return null;
+  // Ignore clicks inside extension UI
+  if (startEl.closest?.('#ja-teach-overlay, #ja-teach-banner, #ja-dropdown-resolver, #ja-approval-banner, #ja-coverage-banner, #ja-review-panel, #ja-job-context-prompt, #ja-resume-attach, #ja-debug-overlay')) {
+    return null;
+  }
+  // If clicking on an option, map to its parent control
+  const optEl = startEl.closest?.('[role="option"], option');
+  if (optEl) {
+    const select = optEl.closest?.('select');
+    if (select) return select;
+    const listbox = optEl.closest?.('[role="listbox"]');
+    if (listbox) return listbox;
+    const combo = optEl.closest?.('[role="combobox"], [aria-haspopup="listbox"]');
+    if (combo) return combo;
+  }
+  // Walk up to nearest teachable control
+  const direct = startEl.closest?.('input, textarea, select, [role="combobox"], [role="listbox"], [role="textbox"], [contenteditable="true"], [aria-haspopup="listbox"]');
+  if (direct) return direct;
+  // Fallback to the original element if it's teachable
+  if (isTeachTarget(startEl)) return startEl;
+  return null;
+}
+
+function isEmptySelectableValue(value) {
+  if (!value) return true;
+  const decoded = decodeSelectValue(String(value));
+  const text = (decoded.text || decoded.value || '').toString().trim();
+  return isPlaceholderText(text);
+}
+
 function startTeachMode() {
   if (teachMode) return;
+  if (!shouldShowUi()) return;
   teachMode = true;
   showTeachBanner();
   attachTeachHover();
@@ -2847,14 +3786,14 @@ function handleTeachKeydown(e) {
 
 function handleTeachClick(e) {
   if (!teachMode) return;
-  const el = e.target;
+  const el = resolveTeachTarget(e.target);
   if (!el) return;
   if (!isTeachTarget(el)) return;
   if (isSensitiveField(el)) return;
   e.preventDefault();
   e.stopPropagation();
 
-  const label = cleanLabelText(getFieldKey(el) || el.getAttribute('aria-label') || el.placeholder || 'Field');
+  const label = cleanLabelText(getFieldKey(el) || getSiteLabel(el) || el.getAttribute('aria-label') || el.placeholder || 'Field');
   const signature = getFieldSignature(el);
   const type = (el.type || el.tagName || '').toLowerCase();
   const value = getStoredValue(el);
@@ -2863,6 +3802,7 @@ function handleTeachClick(e) {
 
 function showTeachBanner() {
   if (document.getElementById('ja-teach-banner')) return;
+  if (!shouldShowUi()) return;
   const banner = document.createElement('div');
   banner.id = 'ja-teach-banner';
   banner.innerHTML = `
@@ -2892,6 +3832,7 @@ function removeTeachOverlay() {
 }
 
 function showTeachOverlay({ el, label, signature, type, value }) {
+  if (!shouldShowUi()) return;
   removeTeachOverlay();
   const overlay = document.createElement('div');
   overlay.id = 'ja-teach-overlay';
@@ -2977,7 +3918,7 @@ function showTeachOverlay({ el, label, signature, type, value }) {
       else currentSiteMappings.push(mapping);
       siteData.mappings = currentSiteMappings;
     }
-    if (value) {
+    if (value && !isEmptySelectableValue(value)) {
       const payload = { [mappedKey]: value };
       await chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields: payload });
       await chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields: payload });
@@ -2988,6 +3929,7 @@ function showTeachOverlay({ el, label, signature, type, value }) {
 }
 
 function showSaveToast(message) {
+  if (!shouldShowUi()) return;
   const existing = document.getElementById('ja-teach-toast');
   if (existing) existing.remove();
   const t = document.createElement('div');
@@ -3023,7 +3965,9 @@ function attachDropdownResolveListener() {
     if (!opt) return;
     const text = getOptionText(opt) || opt.textContent || '';
     const value = getOptionValue(opt) || opt.value || text;
-    const encoded = encodeSelectValue(text, value);
+    const host = opt.closest?.('select, [role="listbox"], [role="combobox"]') || opt;
+    const meta = getDropdownMeta(host);
+    const encoded = encodeSelectValue(text, value, meta);
     saveFieldValue(pendingDropdownResolve.key, encoded);
     showSaveToast('Saved dropdown choice');
     pendingDropdownResolve = null;
@@ -3034,7 +3978,8 @@ function attachDropdownResolveListener() {
     if (!el || el.tagName !== 'SELECT') return;
     const text = el.selectedOptions?.[0]?.text || el.value || '';
     const value = el.value || text;
-    const encoded = encodeSelectValue(text, value);
+    const meta = getDropdownMeta(el);
+    const encoded = encodeSelectValue(text, value, meta);
     saveFieldValue(pendingDropdownResolve.key, encoded);
     showSaveToast('Saved dropdown choice');
     pendingDropdownResolve = null;
@@ -3043,6 +3988,7 @@ function attachDropdownResolveListener() {
 
 function showDropdownResolver(unresolved) {
   if (!unresolved || unresolved.length === 0) return;
+  if (!shouldShowUi()) return;
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobContextPage()) return;
   if (dropdownResolverOpen) return;
@@ -3139,7 +4085,8 @@ function showDropdownResolver(unresolved) {
         triggerEvents(original);
       }
       const text = sel.selectedOptions?.[0]?.text || value;
-      saveFieldValue(entry.key, encodeSelectValue(text, value));
+      const meta = getDropdownMeta(original || entry.el);
+      saveFieldValue(entry.key, encodeSelectValue(text, value, meta));
       showSaveToast('Dropdown saved');
       sel.closest('.ja-dd-row')?.remove();
       cleanupResolver();
@@ -3199,6 +4146,7 @@ function getFormCompletionStats() {
 
 function showReviewPanel() {
   if (document.getElementById('ja-review-panel')) return;
+  if (!shouldShowUi()) return;
   if (!isJobContextPage()) return;
   const stats = getFormCompletionStats();
   if (stats.total < 4) return;
@@ -3252,6 +4200,7 @@ function showReviewPanel() {
 
 function showConfidenceOverlay(savedFields) {
   if (document.getElementById('ja-confidence-layer')) return;
+  if (!shouldShowUi()) return;
   if (getSessionFlag('confidenceDismissed')) return;
   if (!isJobContextPage()) return;
   if (getSiteFlag('neverPrompt')) return;
@@ -3367,6 +4316,7 @@ function showConfidenceOverlay(savedFields) {
 function showCoverageBanner(stats) {
   if (!stats) return;
   if (document.getElementById('ja-coverage-banner')) return;
+  if (!shouldShowUi()) return;
   if (getSessionFlag('coverageDismissed')) return;
   const detected = stats.detected || 0;
   const matched = stats.matched || 0;
@@ -3491,6 +4441,7 @@ function fillStandardFields(savedFields) {
 // ── Banner UI ──────────────────────────────────────────────────
 function showAutofillBanner(savedFields) {
   if (document.getElementById('ja-banner')) return;
+  if (!shouldShowUi()) return;
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobContextPage()) return;
   if (!hasFillableFields()) return;
@@ -3579,6 +4530,7 @@ function showAutofillBanner(savedFields) {
 // ── Save Data Prompt ──────────────────────────────────────────
 function showSaveDataBanner(fields) {
   if (document.getElementById('ja-save-banner')) return;
+  if (!shouldShowUi()) return;
   if (getSessionFlag('promptSkipped')) return;
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobContextPage()) return;
@@ -3673,8 +4625,8 @@ function attachRecorder() {
     if (submissionDebounceTimer) return; // already handling this click
     submissionDebounceTimer = setTimeout(() => { submissionDebounceTimer = null; }, 600);
 
-    if (getSiteFlag('neverPrompt')) {
-      console.log('[FormPilot] Site prompts disabled. Skipping auto-capture.');
+    if (isSiteDisabled()) {
+      console.log('[FormPilot] Site disabled. Skipping auto-capture.');
       return;
     }
     if (!isJobContextPage()) {
@@ -3727,6 +4679,7 @@ function attachRecorder() {
 
   // Use mousedown instead of click to beat event.stopPropagation() from modern frameworks
   document.addEventListener('mousedown', (e) => {
+    if (isSiteDisabled()) return;
     let el = e.target;
     let isSubmit = false;
     let stage = 'unknown';
@@ -3780,6 +4733,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'MANUAL_SAVE') {
     try {
+      if (isSiteDisabled()) {
+        sendResponse({ ok: false, error: 'Site disabled' });
+        return true;
+      }
+      if (!isJobContextPage()) {
+        sendResponse({ ok: false, error: 'Not a job form' });
+        return true;
+      }
       const fields = getFormFields();
       const count = Object.keys(fields).length;
       if (count > 0) {
@@ -3810,6 +4771,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         siteData = site;
         siteFlags = site.flags || {};
         currentSiteActive = !(site?.disabled || site?.enabled === false);
+        if (isSiteDisabled()) {
+          sendResponse({ ok: false, error: 'Site disabled' });
+          return;
+        }
+        if (!isJobContextPage()) {
+          sendResponse({ ok: false, error: 'Not a job form' });
+          return;
+        }
         const merged = { ...(site.fields || {}), ...(sessionResp?.fields || {}) };
 
         console.group('[FormPilot DEBUG] MANUAL_AUTOFILL triggered');
@@ -3839,6 +4808,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'TEACH_MODE_START') {
+    if (isSiteDisabled()) {
+      sendResponse({ ok: false, error: 'Site disabled' });
+      return true;
+    }
+    if (!isJobContextPage()) {
+      sendResponse({ ok: false, error: 'Not a job form' });
+      return true;
+    }
     startTeachMode();
     sendResponse({ ok: true });
     return true;
@@ -3847,6 +4824,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'TEACH_MODE_STOP') {
     stopTeachMode();
     sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'SITE_SETTINGS_UPDATE') {
+    try {
+      if (msg.flags && typeof msg.flags === 'object') {
+        siteFlags = { ...(siteFlags || {}), ...msg.flags };
+        siteData.flags = { ...(siteData.flags || {}), ...msg.flags };
+        if (siteFlags.neverPrompt) {
+          currentSiteActive = false;
+          suppressSiteUi();
+        }
+      }
+      if (typeof msg.enabled === 'boolean') {
+        siteData.enabled = msg.enabled;
+        siteData.disabled = !msg.enabled;
+        currentSiteActive = msg.enabled;
+        if (!msg.enabled) {
+          suppressSiteUi();
+        } else {
+          debouncedInit();
+        }
+      }
+      sendResponse({ ok: true });
+    } catch (err) {
+      sendResponse({ ok: false });
+    }
     return true;
   }
 
@@ -3880,6 +4884,7 @@ function isExtensionValid() {
 let isAiMappingRunning = false;
 async function triggerAiMapping(elementsToMap) {
   if (isAiMappingRunning) return;
+  if (isSiteDisabled()) return;
   const unmappedLabels = [];
   const elMap = new Map();
   elementsToMap.forEach(el => {
@@ -3972,12 +4977,21 @@ async function init() {
     currentSiteActive = !(site?.disabled || site?.enabled === false);
     if (!currentSiteActive) {
       console.log(`[FormPilot] Extension inactive for ${hostname} (Disabled: ${!!site?.disabled}, Enabled: ${site?.enabled})`);
+      suppressSiteUi();
       return;
     }
 
-    // Relaxed job context restriction: allow autofill on any form like before.
-    const jobContextOk = true; // Was: isJobContextPage();
-    const allowAuto = !getSiteFlag('neverPrompt');
+    const jobContextOk = isJobContextPage();
+    const allowAuto = !getSiteFlag('neverPrompt') && jobContextOk;
+    if (!jobContextOk) {
+      removeUiOverlays();
+      setTimeout(() => {
+        if (!isExtensionValid()) return;
+        if (!currentSiteActive) return;
+        if (isJobContextPage()) return;
+        showJobContextPrompt();
+      }, 1200);
+    }
 
     // Only attach recorders on tracked contexts or if allowed
     if (allowAuto) {
@@ -3990,6 +5004,30 @@ async function init() {
 
     const savedCount = Object.keys(mergedFields || {}).length;
     const globalCount = Object.keys(currentGlobalProfile || {}).length;
+    const siteFieldCount = Object.keys(site?.fields || {}).length;
+    const sessionFieldCount = Object.keys(sessionFields || {}).length;
+
+    updateDebugInfo({
+      site: {
+        hostname,
+        active: currentSiteActive,
+        neverPrompt: !!getSiteFlag('neverPrompt'),
+        jobContextOk,
+        allowAuto,
+      },
+      counts: {
+        siteFields: siteFieldCount,
+        sessionFields: sessionFieldCount,
+        global: globalCount,
+      },
+      jobContext: {
+        status: jobContextState?.status || 'unknown',
+        jobScore: jobContextState?.jobScore || 0,
+        formScore: jobContextState?.formScore || 0,
+        loginScore: jobContextState?.loginScore || 0,
+        signature: jobContextState?.signature || '',
+      },
+    });
 
     // ── DIAGNOSTIC LOG (remove when working) ─────────────────────
     console.group('[FormPilot] INIT SUMMARY');
@@ -3999,7 +5037,7 @@ async function init() {
     console.log('  session.fields count:', Object.keys(sessionFields).length, Object.keys(sessionFields));
     console.log('  globalProfile count:', globalCount, Object.keys(currentGlobalProfile));
     console.log('  merged fields:', savedCount, Object.keys(mergedFields));
-    console.log('  allowAuto:', allowAuto, '| currentSiteActive:', currentSiteActive);
+    console.log('  allowAuto:', allowAuto, '| jobContextOk:', jobContextOk, '| currentSiteActive:', currentSiteActive);
     if (savedCount === 0 && globalCount === 0) {
       console.warn('  ⚠️ NO DATA to autofill! Fill the form manually first, then click SAVE in the popup.');
       console.warn('  ⚠️ OR upload your resume in Dashboard to populate global profile.');

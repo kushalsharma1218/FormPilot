@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Workday-like Application</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; background: #f7f7fb; }
+      .card { background: #fff; padding: 20px; border-radius: 10px; max-width: 900px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+      label { display: block; font-weight: 600; margin: 12px 0 6px; }
+      input, textarea { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #ccc; }
+    </style>
+  </head>
+  <body>
+    <div class="card" data-automation-id="applyFlowPage">
+      <h1 data-automation-id="jobTitle">Software Engineer</h1>
+      <label data-automation-id="questionText">First Name</label>
+      <input data-automation-id="firstName" />
+      <label data-automation-id="questionText">Last Name</label>
+      <input data-automation-id="lastName" />
+      <label data-automation-id="questionText">Email</label>
+      <input data-automation-id="email" type="email" />
+      <label data-automation-id="questionText">LinkedIn</label>
+      <input data-automation-id="linkedin" />
+      <label data-automation-id="questionText">Summary</label>
+      <textarea data-automation-id="summary" rows="3"></textarea>
+    </div>
+  </body>
+</html>

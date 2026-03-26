@@ -2,13 +2,23 @@
 // Uses Firebase Auth REST API + Firestore REST API (no SDK needed)
 
 // ── Firebase Config ────────────────────────────────────────────
-// Default Firebase project details (safe to ship; security enforced by rules).
-// Users can still override via dashboard if needed.
+// No default config is shipped. If cloud sync is enabled, config must be
+// provisioned by the extension owner (not exposed in the UI).
 const FIREBASE_CONFIG = {
-  apiKey: 'AIzaSyD1WbE-p4tqcKofQAvs7WKbJjfsNNy_A5o',
-  projectId: 'job-auto-fill-290ca',
-  authDomain: 'job-auto-fill-290ca.firebaseapp.com',
+  apiKey: '',
+  projectId: '',
+  authDomain: '',
 };
+const PRIVATE_CONFIG = (globalThis && globalThis.PRIVATE_FIREBASE_CONFIG) || null;
+const HAS_PRIVATE_CONFIG = !!(PRIVATE_CONFIG && (PRIVATE_CONFIG.apiKey || PRIVATE_CONFIG.projectId));
+
+function applyPrivateConfig() {
+  if (!HAS_PRIVATE_CONFIG) return;
+  FIREBASE_CONFIG.apiKey = (PRIVATE_CONFIG.apiKey || '').trim();
+  FIREBASE_CONFIG.projectId = (PRIVATE_CONFIG.projectId || '').trim();
+  const fallbackDomain = FIREBASE_CONFIG.projectId ? `${FIREBASE_CONFIG.projectId}.firebaseapp.com` : '';
+  FIREBASE_CONFIG.authDomain = (PRIVATE_CONFIG.authDomain || fallbackDomain || '').trim();
+}
 
 const CloudAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {};
 const FirestoreUtils = (globalThis.JobAutofill && JobAutofill.FirestoreUtils) || null;
@@ -84,11 +94,15 @@ function setFirebaseConfig(config) {
 }
 
 async function ensureFirebaseConfigLoaded() {
+  if (HAS_PRIVATE_CONFIG) {
+    applyPrivateConfig();
+    return { apiKey: FIREBASE_CONFIG.apiKey, projectId: FIREBASE_CONFIG.projectId, authDomain: FIREBASE_CONFIG.authDomain };
+  }
   if (configLoadPromise) return configLoadPromise;
   configLoadPromise = chrome.storage.local.get(CLOUD_CONFIG_KEY)
     .then((result) => {
       const stored = result[CLOUD_CONFIG_KEY] || {};
-      // If user saved empty values previously, fall back to baked defaults.
+      // If user saved empty values previously, keep them empty.
       const merged = {
         apiKey: (stored.apiKey || FIREBASE_CONFIG.apiKey || '').trim(),
         projectId: (stored.projectId || FIREBASE_CONFIG.projectId || '').trim(),
@@ -110,6 +124,10 @@ async function getCloudConfig() {
 }
 
 async function saveCloudConfig(config) {
+  if (HAS_PRIVATE_CONFIG) {
+    applyPrivateConfig();
+    return { apiKey: FIREBASE_CONFIG.apiKey, projectId: FIREBASE_CONFIG.projectId, authDomain: FIREBASE_CONFIG.authDomain };
+  }
   const normalized = {
     apiKey: (config?.apiKey || '').trim(),
     projectId: (config?.projectId || '').trim(),
@@ -191,7 +209,7 @@ async function getValidToken() {
 // ── Authentication ─────────────────────────────────────────────
 async function cloudSignUp(email, password, displayName) {
   await ensureFirebaseConfigLoaded();
-  if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
+  if (!isCloudConfigured()) throw new Error('Cloud sync not configured.');
 
   const resp = await fetch(authUrl('signUp'), {
     method: 'POST',
@@ -235,7 +253,7 @@ async function cloudSignUp(email, password, displayName) {
 
 async function cloudSignIn(email, password) {
   await ensureFirebaseConfigLoaded();
-  if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
+  if (!isCloudConfigured()) throw new Error('Cloud sync not configured.');
 
   const resp = await fetch(authUrl('signInWithPassword'), {
     method: 'POST',
@@ -280,7 +298,7 @@ async function cloudSignIn(email, password) {
 
 async function cloudSignInWithGoogle(googleAccessToken) {
   await ensureFirebaseConfigLoaded();
-  if (!isCloudConfigured()) throw new Error('Cloud sync not configured. Add Firebase config first.');
+  if (!isCloudConfigured()) throw new Error('Cloud sync not configured.');
 
   const extensionId = chrome.runtime.id;
   const requestUri = `https://${extensionId}.chromiumapp.org/`;
@@ -410,10 +428,11 @@ async function pushAllToCloud(prefs = {}) {
   const syncAutofill = !!prefs.syncAutofill;
   const syncApplications = !!prefs.syncApplications;
   const syncAiSettings = !!prefs.syncAiSettings;
+  const syncResumes = prefs.syncResumes !== false;
 
   // Gather all local data using partitioned keys
   const tasks = [];
-  let autofillData, profile, aiSettings, applications;
+  let autofillData, profile, aiSettings, applications, resumes;
   if (syncAutofill) {
     tasks.push(
       chrome.storage.local.get(await getUserKey('autofill_data'))
@@ -438,6 +457,12 @@ async function pushAllToCloud(prefs = {}) {
         .then(r => { applications = r[Object.keys(r)[0]] || []; })
     );
   }
+  if (syncResumes) {
+    tasks.push(
+      chrome.storage.local.get(await getUserKey('resumes_data'))
+        .then(r => { resumes = r[Object.keys(r)[0]] || { items: [], defaultId: null }; })
+    );
+  }
   await Promise.all(tasks);
 
   // Push each section in parallel
@@ -445,13 +470,10 @@ async function pushAllToCloud(prefs = {}) {
   if (syncAutofill) pushTasks.push(pushDataToCloud('autofill', autofillData));
   if (syncProfile) pushTasks.push(pushDataToCloud('profile', profile));
   if (syncAiSettings) {
-    pushTasks.push(pushDataToCloud('ai_settings', {
-      ...aiSettings,
-      // Don't sync API keys for security — user must set them per device
-      apiKey: aiSettings.apiKey || '',
-    }));
+    pushTasks.push(pushDataToCloud('ai_settings', aiSettings || {}));
   }
   if (syncApplications) pushTasks.push(pushDataToCloud('applications', { list: applications }));
+  if (syncResumes) pushTasks.push(pushDataToCloud('resumes', resumes));
   if (pushTasks.length) await Promise.all(pushTasks);
 
   // Save sync metadata
@@ -474,13 +496,15 @@ async function pullAllFromCloud(prefs = {}) {
   const syncAutofill = !!prefs.syncAutofill;
   const syncApplications = !!prefs.syncApplications;
   const syncAiSettings = !!prefs.syncAiSettings;
+  const syncResumes = prefs.syncResumes !== false;
 
   const pullTasks = [];
-  let autofillData, profile, aiSettings, appData;
+  let autofillData, profile, aiSettings, appData, resumeData;
   if (syncAutofill) pullTasks.push(pullDataFromCloud('autofill').then(r => { autofillData = r; }));
   if (syncProfile) pullTasks.push(pullDataFromCloud('profile').then(r => { profile = r; }));
   if (syncAiSettings) pullTasks.push(pullDataFromCloud('ai_settings').then(r => { aiSettings = r; }));
   if (syncApplications) pullTasks.push(pullDataFromCloud('applications').then(r => { appData = r; }));
+  if (syncResumes) pullTasks.push(pullDataFromCloud('resumes').then(r => { resumeData = r; }));
   if (pullTasks.length) await Promise.all(pullTasks);
 
   // Fetch local keys
@@ -488,7 +512,8 @@ async function pullAllFromCloud(prefs = {}) {
     getUserKey('autofill_data'),
     getUserKey('global_profile_data'),
     getUserKey('ai_settings'),
-    getUserKey('applications_data')
+    getUserKey('applications_data'),
+    getUserKey('resumes_data')
   ]);
 
   const localResult = await chrome.storage.local.get(storageKeys);
@@ -496,15 +521,14 @@ async function pullAllFromCloud(prefs = {}) {
 
   if (syncAutofill && autofillData) {
     const localAutofill = localResult[storageKeys[0]] || { sites: {}, hostnameMappings: {} };
-    // Deep merge: cloud sites + local sites (cloud data wins for fields, local disabled status prioritized if it exists)
+    // Deep merge: cloud sites + local sites (cloud wins for site props, fields merged)
     const mergedSites = { ...localAutofill.sites };
     for (const [hostname, site] of Object.entries(autofillData.sites || {})) {
       if (mergedSites[hostname]) {
         mergedSites[hostname] = {
           ...mergedSites[hostname],
           ...site,
-          // Preserve disabled status if local has it
-          disabled: mergedSites[hostname].disabled || site.disabled,
+          // Merge fields (cloud wins on key conflicts)
           fields: { ...mergedSites[hostname].fields, ...(site.fields || {}) },
         };
       } else {
@@ -527,11 +551,7 @@ async function pullAllFromCloud(prefs = {}) {
 
   if (syncAiSettings && aiSettings) {
     const localAi = localResult[storageKeys[2]] || {};
-    updates[storageKeys[2]] = {
-      ...localAi,
-      ...aiSettings,
-      apiKey: localAi.apiKey || aiSettings.apiKey || '',
-    };
+    updates[storageKeys[2]] = { ...localAi, ...aiSettings };
   }
 
   if (syncApplications && appData?.list) {
@@ -546,6 +566,22 @@ async function pullAllFromCloud(prefs = {}) {
       }
     }
     updates[storageKeys[3]] = mergedApps;
+  }
+
+  if (syncResumes && resumeData?.items) {
+    const localResumes = localResult[storageKeys[4]] || { items: [], defaultId: null };
+    const mergedById = new Map();
+    (localResumes.items || []).forEach(item => {
+      if (item?.id) mergedById.set(item.id, item);
+    });
+    (resumeData.items || []).forEach(item => {
+      if (item?.id) mergedById.set(item.id, { ...(mergedById.get(item.id) || {}), ...item });
+    });
+    const mergedItems = Array.from(mergedById.values());
+    updates[storageKeys[4]] = {
+      items: mergedItems,
+      defaultId: resumeData.defaultId || localResumes.defaultId || mergedItems[0]?.id || null,
+    };
   }
 
   if (Object.keys(updates).length > 0) {

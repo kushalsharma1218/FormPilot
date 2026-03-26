@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ARIA Heavy Job Form – Test</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "Product Designer",
+        "hiringOrganization": { "@type": "Organization", "name": "DemoOrg" },
+        "employmentType": "FULL_TIME",
+        "jobLocation": { "@type": "Place", "address": { "@type": "PostalAddress", "addressLocality": "Remote" } }
+      }
+    </script>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; background: #f8fafc; }
+      .card { background: #fff; padding: 20px 24px; border-radius: 12px; max-width: 900px; margin: 0 auto; box-shadow: 0 6px 18px rgba(0,0,0,0.06); }
+      label { font-size: 12px; color: #334155; display: block; margin-bottom: 6px; }
+      .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+      input { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #cbd5f5; font-size: 13px; }
+      .combobox { position: relative; }
+      .listbox { position: absolute; top: 36px; left: 0; right: 0; background: #fff; border: 1px solid #cbd5f5; border-radius: 8px; box-shadow: 0 6px 16px rgba(0,0,0,0.08); display: block; z-index: 2; }
+      .option { padding: 8px 10px; cursor: pointer; font-size: 13px; }
+      .option[aria-selected="true"] { background: #e0f2fe; }
+      .contenteditable { min-height: 90px; border: 1px dashed #cbd5f5; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>ARIA Heavy Job Form</h1>
+      <p class="note">Custom ARIA combobox/listbox, contenteditable textbox, and aria-labelledby mappings.</p>
+
+      <div class="row">
+        <div>
+          <span id="fn-label">First Name</span>
+          <input id="first-name" aria-labelledby="fn-label" />
+        </div>
+        <div>
+          <span id="ln-label">Last Name</span>
+          <input id="last-name" aria-labelledby="ln-label" />
+        </div>
+        <div>
+          <span id="email-label">Email</span>
+          <input id="email-input" type="email" aria-labelledby="email-label" />
+        </div>
+        <div>
+          <span id="phone-label">Phone</span>
+          <input id="phone-input" type="tel" aria-labelledby="phone-label" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 18px;">
+        <div class="combobox">
+          <label id="role-label">Preferred Role</label>
+          <div id="role-combobox" role="combobox" aria-haspopup="listbox" aria-labelledby="role-label">
+            <input id="role-input" aria-label="Preferred Role" />
+          </div>
+          <div id="role-listbox" class="listbox" role="listbox">
+            <div class="option" role="option" data-value="Frontend Engineer">Frontend Engineer</div>
+            <div class="option" role="option" data-value="Product Designer">Product Designer</div>
+            <div class="option" role="option" data-value="QA Engineer">QA Engineer</div>
+          </div>
+        </div>
+        <div>
+          <label id="country-label">Country</label>
+          <div id="country-listbox" role="listbox" aria-labelledby="country-label">
+            <div class="option" role="option" data-value="United States">United States</div>
+            <div class="option" role="option" data-value="Canada">Canada</div>
+            <div class="option" role="option" data-value="India">India</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 18px;">
+        <label id="skills-label">Skills (Multi-select)</label>
+        <div id="skills-listbox" role="listbox" aria-labelledby="skills-label" aria-multiselectable="true">
+          <div class="option" role="option" data-value="JavaScript">JavaScript</div>
+          <div class="option" role="option" data-value="React">React</div>
+          <div class="option" role="option" data-value="TypeScript">TypeScript</div>
+        </div>
+      </div>
+
+      <div style="margin-top: 18px;">
+        <label id="summary-label">Summary</label>
+        <div id="summary-box" class="contenteditable" role="textbox" aria-labelledby="summary-label" contenteditable="true"></div>
+      </div>
+    </div>
+
+    <script>
+      const bindListbox = (listbox, input) => {
+        listbox.addEventListener('click', (e) => {
+          const opt = e.target.closest('[role="option"]');
+          if (!opt) return;
+          const val = opt.getAttribute('data-value') || opt.textContent.trim();
+          if (input) input.value = val;
+          listbox.querySelectorAll('[role="option"]').forEach(o => o.setAttribute('aria-selected', 'false'));
+          opt.setAttribute('aria-selected', 'true');
+        });
+      };
+
+      const roleList = document.getElementById('role-listbox');
+      const roleInput = document.getElementById('role-input');
+      bindListbox(roleList, roleInput);
+
+      const countryList = document.getElementById('country-listbox');
+      bindListbox(countryList, null);
+
+      const skillsList = document.getElementById('skills-listbox');
+      skillsList.addEventListener('click', (e) => {
+        const opt = e.target.closest('[role="option"]');
+        if (!opt) return;
+        const selected = opt.getAttribute('aria-selected') === 'true';
+        opt.setAttribute('aria-selected', selected ? 'false' : 'true');
+      });
+    </script>
+  </body>
+</html>

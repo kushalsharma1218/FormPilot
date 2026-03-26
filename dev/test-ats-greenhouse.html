@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Greenhouse-like Application</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; background: #f7f7fb; }
+      .card { background: #fff; padding: 20px; border-radius: 10px; max-width: 900px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+      label { display: block; font-weight: 600; margin: 12px 0 6px; }
+      input, textarea { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #ccc; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1 class="posting-headline">Frontend Engineer</h1>
+      <label>First Name</label>
+      <input name="first_name" aria-label="First Name" />
+      <label>Last Name</label>
+      <input name="last_name" aria-label="Last Name" />
+      <label>Email</label>
+      <input name="email" type="email" aria-label="Email" />
+      <label>Phone</label>
+      <input name="phone" type="tel" aria-label="Phone" />
+      <label>LinkedIn</label>
+      <input name="linkedin" aria-label="LinkedIn" />
+      <label>Cover Letter</label>
+      <textarea name="cover_letter" rows="3"></textarea>
+      <label>Upload Resume</label>
+      <input type="file" />
+    </div>
+  </body>
+</html>

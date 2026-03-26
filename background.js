@@ -4,6 +4,11 @@ importScripts('lib/auth-store.js');
 importScripts('lib/ai-utils.js');
 importScripts('lib/firestore-utils.js');
 importScripts('ai-service.js');
+try {
+  importScripts('config.private.js');
+} catch (_) {
+  // Optional private Firebase config (not committed)
+}
 importScripts('cloud-sync.js');
 
 const STORAGE_KEY = 'autofill_data';
@@ -101,6 +106,11 @@ function computeQualityScore(stats) {
   return clampScore(score);
 }
 
+function isSiteDisabled(data, siteKey) {
+  const site = data?.sites?.[siteKey];
+  return !!(site?.disabled || site?.enabled === false);
+}
+
 // ── Cloud Sync Preferences ─────────────────────────────────────
 async function getCloudPrefs() {
   const key = await AuthStore.getUserKey(CLOUD_PREFS_KEY);
@@ -109,24 +119,39 @@ async function getCloudPrefs() {
   const prefs = {
     enabled: false,
     syncProfile: true, // always on when enabled
-    syncAutofill: false,
-    syncApplications: false,
-    syncAiSettings: false,
+    syncAutofill: true,
+    syncApplications: true,
+    syncAiSettings: true,
+    syncResumes: true,
     ...stored,
   };
-  if (prefs.enabled) prefs.syncProfile = true;
+  const auth = await AuthStore.getAuthState();
+  if (auth) {
+    prefs.enabled = true;
+    prefs.syncProfile = true;
+    prefs.syncAutofill = true;
+    prefs.syncApplications = true;
+    prefs.syncAiSettings = true;
+    prefs.syncResumes = true;
+  }
   return { key, prefs };
 }
 
 async function saveCloudPrefs(next) {
   const { key, prefs } = await getCloudPrefs();
   const merged = { ...prefs, ...(next || {}) };
-  if (merged.enabled) merged.syncProfile = true;
+  if (merged.enabled) {
+    merged.syncProfile = true;
+    merged.syncAutofill = true;
+    merged.syncApplications = true;
+    merged.syncAiSettings = true;
+    merged.syncResumes = true;
+  }
   await chrome.storage.local.set({ [key]: merged });
   return merged;
 }
 
-// ── Resume Vault (Local Only) ──────────────────────────────────
+// ── Resume Vault (Local + Cloud Sync) ──────────────────────────
 async function getResumesStore() {
   const key = await AuthStore.getUserKey(RESUMES_KEY);
   const result = await chrome.storage.local.get(key);
@@ -333,12 +358,16 @@ async function handleMessage(msg, sender) {
       if (msg.clearDisabled) data.sites[siteKey].disabled = false;
       await saveData(data);
       queueCloudSync();
+      if (sender?.tab?.id) {
+        chrome.tabs.sendMessage(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: data.sites[siteKey].enabled }).catch(() => {});
+      }
       return { ok: true };
     }
 
     case 'SAVE_FIELDS': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
+      if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
       if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, flags: {}, metrics: {}, sandbox: {} };
       data.sites[siteKey].fields = Object.assign({}, data.sites[siteKey].fields, msg.fields || {});
       await saveData(data);
@@ -349,6 +378,7 @@ async function handleMessage(msg, sender) {
     case 'SANDBOX_MERGE': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
+      if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
       if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
       const sandbox = data.sites[siteKey].sandbox || {};
       const fields = msg.fields || {};
@@ -419,6 +449,7 @@ async function handleMessage(msg, sender) {
       if (!msg.mapping || !msg.hostname) return { ok: false, error: 'Missing mapping/hostname' };
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
+      if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
       if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, mappings: [], flags: {}, metrics: {}, sandbox: {} };
       if (!Array.isArray(data.sites[siteKey].mappings)) data.sites[siteKey].mappings = [];
       const mappings = data.sites[siteKey].mappings;
@@ -448,6 +479,9 @@ async function handleMessage(msg, sender) {
       data.sites[siteKey].flags = { ...(data.sites[siteKey].flags || {}), ...(msg.flags || {}) };
       await saveData(data);
       queueCloudSync();
+      if (sender?.tab?.id) {
+        chrome.tabs.sendMessage(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', flags: data.sites[siteKey].flags }).catch(() => {});
+      }
       return { ok: true, flags: data.sites[siteKey].flags };
     }
 
@@ -457,11 +491,17 @@ async function handleMessage(msg, sender) {
     }
 
     case 'SESSION_MERGE': {
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
       const fields = await mergeSessionFields(msg.hostname, msg.fields || {});
       return { ok: true, fields };
     }
 
     case 'SESSION_SET_FLAGS': {
+      const data = await getData();
+      const siteKey = resolveSiteKey(data, msg.hostname);
+      if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
       const flags = await setSessionFlags(msg.hostname, msg.flags || {});
       return { ok: true, flags };
     }
@@ -641,12 +681,14 @@ async function handleMessage(msg, sender) {
     case 'APP_ADD': {
       if (!msg.application?.companyName) return { ok: false, error: 'Company name is required' };
       const apps = await addApplication(msg.application);
+      queueCloudSync();
       return { ok: true, apps };
     }
 
     case 'APP_UPDATE': {
       if (!msg.id) return { ok: false, error: 'Application ID is required' };
       const apps = await updateApplication(msg.id, msg.updates || {});
+      queueCloudSync();
       return { ok: true, apps };
     }
 
@@ -676,18 +718,21 @@ async function handleMessage(msg, sender) {
         return { ok: false, error: 'Missing resume file' };
       }
       const entry = await addOrUpdateResume(msg.resume);
+      queueCloudSync();
       return { ok: true, resume: sanitizeResumeMeta(entry) };
     }
 
     case 'RESUME_DELETE': {
       if (!msg.id) return { ok: false, error: 'Resume ID required' };
       const data = await deleteResume(msg.id);
+      queueCloudSync();
       return { ok: true, items: data.items.map(sanitizeResumeMeta), defaultId: data.defaultId || null };
     }
 
     case 'RESUME_SET_DEFAULT': {
       if (!msg.id) return { ok: false, error: 'Resume ID required' };
       const data = await setDefaultResume(msg.id);
+      queueCloudSync();
       return { ok: true, items: data.items.map(sanitizeResumeMeta), defaultId: data.defaultId || null };
     }
 
@@ -750,6 +795,7 @@ async function handleMessage(msg, sender) {
       const auth = await cloudSignUp(msg.email, msg.password, msg.displayName || '');
       // Auto-push local data to cloud on signup
       try {
+        await saveCloudPrefs({ enabled: true });
         const { prefs } = await getCloudPrefs();
         if (prefs.enabled) await pushAllToCloud(prefs);
       } catch (e) { console.warn('[Cloud] Post-signup push failed:', e); }
@@ -762,9 +808,11 @@ async function handleMessage(msg, sender) {
       const auth = await cloudSignIn(msg.email, msg.password);
       // Auto-pull cloud data on login
       try {
+        await saveCloudPrefs({ enabled: true });
         const { prefs } = await getCloudPrefs();
-        if (prefs.enabled) await pullAllFromCloud(prefs);
-      } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
+        await pullAllFromCloud(prefs);
+        await pushAllToCloud(prefs);
+      } catch (e) { console.warn('[Cloud] Post-login sync failed:', e); }
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
@@ -773,9 +821,11 @@ async function handleMessage(msg, sender) {
       const auth = await cloudSignInWithGoogle(msg.accessToken);
       // Auto-pull cloud data on login
       try {
+        await saveCloudPrefs({ enabled: true });
         const { prefs } = await getCloudPrefs();
-        if (prefs.enabled) await pullAllFromCloud(prefs);
-      } catch (e) { console.warn('[Cloud] Post-login pull failed:', e); }
+        await pullAllFromCloud(prefs);
+        await pushAllToCloud(prefs);
+      } catch (e) { console.warn('[Cloud] Post-login sync failed:', e); }
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
@@ -792,14 +842,12 @@ async function handleMessage(msg, sender) {
 
     case 'CLOUD_PUSH': {
       const { prefs } = await getCloudPrefs();
-      if (!prefs.enabled) return { ok: false, error: 'Enable cloud sync first' };
       await pushAllToCloud(prefs);
       return { ok: true };
     }
 
     case 'CLOUD_PULL': {
       const { prefs } = await getCloudPrefs();
-      if (!prefs.enabled) return { ok: false, error: 'Enable cloud sync first' };
       await pullAllFromCloud(prefs);
       return { ok: true };
     }
@@ -807,7 +855,6 @@ async function handleMessage(msg, sender) {
     case 'CLOUD_SYNC': {
       // Pull first (get latest), then push (upload merged)
       const { prefs } = await getCloudPrefs();
-      if (!prefs.enabled) return { ok: false, error: 'Enable cloud sync first' };
       await pullAllFromCloud(prefs);
       await pushAllToCloud(prefs);
       return { ok: true };

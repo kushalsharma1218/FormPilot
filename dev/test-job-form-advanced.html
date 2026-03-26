@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Advanced Job Application – Test</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "Senior Frontend Engineer",
+        "hiringOrganization": { "@type": "Organization", "name": "TestCo" },
+        "employmentType": "FULL_TIME",
+        "jobLocation": { "@type": "Place", "address": { "@type": "PostalAddress", "addressLocality": "Remote" } }
+      }
+    </script>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 24px; background: #f5f7fb; }
+      .card { background: #fff; padding: 18px 22px; border-radius: 12px; max-width: 900px; margin: 0 auto; box-shadow: 0 6px 18px rgba(0,0,0,0.06); }
+      h1 { margin-top: 0; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+      label { display: block; font-size: 12px; color: #334155; margin-bottom: 4px; }
+      input, select, textarea { width: 100%; padding: 8px 10px; border: 1px solid #cbd5f5; border-radius: 8px; font-size: 13px; }
+      textarea { min-height: 90px; }
+      .section { margin-top: 18px; padding-top: 16px; border-top: 1px solid #e2e8f0; }
+      .combobox { position: relative; }
+      .listbox { position: absolute; top: 36px; left: 0; right: 0; background: #fff; border: 1px solid #cbd5f5; border-radius: 8px; box-shadow: 0 6px 16px rgba(0,0,0,0.08); display: none; z-index: 2; }
+      .option { padding: 8px 10px; cursor: pointer; font-size: 13px; }
+      .option:hover { background: #f1f5f9; }
+      .actions { margin-top: 16px; display: flex; gap: 10px; }
+      button { padding: 8px 12px; border-radius: 8px; border: none; background: #0f172a; color: #fff; cursor: pointer; }
+      .inline { display: flex; gap: 14px; align-items: center; font-size: 13px; }
+      .note { font-size: 12px; color: #64748b; }
+      #step-2 { display: none; }
+      .contenteditable { min-height: 80px; border: 1px dashed #cbd5f5; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Advanced Job Application</h1>
+      <p class="note">Includes multi-step flow, custom combobox, listbox, radios, checkboxes, and a contenteditable field.</p>
+
+      <form id="job-app">
+        <div class="grid">
+          <div>
+            <label for="firstName">First Name *</label>
+            <input id="firstName" name="firstName" autocomplete="given-name" />
+          </div>
+          <div>
+            <label for="lastName">Last Name *</label>
+            <input id="lastName" name="lastName" autocomplete="family-name" />
+          </div>
+          <div>
+            <label for="email">Email *</label>
+            <input id="email" type="email" autocomplete="email" />
+          </div>
+          <div>
+            <label for="phone">Phone *</label>
+            <input id="phone" type="tel" autocomplete="tel" />
+          </div>
+          <div>
+            <label for="country">Country</label>
+            <select id="country">
+              <option value="">Select…</option>
+              <option>United States</option>
+              <option>Canada</option>
+              <option>Germany</option>
+            </select>
+          </div>
+          <div class="combobox">
+            <label id="work-mode-label">Work Mode</label>
+            <div id="workModeBox" role="combobox" aria-haspopup="listbox" aria-labelledby="work-mode-label" aria-expanded="false">
+              <input id="workModeInput" type="text" aria-label="Work Mode" />
+            </div>
+            <div id="workModeList" class="listbox" role="listbox">
+              <div class="option" role="option" data-value="Remote">Remote</div>
+              <div class="option" role="option" data-value="Hybrid">Hybrid</div>
+              <div class="option" role="option" data-value="Onsite">Onsite</div>
+            </div>
+          </div>
+          <div>
+            <label for="currentCompany">Current Company</label>
+            <input id="currentCompany" />
+          </div>
+          <div>
+            <label for="currentTitle">Current Title</label>
+            <input id="currentTitle" />
+          </div>
+        </div>
+
+        <div class="section">
+          <label for="summary">Summary</label>
+          <textarea id="summary" placeholder="Short professional summary"></textarea>
+        </div>
+
+        <div class="section">
+          <div class="inline">
+            <label>Are you legally authorized to work?</label>
+            <label><input type="radio" name="workAuth" value="Yes" /> Yes</label>
+            <label><input type="radio" name="workAuth" value="No" /> No</label>
+          </div>
+          <div class="inline">
+            <label><input type="checkbox" id="relocate" /> I can relocate</label>
+            <label><input type="checkbox" id="sponsorship" /> I need sponsorship</label>
+          </div>
+        </div>
+
+        <div class="section grid">
+          <div>
+            <label for="resume">Resume</label>
+            <input id="resume" type="file" />
+          </div>
+          <div>
+            <label for="password">Password (should never fill)</label>
+            <input id="password" type="password" />
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" id="next-btn">Next</button>
+        </div>
+
+        <div id="step-2" class="section">
+          <h3>Step 2 – Additional Details</h3>
+          <div class="grid">
+            <div>
+              <label for="linkedin">LinkedIn</label>
+              <input id="linkedin" type="url" />
+            </div>
+            <div>
+              <label for="portfolio">Portfolio</label>
+              <input id="portfolio" type="url" />
+            </div>
+            <div>
+              <label for="desiredSalary">Desired Salary</label>
+              <input id="desiredSalary" type="number" />
+            </div>
+          </div>
+          <div class="section">
+            <label id="cover-label">Cover Letter</label>
+            <div id="coverLetter" class="contenteditable" role="textbox" aria-labelledby="cover-label" contenteditable="true"></div>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <script>
+      const combo = document.getElementById('workModeBox');
+      const list = document.getElementById('workModeList');
+      const input = document.getElementById('workModeInput');
+      combo.addEventListener('click', () => {
+        list.style.display = 'block';
+        combo.setAttribute('aria-expanded', 'true');
+      });
+      list.addEventListener('click', (e) => {
+        const opt = e.target.closest('[role="option"]');
+        if (!opt) return;
+        const val = opt.getAttribute('data-value') || opt.textContent.trim();
+        input.value = val;
+        combo.setAttribute('aria-activedescendant', opt.id || '');
+        list.style.display = 'none';
+        combo.setAttribute('aria-expanded', 'false');
+      });
+
+      document.getElementById('next-btn').addEventListener('click', () => {
+        const step2 = document.getElementById('step-2');
+        step2.style.display = 'block';
+      });
+    </script>
+  </body>
+</html>

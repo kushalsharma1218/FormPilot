@@ -585,7 +585,7 @@ function renderResumeVault() {
         const btnDelete = el.querySelector('.btn-resume-delete');
         if (btnDelete) {
             btnDelete.addEventListener('click', async () => {
-                showConfirmModal('Delete resume?', 'This will remove the file from local storage.', async () => {
+                showConfirmModal('Delete resume?', 'This will remove the file from local storage (and cloud if sync is enabled).', async () => {
                     await chrome.runtime.sendMessage({ type: 'RESUME_DELETE', id });
                     loadResumeVault();
                 });
@@ -628,7 +628,7 @@ if (resumeVaultBtn && resumeVaultInput) {
                 resume: { name: file.name, label, mime: file.type, size: file.size, dataUrl }
             });
             if (resumeVaultLabel) resumeVaultLabel.value = '';
-            resumeVaultStatus.textContent = '✓ Resume saved locally';
+            resumeVaultStatus.textContent = '✓ Resume saved';
             resumeVaultStatus.className = 'status-msg success';
             loadResumeVault();
         } catch (err) {
@@ -1370,13 +1370,9 @@ function withTimeout(promise, ms, fallback = null) {
 }
 
 async function renderCloudSync() {
-    // Load and display config
+    // Load config (not displayed in UI)
     try {
-        const cfgResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_CONFIG' });
-        if (cfgResp?.ok && cfgResp.config) {
-            document.getElementById('cloud-api-key').value = cfgResp.config.apiKey || '';
-            document.getElementById('cloud-project-id').value = cfgResp.config.projectId || '';
-        }
+        await chrome.runtime.sendMessage({ type: 'CLOUD_GET_CONFIG' });
     } catch (_) { /* ignore */ }
 
     const statusResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
@@ -1388,17 +1384,15 @@ async function renderCloudSync() {
     const badge = document.getElementById('cloud-status-badge');
     const authForms = document.getElementById('cloud-auth-forms');
     const loggedInView = document.getElementById('cloud-logged-in');
-    const cfgMsg = document.getElementById('cloud-config-msg');
     const prefsWrap = document.getElementById('cloud-sync-prefs');
 
     msgEl.textContent = '';
-    if (cfgMsg) cfgMsg.textContent = '';
     
     if (!configured) {
         badge.textContent = 'Not Configured';
         badge.style.background = 'rgba(239, 68, 68, 0.12)';
         badge.style.color = 'var(--red-400)';
-        msgEl.textContent = 'Cloud sync requires Firebase config.';
+        msgEl.textContent = 'Cloud sync is not configured.';
         if (prefsWrap) prefsWrap.style.display = 'none';
         return;
     }
@@ -1466,6 +1460,10 @@ function setupCloudPrefListeners() {
             });
             if (resp?.ok) {
                 cloudPrefs = resp.prefs;
+                if (enabledEl) enabledEl.checked = !!cloudPrefs.enabled;
+                if (autofillEl) autofillEl.checked = !!cloudPrefs.syncAutofill;
+                if (appsEl) appsEl.checked = !!cloudPrefs.syncApplications;
+                if (aiEl) aiEl.checked = !!cloudPrefs.syncAiSettings;
                 msg.textContent = '✓ Preferences saved';
                 msg.className = 'status-msg success';
             } else {
@@ -1528,35 +1526,6 @@ function setupCloudPrefListeners() {
     }
 }
 
-document.getElementById('btn-cloud-save-config').addEventListener('click', async () => {
-    const apiKey = document.getElementById('cloud-api-key').value.trim();
-    const projectId = document.getElementById('cloud-project-id').value.trim();
-    const msg = document.getElementById('cloud-config-msg');
-
-    if (!apiKey || !projectId) {
-        msg.textContent = '❌ API Key and Project ID are required.';
-        msg.className = 'status-msg error';
-        return;
-    }
-
-    try {
-        const resp = await chrome.runtime.sendMessage({
-            type: 'CLOUD_SAVE_CONFIG',
-            config: { apiKey, projectId }
-        });
-        if (resp?.ok) {
-            msg.textContent = '✓ Config saved';
-            msg.className = 'status-msg success';
-            await renderCloudSync();
-        } else {
-            msg.textContent = resp?.error || '❌ Failed to save config';
-            msg.className = 'status-msg error';
-        }
-    } catch (err) {
-        msg.textContent = err.message || '❌ Failed to save config';
-        msg.className = 'status-msg error';
-    }
-});
 
 document.getElementById('btn-cloud-signin').addEventListener('click', async () => {
     const email = document.getElementById('cloud-email').value;
@@ -1569,6 +1538,16 @@ document.getElementById('btn-cloud-signin').addEventListener('click', async () =
         msg.className = 'status-msg error';
         return;
     }
+
+    // Ensure cloud is configured before attempting sign-in
+    try {
+        const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
+        if (!status?.configured) {
+            msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
+            msg.className = 'status-msg error';
+            return;
+        }
+    } catch (_) {}
 
     setLoading(btn, true);
     msg.textContent = 'Signing in...';
@@ -1614,6 +1593,16 @@ document.getElementById('btn-cloud-signup').addEventListener('click', async () =
         msg.className = 'status-msg error';
         return;
     }
+
+    // Ensure cloud is configured before attempting sign-up
+    try {
+        const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
+        if (!status?.configured) {
+            msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
+            msg.className = 'status-msg error';
+            return;
+        }
+    } catch (_) {}
 
     setLoading(btn, true);
     msg.textContent = 'Creating account...';
