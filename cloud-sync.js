@@ -85,6 +85,42 @@ const SYNC_META_KEY = 'cloud_sync_meta';
 const CLOUD_CONFIG_KEY = 'cloud_config';
 let configLoadPromise = null;
 
+function mergeMetricBucket(a = {}, b = {}) {
+  return {
+    runs: Math.max(Number(a.runs || 0), Number(b.runs || 0)),
+    fieldsDetected: Math.max(Number(a.fieldsDetected || 0), Number(b.fieldsDetected || 0)),
+    fieldsMatched: Math.max(Number(a.fieldsMatched || 0), Number(b.fieldsMatched || 0)),
+    fieldsFilled: Math.max(Number(a.fieldsFilled || 0), Number(b.fieldsFilled || 0)),
+    timeSavedSec: Math.max(Number(a.timeSavedSec || 0), Number(b.timeSavedSec || 0)),
+    lastAt: a.lastAt && b.lastAt ? (a.lastAt > b.lastAt ? a.lastAt : b.lastAt) : (a.lastAt || b.lastAt || null),
+  };
+}
+
+function mergeUsageMetrics(local = {}, remote = {}) {
+  const merged = {};
+  merged.totalRuns = Math.max(Number(local.totalRuns || 0), Number(remote.totalRuns || 0));
+  merged.totalFieldsDetected = Math.max(Number(local.totalFieldsDetected || 0), Number(remote.totalFieldsDetected || 0));
+  merged.totalFieldsMatched = Math.max(Number(local.totalFieldsMatched || 0), Number(remote.totalFieldsMatched || 0));
+  merged.totalFieldsFilled = Math.max(Number(local.totalFieldsFilled || 0), Number(remote.totalFieldsFilled || 0));
+  merged.totalTimeSavedSec = Math.max(Number(local.totalTimeSavedSec || 0), Number(remote.totalTimeSavedSec || 0));
+  merged.lastRunAt = local.lastRunAt && remote.lastRunAt
+    ? (local.lastRunAt > remote.lastRunAt ? local.lastRunAt : remote.lastRunAt)
+    : (local.lastRunAt || remote.lastRunAt || null);
+
+  const daily = { ...(local.daily || {}) };
+  Object.entries(remote.daily || {}).forEach(([key, bucket]) => {
+    daily[key] = mergeMetricBucket(daily[key], bucket);
+  });
+  merged.daily = daily;
+
+  const perSite = { ...(local.perSite || {}) };
+  Object.entries(remote.perSite || {}).forEach(([key, bucket]) => {
+    perSite[key] = mergeMetricBucket(perSite[key], bucket);
+  });
+  merged.perSite = perSite;
+  return merged;
+}
+
 function setFirebaseConfig(config) {
   FIREBASE_CONFIG.apiKey = (config?.apiKey || '').trim();
   FIREBASE_CONFIG.projectId = (config?.projectId || '').trim();
@@ -429,10 +465,11 @@ async function pushAllToCloud(prefs = {}) {
   const syncApplications = !!prefs.syncApplications;
   const syncAiSettings = !!prefs.syncAiSettings;
   const syncResumes = prefs.syncResumes !== false;
+  const syncMetrics = prefs.syncMetrics !== false;
 
   // Gather all local data using partitioned keys
   const tasks = [];
-  let autofillData, profile, aiSettings, applications, resumes;
+  let autofillData, profile, aiSettings, applications, resumes, metrics;
   if (syncAutofill) {
     tasks.push(
       chrome.storage.local.get(await getUserKey('autofill_data'))
@@ -463,6 +500,12 @@ async function pushAllToCloud(prefs = {}) {
         .then(r => { resumes = r[Object.keys(r)[0]] || { items: [], defaultId: null }; })
     );
   }
+  if (syncMetrics) {
+    tasks.push(
+      chrome.storage.local.get(await getUserKey('usage_metrics'))
+        .then(r => { metrics = r[Object.keys(r)[0]] || {}; })
+    );
+  }
   await Promise.all(tasks);
 
   // Push each section in parallel
@@ -474,6 +517,7 @@ async function pushAllToCloud(prefs = {}) {
   }
   if (syncApplications) pushTasks.push(pushDataToCloud('applications', { list: applications }));
   if (syncResumes) pushTasks.push(pushDataToCloud('resumes', resumes));
+  if (syncMetrics) pushTasks.push(pushDataToCloud('metrics', metrics || {}));
   if (pushTasks.length) await Promise.all(pushTasks);
 
   // Save sync metadata
@@ -497,14 +541,16 @@ async function pullAllFromCloud(prefs = {}) {
   const syncApplications = !!prefs.syncApplications;
   const syncAiSettings = !!prefs.syncAiSettings;
   const syncResumes = prefs.syncResumes !== false;
+  const syncMetrics = prefs.syncMetrics !== false;
 
   const pullTasks = [];
-  let autofillData, profile, aiSettings, appData, resumeData;
+  let autofillData, profile, aiSettings, appData, resumeData, metricsData;
   if (syncAutofill) pullTasks.push(pullDataFromCloud('autofill').then(r => { autofillData = r; }));
   if (syncProfile) pullTasks.push(pullDataFromCloud('profile').then(r => { profile = r; }));
   if (syncAiSettings) pullTasks.push(pullDataFromCloud('ai_settings').then(r => { aiSettings = r; }));
   if (syncApplications) pullTasks.push(pullDataFromCloud('applications').then(r => { appData = r; }));
   if (syncResumes) pullTasks.push(pullDataFromCloud('resumes').then(r => { resumeData = r; }));
+  if (syncMetrics) pullTasks.push(pullDataFromCloud('metrics').then(r => { metricsData = r; }));
   if (pullTasks.length) await Promise.all(pullTasks);
 
   // Fetch local keys
@@ -513,7 +559,8 @@ async function pullAllFromCloud(prefs = {}) {
     getUserKey('global_profile_data'),
     getUserKey('ai_settings'),
     getUserKey('applications_data'),
-    getUserKey('resumes_data')
+    getUserKey('resumes_data'),
+    getUserKey('usage_metrics')
   ]);
 
   const localResult = await chrome.storage.local.get(storageKeys);
@@ -582,6 +629,15 @@ async function pullAllFromCloud(prefs = {}) {
       items: mergedItems,
       defaultId: resumeData.defaultId || localResumes.defaultId || mergedItems[0]?.id || null,
     };
+  }
+
+  if (syncMetrics && metricsData) {
+    const localMetrics = localResult[storageKeys[5]] || {};
+    // Prefer higher totals to avoid double counting across devices
+    const merged = (typeof mergeUsageMetrics === 'function')
+      ? mergeUsageMetrics(localMetrics, metricsData)
+      : { ...localMetrics, ...metricsData };
+    updates[storageKeys[5]] = merged;
   }
 
   if (Object.keys(updates).length > 0) {

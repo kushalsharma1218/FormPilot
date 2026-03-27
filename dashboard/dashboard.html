@@ -88,6 +88,16 @@
                     </svg>
                     <span>Overview</span>
                 </button>
+                <button class="nav-item" data-tab="metrics">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        stroke-width="2">
+                        <path d="M3 3v18h18" />
+                        <rect x="7" y="13" width="3" height="5" />
+                        <rect x="12" y="9" width="3" height="9" />
+                        <rect x="17" y="5" width="3" height="13" />
+                    </svg>
+                    <span>Metrics</span>
+                </button>
                 <button class="nav-item" data-tab="sites">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="12" cy="12" r="10" />
@@ -264,6 +274,89 @@
 
                 <div id="all-sites-list" class="all-sites-list">
                     <div class="empty-state">No sites recorded yet. Visit a job application page to get started.</div>
+                </div>
+            </section>
+
+            <!-- ═══ METRICS TAB ═══ -->
+            <section class="tab-content" id="tab-metrics">
+                <div class="page-header">
+                    <h1>Impact Metrics</h1>
+                    <p class="page-subtitle">How FormPilot is helping you save time and complete applications faster</p>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card stat-green">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <circle cx="12" cy="12" r="10" />
+                                <path d="M12 6v6l4 2" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="metric-time-saved">0m</span>
+                            <span class="stat-card-label">Estimated Time Saved</span>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-blue">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="metric-fields-filled">0</span>
+                            <span class="stat-card-label">Fields Autofilled</span>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-purple">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <rect x="3" y="4" width="18" height="18" rx="2" />
+                                <line x1="7" y1="8" x2="17" y2="8" />
+                                <line x1="7" y1="12" x2="17" y2="12" />
+                                <line x1="7" y1="16" x2="17" y2="16" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="metric-autofill-runs">0</span>
+                            <span class="stat-card-label">Autofill Runs</span>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-amber">
+                        <div class="stat-card-icon">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M12 20V10" />
+                                <path d="M18 20V4" />
+                                <path d="M6 20v-6" />
+                            </svg>
+                        </div>
+                        <div class="stat-card-data">
+                            <span class="stat-card-value" id="metric-fill-accuracy">--</span>
+                            <span class="stat-card-label">Fill Accuracy</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Last 7 Days</h2>
+                    </div>
+                    <div id="metric-daily-list" class="recent-sites-list">
+                        <div class="empty-state">No usage data yet. Fill a job form to get started.</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Top Sites by Time Saved</h2>
+                    </div>
+                    <div id="metric-top-sites" class="recent-sites-list">
+                        <div class="empty-state">No site metrics yet.</div>
+                    </div>
                 </div>
             </section>
 

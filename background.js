@@ -14,9 +14,11 @@ importScripts('cloud-sync.js');
 const STORAGE_KEY = 'autofill_data';
 const GLOBAL_STORAGE_KEY = 'global_profile_data';
 const RESUMES_KEY = 'resumes_data';
+const METRICS_KEY = 'usage_metrics';
 const SESSION_KEY = 'autofill_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CLOUD_PREFS_KEY = 'cloud_sync_prefs';
+const METRIC_TIME_PER_FIELD_SEC = 8;
 
 // ── Storage Helpers (Account Aware) ────────────────────────────
 const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
@@ -90,6 +92,126 @@ async function saveGlobalProfile(profile) {
   await chrome.storage.local.set({ [key]: profile });
 }
 
+function defaultUsageMetrics() {
+  return {
+    totalRuns: 0,
+    totalFieldsDetected: 0,
+    totalFieldsMatched: 0,
+    totalFieldsFilled: 0,
+    totalTimeSavedSec: 0,
+    lastRunAt: null,
+    daily: {},
+    perSite: {},
+  };
+}
+
+async function getUsageMetrics() {
+  const key = await AuthStore.getUserKey(METRICS_KEY);
+  const result = await chrome.storage.local.get([key, METRICS_KEY]);
+  let metrics = result[key] || {};
+  if (key !== METRICS_KEY && (!metrics || Object.keys(metrics).length === 0)) {
+    const anonMetrics = result[METRICS_KEY];
+    if (anonMetrics && Object.keys(anonMetrics).length > 0) {
+      metrics = anonMetrics;
+      await chrome.storage.local.set({ [key]: metrics });
+    }
+  }
+  return metrics && Object.keys(metrics).length > 0 ? metrics : defaultUsageMetrics();
+}
+
+async function saveUsageMetrics(metrics) {
+  const key = await AuthStore.getUserKey(METRICS_KEY);
+  await chrome.storage.local.set({ [key]: metrics });
+}
+
+function getLocalDateKey(d = new Date()) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function mergeMetricBucket(a = {}, b = {}) {
+  return {
+    runs: Math.max(Number(a.runs || 0), Number(b.runs || 0)),
+    fieldsDetected: Math.max(Number(a.fieldsDetected || 0), Number(b.fieldsDetected || 0)),
+    fieldsMatched: Math.max(Number(a.fieldsMatched || 0), Number(b.fieldsMatched || 0)),
+    fieldsFilled: Math.max(Number(a.fieldsFilled || 0), Number(b.fieldsFilled || 0)),
+    timeSavedSec: Math.max(Number(a.timeSavedSec || 0), Number(b.timeSavedSec || 0)),
+    lastAt: a.lastAt && b.lastAt ? (a.lastAt > b.lastAt ? a.lastAt : b.lastAt) : (a.lastAt || b.lastAt || null),
+  };
+}
+
+function mergeUsageMetrics(local, remote) {
+  const merged = defaultUsageMetrics();
+  const l = local || {};
+  const r = remote || {};
+  merged.totalRuns = Math.max(Number(l.totalRuns || 0), Number(r.totalRuns || 0));
+  merged.totalFieldsDetected = Math.max(Number(l.totalFieldsDetected || 0), Number(r.totalFieldsDetected || 0));
+  merged.totalFieldsMatched = Math.max(Number(l.totalFieldsMatched || 0), Number(r.totalFieldsMatched || 0));
+  merged.totalFieldsFilled = Math.max(Number(l.totalFieldsFilled || 0), Number(r.totalFieldsFilled || 0));
+  merged.totalTimeSavedSec = Math.max(Number(l.totalTimeSavedSec || 0), Number(r.totalTimeSavedSec || 0));
+  merged.lastRunAt = l.lastRunAt && r.lastRunAt ? (l.lastRunAt > r.lastRunAt ? l.lastRunAt : r.lastRunAt) : (l.lastRunAt || r.lastRunAt || null);
+
+  const daily = { ...(l.daily || {}) };
+  Object.entries(r.daily || {}).forEach(([key, bucket]) => {
+    daily[key] = mergeMetricBucket(daily[key], bucket);
+  });
+  merged.daily = daily;
+
+  const perSite = { ...(l.perSite || {}) };
+  Object.entries(r.perSite || {}).forEach(([key, bucket]) => {
+    perSite[key] = mergeMetricBucket(perSite[key], bucket);
+  });
+  merged.perSite = perSite;
+  return merged;
+}
+
+async function recordUsageMetrics(hostname, stats = {}) {
+  const detected = Number(stats.detected || 0);
+  const matched = Number(stats.matched || 0);
+  const filled = Number(stats.filled || 0);
+  if (detected <= 0 && filled <= 0) return null;
+
+  const metrics = await getUsageMetrics();
+  const now = new Date();
+  const dateKey = getLocalDateKey(now);
+  const timeSavedSec = filled * METRIC_TIME_PER_FIELD_SEC;
+
+  metrics.totalRuns = Number(metrics.totalRuns || 0) + 1;
+  metrics.totalFieldsDetected = Number(metrics.totalFieldsDetected || 0) + detected;
+  metrics.totalFieldsMatched = Number(metrics.totalFieldsMatched || 0) + matched;
+  metrics.totalFieldsFilled = Number(metrics.totalFieldsFilled || 0) + filled;
+  metrics.totalTimeSavedSec = Number(metrics.totalTimeSavedSec || 0) + timeSavedSec;
+  metrics.lastRunAt = now.toISOString();
+
+  metrics.daily = metrics.daily || {};
+  const day = metrics.daily[dateKey] || {};
+  metrics.daily[dateKey] = {
+    runs: Number(day.runs || 0) + 1,
+    fieldsDetected: Number(day.fieldsDetected || 0) + detected,
+    fieldsMatched: Number(day.fieldsMatched || 0) + matched,
+    fieldsFilled: Number(day.fieldsFilled || 0) + filled,
+    timeSavedSec: Number(day.timeSavedSec || 0) + timeSavedSec,
+    lastAt: metrics.lastRunAt,
+  };
+
+  if (hostname) {
+    metrics.perSite = metrics.perSite || {};
+    const site = metrics.perSite[hostname] || {};
+    metrics.perSite[hostname] = {
+      runs: Number(site.runs || 0) + 1,
+      fieldsDetected: Number(site.fieldsDetected || 0) + detected,
+      fieldsMatched: Number(site.fieldsMatched || 0) + matched,
+      fieldsFilled: Number(site.fieldsFilled || 0) + filled,
+      timeSavedSec: Number(site.timeSavedSec || 0) + timeSavedSec,
+      lastAt: metrics.lastRunAt,
+    };
+  }
+
+  await saveUsageMetrics(metrics);
+  return metrics;
+}
 function clampScore(value) {
   if (Number.isNaN(value)) return 0;
   return Math.max(0, Math.min(100, value));
@@ -123,6 +245,7 @@ async function getCloudPrefs() {
     syncApplications: true,
     syncAiSettings: true,
     syncResumes: true,
+    syncMetrics: true,
     ...stored,
   };
   const auth = await AuthStore.getAuthState();
@@ -133,6 +256,7 @@ async function getCloudPrefs() {
     prefs.syncApplications = true;
     prefs.syncAiSettings = true;
     prefs.syncResumes = true;
+    prefs.syncMetrics = true;
   }
   return { key, prefs };
 }
@@ -146,6 +270,7 @@ async function saveCloudPrefs(next) {
     merged.syncApplications = true;
     merged.syncAiSettings = true;
     merged.syncResumes = true;
+    merged.syncMetrics = true;
   }
   await chrome.storage.local.set({ [key]: merged });
   return merged;
@@ -438,6 +563,13 @@ async function handleMessage(msg, sender) {
       return { ok: true, metrics };
     }
 
+    case 'USAGE_METRICS_UPDATE': {
+      const stats = msg.stats || {};
+      const metrics = await recordUsageMetrics(msg.hostname, stats);
+      if (metrics) queueCloudSync();
+      return { ok: true, metrics };
+    }
+
     case 'GET_SITE_MAPPINGS': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
@@ -558,6 +690,11 @@ async function handleMessage(msg, sender) {
     case 'GET_ALL_DATA': {
       const data = await getData();
       return { data };
+    }
+
+    case 'GET_USAGE_METRICS': {
+      const metrics = await getUsageMetrics();
+      return { ok: true, metrics };
     }
 
     case 'GET_GLOBAL_PROFILE': {
@@ -750,7 +887,7 @@ async function handleMessage(msg, sender) {
     case 'CLOUD_DELETE_REMOTE': {
       const { prefs } = await getCloudPrefs();
       if (!prefs.enabled) return { ok: false, error: 'Cloud sync is disabled' };
-      const keys = ['autofill', 'profile', 'ai_settings', 'applications'];
+      const keys = ['autofill', 'profile', 'ai_settings', 'applications', 'metrics', 'resumes'];
       if (typeof deleteCloudData === 'function') {
         await deleteCloudData(keys);
         return { ok: true };

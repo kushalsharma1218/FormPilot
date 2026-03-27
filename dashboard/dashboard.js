@@ -7,6 +7,7 @@ let applications = [];
 let aiSettings = {};
 let resumeVault = { items: [], defaultId: null };
 let cloudPrefs = { enabled: false, syncProfile: true, syncAutofill: false, syncApplications: false, syncAiSettings: false };
+let usageMetrics = {};
 
 // ── Helpers ────────────────────────────────────────────────────
 function escHtml(str) {
@@ -82,6 +83,40 @@ function formatBytes(bytes) {
     return `${mb.toFixed(1)} MB`;
 }
 
+function formatDuration(seconds) {
+    const total = Math.max(0, Number(seconds || 0));
+    const hours = Math.floor(total / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    if (hours <= 0 && mins <= 0) return '0m';
+    if (hours <= 0) return `${mins}m`;
+    if (mins <= 0) return `${hours}h`;
+    return `${hours}h ${mins}m`;
+}
+
+function getLocalDateKey(d = new Date()) {
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+}
+
+function getDayLabel(dateKey) {
+    const d = new Date(dateKey + 'T00:00:00');
+    if (Number.isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('en-US', { weekday: 'short' });
+}
+
+function getRecentDateKeys(days = 7) {
+    const keys = [];
+    const now = new Date();
+    for (let i = 0; i < days; i += 1) {
+        const d = new Date(now);
+        d.setDate(now.getDate() - i);
+        keys.push(getLocalDateKey(d));
+    }
+    return keys.reverse();
+}
+
 function setLoading(btn, loading) {
     if (loading) btn.classList.add('loading');
     else btn.classList.remove('loading');
@@ -145,22 +180,25 @@ async function loadAllData() {
         document.getElementById('dashboard-auth-shield').style.display = 'none';
         document.getElementById('main-dashboard-app').style.display = 'flex';
 
-        const [dataResp, profileResp, aiResp, appsResp] = await Promise.all([
+        const [dataResp, profileResp, aiResp, appsResp, metricsResp] = await Promise.all([
             chrome.runtime.sendMessage({ type: 'GET_ALL_DATA' }),
             chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }),
             chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }),
             chrome.runtime.sendMessage({ type: 'APP_GET_ALL' }),
+            chrome.runtime.sendMessage({ type: 'GET_USAGE_METRICS' }),
         ]);
         allData = dataResp?.data || { sites: {}, hostnameMappings: {} };
         globalProfile = profileResp?.profile || {};
         aiSettings = aiResp?.settings || {};
         applications = appsResp?.apps || [];
+        usageMetrics = metricsResp?.metrics || {};
     } catch (err) {
         console.error('[Dashboard] Load error:', err);
         showToast('Failed to load data. Please reload.', 'error');
     }
     try {
         renderOverview();
+        renderMetrics();
         renderSites();
         renderProfile();
         renderTracker();
@@ -225,6 +263,87 @@ function renderOverview() {
         pct === 100 ? 'Your profile is complete! 🎉' :
             pct >= 50 ? 'Keep going! Add more to unlock better AI features.' :
                 'Upload your resume for instant AI-powered profile setup';
+}
+
+// ── METRICS TAB ───────────────────────────────────────────────
+function renderMetrics() {
+    const m = usageMetrics || {};
+    const totalRuns = Number(m.totalRuns || 0);
+    const totalFilled = Number(m.totalFieldsFilled || 0);
+    const totalDetected = Number(m.totalFieldsDetected || 0);
+    const totalTimeSaved = Number(m.totalTimeSavedSec || 0);
+
+    const timeEl = document.getElementById('metric-time-saved');
+    const fieldsEl = document.getElementById('metric-fields-filled');
+    const runsEl = document.getElementById('metric-autofill-runs');
+    const accuracyEl = document.getElementById('metric-fill-accuracy');
+
+    if (timeEl) timeEl.textContent = formatDuration(totalTimeSaved);
+    if (fieldsEl) fieldsEl.textContent = totalFilled.toLocaleString();
+    if (runsEl) runsEl.textContent = totalRuns.toLocaleString();
+    if (accuracyEl) {
+        if (totalDetected > 0) {
+            accuracyEl.textContent = `${Math.round((totalFilled / totalDetected) * 100)}%`;
+        } else {
+            accuracyEl.textContent = '--';
+        }
+    }
+
+    const dailyList = document.getElementById('metric-daily-list');
+    if (dailyList) {
+        const keys = getRecentDateKeys(7);
+        const rows = keys.map(key => {
+            const day = (m.daily || {})[key] || {};
+            const filled = Number(day.fieldsFilled || 0);
+            const timeSaved = Number(day.timeSavedSec || 0);
+            return { key, filled, timeSaved };
+        });
+        const hasData = rows.some(r => r.filled > 0 || r.timeSaved > 0);
+        if (!hasData) {
+            dailyList.innerHTML = '<div class="empty-state">No usage data yet. Fill a job form to get started.</div>';
+        } else {
+            dailyList.innerHTML = rows.map(r => `
+                <div class="recent-site-item">
+                    <div class="recent-site-info">
+                        <div class="site-favicon">${getDayLabel(r.key)}</div>
+                        <div>
+                            <div class="recent-site-name">${r.key}</div>
+                            <div class="recent-site-fields">${r.filled} fields · ${formatDuration(r.timeSaved)} saved</div>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+    }
+
+    const topSites = document.getElementById('metric-top-sites');
+    if (topSites) {
+        const sites = Object.entries(m.perSite || {})
+            .map(([host, data]) => ({
+                host,
+                timeSavedSec: Number(data.timeSavedSec || 0),
+                fieldsFilled: Number(data.fieldsFilled || 0),
+            }))
+            .filter(s => s.timeSavedSec > 0 || s.fieldsFilled > 0)
+            .sort((a, b) => b.timeSavedSec - a.timeSavedSec)
+            .slice(0, 6);
+
+        if (sites.length === 0) {
+            topSites.innerHTML = '<div class="empty-state">No site metrics yet.</div>';
+        } else {
+            topSites.innerHTML = sites.map(site => `
+                <div class="recent-site-item">
+                    <div class="recent-site-info">
+                        <div class="site-favicon">${getInitials(site.host)}</div>
+                        <div>
+                            <div class="recent-site-name">${escHtml(site.host)}</div>
+                            <div class="recent-site-fields">${site.fieldsFilled} fields · ${formatDuration(site.timeSavedSec)} saved</div>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+    }
 }
 
 // ── SITES TAB ──────────────────────────────────────────────────

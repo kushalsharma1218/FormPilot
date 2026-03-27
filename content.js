@@ -2999,6 +2999,7 @@ function fillFields(savedFields, opts = {}) {
   if (!skipObserver) {
     showCoverageBanner(stats);
     reportSiteMetrics(stats);
+    reportUsageMetrics(stats);
     if (unresolvedDropdowns.length > 0) {
       showDropdownResolver(unresolvedDropdowns);
     }
@@ -3030,6 +3031,17 @@ function reportSiteMetrics(stats) {
   const detected = Number(stats.detected || 0);
   if (detected < 3) return;
   chrome.runtime.sendMessage({ type: 'SITE_METRICS_UPDATE', hostname, stats }).catch(() => { });
+}
+
+function reportUsageMetrics(stats) {
+  if (!stats) return;
+  if (isSiteDisabled()) return;
+  if (getSiteFlag('neverPrompt')) return;
+  if (!isJobContextPage()) return;
+  const detected = Number(stats.detected || 0);
+  const filled = Number(stats.filled || 0);
+  if (detected <= 0 && filled <= 0) return;
+  chrome.runtime.sendMessage({ type: 'USAGE_METRICS_UPDATE', hostname, stats }).catch(() => { });
 }
 
 // Track corrections: when user changes a field we auto-filled, learn from it
