@@ -153,9 +153,9 @@ async function init() {
     const authEl = document.getElementById('auth-ui');
     const mainEl = document.getElementById('main-ui');
 
-    // Default to auth UI so popup never appears blank
-    if (authEl) authEl.style.display = 'flex';
-    if (mainEl) mainEl.style.display = 'none';
+    // Default to main UI (local use should never be blocked by cloud auth)
+    if (authEl) authEl.style.display = 'none';
+    if (mainEl) mainEl.style.display = 'block';
 
     const tab = await getActiveTab();
     try {
@@ -171,37 +171,22 @@ async function init() {
       5000,
       null
     );
-    if (!authStatus || !authStatus.loggedIn) {
-      if (authEl) authEl.style.display = 'flex';
-      setupAuthListeners();
-      
-      if (!authStatus) {
-        const errEl = document.getElementById('auth-error-msg');
-        if (errEl) {
-          errEl.innerHTML = 'Background not responding. <a href="#" id="auth-retry">Retry</a>';
-          const retry = document.getElementById('auth-retry');
-          if (retry) {
-            retry.addEventListener('click', (e) => {
-              e.preventDefault();
-              init();
-            });
-          }
+    if (!authStatus) {
+      const errEl = document.getElementById('auth-error-msg');
+      if (errEl) {
+        errEl.innerHTML = 'Background not responding. <a href="#" id="auth-retry">Retry</a>';
+        const retry = document.getElementById('auth-retry');
+        if (retry) {
+          retry.addEventListener('click', (e) => {
+            e.preventDefault();
+            init();
+          });
         }
-        if (initAttempts < 3) {
-          setTimeout(() => init(), 1200);
-        }
-        initInFlight = false;
-        return;
       }
-      if (!authStatus.configured) {
-        document.getElementById('auth-error-msg').textContent = 'Cloud sync is not configured for this build.';
+      if (initAttempts < 3) {
+        setTimeout(() => init(), 1200);
       }
-      initInFlight = false;
-      return; // Stop here, don't load main UI
     }
-
-    if (authEl) authEl.style.display = 'none';
-    if (mainEl) mainEl.style.display = 'block';
     document.getElementById('site-badge').textContent = currentHostname;
 
     // Load site data & AI settings in parallel
@@ -326,11 +311,7 @@ document.getElementById('btn-clear').addEventListener('click', async () => {
 });
 
 document.getElementById('btn-settings').addEventListener('click', () => {
-  if (chrome.runtime.openOptionsPage) {
-    chrome.runtime.openOptionsPage();
-  } else {
-    window.open(chrome.runtime.getURL('dashboard/dashboard.html'));
-  }
+  chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => {});
 });
 
 // Rename logic
@@ -400,12 +381,7 @@ document.getElementById('btn-ai-copy').addEventListener('click', async () => {
 
 document.getElementById('btn-ai-upload').addEventListener('click', () => {
   // Open dashboard at the profile/resume tab
-  const url = chrome.runtime.getURL('dashboard/dashboard.html') + '#tab-profile';
-  if (chrome.runtime.openOptionsPage) {
-    chrome.runtime.openOptionsPage();
-  } else {
-    window.open(url);
-  }
+  chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', hash: '#tab-profile' }).catch(() => {});
   showToast('Opening Dashboard → Profile tab to upload resume', 'info');
 });
 
@@ -507,11 +483,7 @@ function setupAuthListeners() {
 
   document.getElementById('auth-link-setup').addEventListener('click', (e) => {
     e.preventDefault();
-    if (chrome.runtime.openOptionsPage) {
-      chrome.runtime.openOptionsPage();
-    } else {
-      window.open(chrome.runtime.getURL('dashboard/dashboard.html'));
-    }
+    chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => {});
   });
 
   btnEmail.addEventListener('click', async () => {

@@ -860,6 +860,18 @@ async function handleMessage(msg, sender) {
       return { ok: true };
     }
 
+    case 'OPEN_DASHBOARD': {
+      try {
+        const hash = typeof msg.hash === 'string' ? msg.hash : '';
+        const url = chrome.runtime.getURL('dashboard/dashboard.html') + hash;
+        await chrome.tabs.create({ url });
+        return { ok: true };
+      } catch (err) {
+        console.warn('[Background] OPEN_DASHBOARD failed:', err);
+        return { ok: false, error: err?.message || 'Failed to open dashboard' };
+      }
+    }
+
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }

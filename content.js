@@ -3547,8 +3547,7 @@ async function openResumeMenu() {
       </div>`;
     menu.querySelector('#ja-resume-open-dash')?.addEventListener('click', (e) => {
       e.preventDefault();
-      chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => {});
-      if (chrome.runtime.openOptionsPage) chrome.runtime.openOptionsPage();
+      chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', hash: '#tab-profile' }).catch(() => {});
       closeResumeMenu();
     });
   } else {
