@@ -20,6 +20,27 @@ try {
 
 console.log(`[FormPilot] Content script loaded on: ${location.hostname} (stored under: ${hostname})`);
 
+const BRAND_FONT_ID = 'ja-font-face';
+const BRAND_FONT_URL = chrome.runtime?.getURL
+  ? chrome.runtime.getURL('assets/fonts/plus-jakarta-sans-latin-wght-normal.woff2')
+  : '';
+
+function ensureBrandFont() {
+  if (!BRAND_FONT_URL || document.getElementById(BRAND_FONT_ID)) return;
+  const style = document.createElement('style');
+  style.id = BRAND_FONT_ID;
+  style.textContent = `
+    @font-face {
+      font-family: "FormPilot Sans";
+      font-style: normal;
+      font-weight: 200 800;
+      font-display: swap;
+      src: url("${BRAND_FONT_URL}") format("woff2");
+    }
+  `;
+  (document.head || document.documentElement || document.body).appendChild(style);
+}
+
 let currentGlobalProfile = {};
 let siteData = { enabled: true, fields: {}, mappings: [], flags: {} };
 let currentSiteKey = '';
@@ -40,6 +61,14 @@ let pendingDropdownResolve = null;
 let dropdownResolverOpen = false;
 let lastSubmitIntent = null;
 let approvalQueue = [];
+let lastFocusedField = null;
+let aiPanelOpen = false;
+let aiPanelBusy = false;
+let aiLastAnswer = '';
+let aiLastQuestion = '';
+let aiFocusTrackingAttached = false;
+let essayObserver = null;
+let essayButtons = new Set();
 let jobContextState = { status: 'unknown', signature: '', jobScore: 0, formScore: 0, loginScore: 0, ts: 0 };
 let debugInfo = {};
 let debugOverlayEnabled = false;
@@ -134,6 +163,11 @@ function updateDebugInfo(patch) {
 
 function renderDebugOverlay() {
   if (!isDebugOverlayEnabled()) return;
+  if (isSiteDisabled()) {
+    const existing = document.getElementById('ja-debug-overlay');
+    if (existing) existing.remove();
+    return;
+  }
   let panel = document.getElementById('ja-debug-overlay');
   if (!panel) {
     panel = document.createElement('div');
@@ -142,7 +176,7 @@ function renderDebugOverlay() {
       position: fixed; bottom: 18px; left: 18px; z-index: 2147483646;
       background: #0b1220; color: #e2e8f0; border: 1px solid rgba(148,163,184,0.35);
       border-radius: 12px; padding: 10px 12px; max-width: 360px;
-      font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; font-size: 11px;
+      font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; font-size: 11px;
       box-shadow: 0 12px 32px rgba(0,0,0,0.45);
     `;
     document.body.appendChild(panel);
@@ -220,15 +254,15 @@ function showJobContextPrompt() {
       #ja-job-context-prompt {
         position: fixed; bottom: 18px; right: 18px; z-index: 2147483646;
         background: #0b1220; color: #e2e8f0;
-        border: 1px solid rgba(10, 102, 194, 0.35);
+        border: 1px solid rgba(14, 165, 233, 0.35);
         border-radius: 12px; padding: 12px 14px; max-width: 320px;
         box-shadow: 0 12px 32px rgba(0,0,0,0.5);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
       #ja-job-context-prompt .title { font-weight: 600; }
       #ja-job-context-prompt .actions { display:flex; gap:8px; margin-top: 8px; }
-      #ja-job-yes { background: #0a66c2; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+      #ja-job-yes { background: #0ea5e9; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
       #ja-job-no { background: rgba(255,255,255,0.08); color: #cbd5f5; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
       #ja-job-dismiss { background: transparent; color: #94a3b8; border: none; padding: 6px 6px; cursor: pointer; }
     </style>
@@ -280,6 +314,8 @@ function removeUiOverlays() {
     'ja-confidence-layer',
     'ja-dropdown-resolver',
     'ja-review-panel',
+    'ja-debug-overlay',
+    'ja-ai-panel',
   ];
   ids.forEach(id => {
     const el = document.getElementById(id);
@@ -296,6 +332,9 @@ function suppressSiteUi() {
   setSessionFlag('confidenceDismissed', true);
   try { window._jaObserver?.disconnect?.(); } catch (_) { }
   window._jaObserver = null;
+  try { essayObserver?.disconnect?.(); } catch (_) { }
+  essayObserver = null;
+  cleanupEssayButtons();
   dropdownResolverOpen = false;
   approvalQueue = [];
   pendingCapture = {};
@@ -580,14 +619,14 @@ function showApprovalBanner() {
       #ja-approval-banner {
         position: fixed; top: 18px; right: 18px; z-index: 2147483646;
         background: #0b1220; color: #e2e8f0;
-        border: 1px solid rgba(10, 102, 194, 0.35);
+        border: 1px solid rgba(14, 165, 233, 0.35);
         border-radius: 12px; padding: 12px 14px; max-width: 320px;
         box-shadow: 0 12px 32px rgba(0,0,0,0.5);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
       #ja-approval-banner .actions { display:flex; gap:8px; margin-top: 8px; }
-      #ja-approval-fill { background: #0a66c2; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+      #ja-approval-fill { background: #0ea5e9; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
       #ja-approval-skip { background: rgba(255,255,255,0.08); color: #cbd5f5; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
     </style>
     <div><strong>Approve ${approvalQueue.length} suggestions?</strong></div>
@@ -3026,6 +3065,7 @@ function fillFields(savedFields, opts = {}) {
 
 function reportSiteMetrics(stats) {
   if (!stats) return;
+  if (isSiteDisabled()) return;
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobContextPage()) return;
   const detected = Number(stats.detected || 0);
@@ -3063,8 +3103,88 @@ function attachCorrectionTracker(el, fieldKey, autoFilledVal) {
   el.addEventListener('blur', onCorrect, { once: false });
 }
 
+function maybeInjectEssayButtons() {
+  if (isSiteDisabled() || !shouldShowUi()) return;
+  collectElements('textarea').forEach(el => {
+    if (el.__jaEssayBtn) return;
+    if (!isVisibleElement(el)) return;
+    const label = getFieldKey(el) || getSiteLabel(el) || el.placeholder || '';
+    if (!isEssayQuestion(el, label)) return;
+
+    el.__jaEssayBtn = true;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ja-essay-btn';
+    btn.textContent = '✨ AI Answer';
+    btn.style.cssText = [
+      'position:absolute', 'z-index:2147483640',
+      'background:linear-gradient(135deg,#0ea5e9,#22d3ee)',
+      'color:#f8fafc', 'border:none', 'border-radius:8px',
+      'padding:4px 10px', 'font-size:11px', 'font-weight:700',
+      'cursor:pointer', 'box-shadow:0 2px 8px rgba(14,165,233,.35)',
+      'opacity:0.9', 'transition:opacity .15s',
+    ].join(';');
+    btn.onmouseover = () => { btn.style.opacity = '1'; };
+    btn.onmouseout  = () => { btn.style.opacity = '0.9'; };
+
+    const positionBtn = () => {
+      const rect = el.getBoundingClientRect();
+      btn.style.top  = (rect.top  + window.scrollY + 4) + 'px';
+      btn.style.left = (rect.right + window.scrollX - 110) + 'px';
+    };
+    positionBtn();
+    document.body.appendChild(btn);
+    essayButtons.add(btn);
+    btn.__jaPosHandler = positionBtn;
+
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const originalText = btn.textContent;
+      btn.textContent = '⏳ Generating...';
+      btn.disabled = true;
+      try {
+        const pageText = (document.body?.innerText || '').substring(0, 4000);
+        const resp = await chrome.runtime.sendMessage({
+          type: 'AI_GENERATE_ANSWER',
+          question: label,
+          jobContext: pageText
+        });
+        if (resp?.ok && resp.answer) {
+          setNativeValue(el, resp.answer);
+          triggerEvents(el);
+          el.dispatchEvent(new Event('blur', { bubbles: true }));
+          btn.textContent = '✅ Done';
+          setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+        } else {
+          btn.textContent = '❌ Failed';
+          setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+        }
+      } catch (_) {
+        btn.textContent = originalText;
+        btn.disabled = false;
+      }
+    });
+
+    window.addEventListener('scroll', positionBtn, { passive: true });
+    window.addEventListener('resize', positionBtn, { passive: true });
+  });
+}
+
+function ensureEssayObserver() {
+  if (essayObserver) return;
+  setTimeout(maybeInjectEssayButtons, 1500);
+  essayObserver = new MutationObserver(() => {
+    clearTimeout(essayObserver._t);
+    essayObserver._t = setTimeout(maybeInjectEssayButtons, 600);
+  });
+  try { essayObserver.observe(document.body, { childList: true, subtree: true }); } catch (_) {}
+}
+
 function attachLiveCapture() {
-  if (window._jaLiveCaptureAttached) return;
+  if (window._jaLiveCaptureAttached) {
+    ensureEssayObserver();
+    return;
+  }
   window._jaLiveCaptureAttached = true;
   const handler = (e) => {
     if (isSiteDisabled()) return;
@@ -3104,81 +3224,22 @@ function attachLiveCapture() {
   document.addEventListener('change', handler, true);
   document.addEventListener('blur', handler, true);
   document.addEventListener('click', handler, true);
+  ensureEssayObserver();
+}
 
-  // ── AI Essay Fill Buttons ─────────────────────────────────────
-  // Inject "✨ AI Answer" buttons next to behavioral/essay textareas
-  function maybeInjectEssayButtons() {
-    collectElements('textarea').forEach(el => {
-      if (el.__jaEssayBtn) return;
-      if (!isVisibleElement(el)) return;
-      const label = getFieldKey(el) || getSiteLabel(el) || el.placeholder || '';
-      if (!isEssayQuestion(el, label)) return;
-
-      el.__jaEssayBtn = true;
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.textContent = '✨ AI Answer';
-      btn.style.cssText = [
-        'position:absolute', 'z-index:2147483640',
-        'background:linear-gradient(135deg,#4f46e5,#7c3aed)',
-        'color:#fff', 'border:none', 'border-radius:8px',
-        'padding:4px 10px', 'font-size:11px', 'font-weight:700',
-        'cursor:pointer', 'box-shadow:0 2px 8px rgba(79,70,229,.4)',
-        'opacity:0.9', 'transition:opacity .15s',
-      ].join(';');
-      btn.onmouseover = () => { btn.style.opacity = '1'; };
-      btn.onmouseout  = () => { btn.style.opacity = '0.9'; };
-
-      // Position relative to the textarea
-      const positionBtn = () => {
-        const rect = el.getBoundingClientRect();
-        btn.style.top  = (rect.top  + window.scrollY + 4) + 'px';
-        btn.style.left = (rect.right + window.scrollX - 110) + 'px';
-      };
-      positionBtn();
-      document.body.appendChild(btn);
-
-      btn.addEventListener('click', async (e) => {
-        e.preventDefault(); e.stopPropagation();
-        const originalText = btn.textContent;
-        btn.textContent = '⏳ Generating...';
-        btn.disabled = true;
-        try {
-          const pageText = (document.body?.innerText || '').substring(0, 4000);
-          const resp = await chrome.runtime.sendMessage({
-            type: 'AI_GENERATE_ANSWER',
-            question: label,
-            jobContext: pageText
-          });
-          if (resp?.ok && resp.answer) {
-            setNativeValue(el, resp.answer);
-            triggerEvents(el);
-            el.dispatchEvent(new Event('blur', { bubbles: true }));
-            btn.textContent = '✅ Done';
-            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
-          } else {
-            btn.textContent = '❌ Failed';
-            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
-          }
-        } catch (_) {
-          btn.textContent = originalText;
-          btn.disabled = false;
-        }
-      });
-
-      // Reposition on scroll/resize
-      window.addEventListener('scroll', positionBtn, { passive: true });
-      window.addEventListener('resize', positionBtn, { passive: true });
+function cleanupEssayButtons() {
+  try {
+    essayButtons.forEach(btn => {
+      const handler = btn.__jaPosHandler;
+      if (handler) {
+        window.removeEventListener('scroll', handler);
+        window.removeEventListener('resize', handler);
+      }
+      btn.remove();
     });
-  }
-
-  // Run after slight delay so page is rendered, and re-run on DOM changes
-  setTimeout(maybeInjectEssayButtons, 1500);
-  const essayObserver = new MutationObserver(() => {
-    clearTimeout(essayObserver._t);
-    essayObserver._t = setTimeout(maybeInjectEssayButtons, 600);
-  });
-  try { essayObserver.observe(document.body, { childList: true, subtree: true }); } catch (_) {}
+    essayButtons.clear();
+    document.querySelectorAll('.ja-essay-btn').forEach(btn => btn.remove());
+  } catch (_) { }
 }
 
 // ── Resume Attach (Local Resume Vault) ─────────────────────────
@@ -3244,18 +3305,18 @@ function ensureResumeAttachUI() {
       #ja-resume-attach {
         position: fixed;
         z-index: 2147483647;
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'Sora', 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
       }
       #ja-resume-attach .ja-resume-btn {
-        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-        color: #e2e8f0;
-        border: 1px solid rgba(99,102,241,0.5);
+        background: linear-gradient(135deg, #0ea5e9 0%, #22d3ee 100%);
+        color: #f8fafc;
+        border: 1px solid rgba(14,165,233,0.45);
         border-radius: 10px;
         padding: 8px 14px;
         font-size: 12px;
         font-weight: 700;
         cursor: pointer;
-        box-shadow: 0 4px 18px rgba(0,0,0,0.5), 0 0 0 1px rgba(99,102,241,0.2);
+        box-shadow: 0 4px 18px rgba(0,0,0,0.45), 0 0 0 1px rgba(14,165,233,0.25);
         display: inline-flex;
         align-items: center;
         gap: 7px;
@@ -3264,14 +3325,14 @@ function ensureResumeAttachUI() {
         user-select: none;
       }
       #ja-resume-attach .ja-resume-btn:hover {
-        border-color: rgba(99,102,241,0.85);
-        box-shadow: 0 4px 20px rgba(99,102,241,0.35);
+        border-color: rgba(14,165,233,0.8);
+        box-shadow: 0 6px 22px rgba(14,165,233,0.38);
       }
       #ja-resume-attach .ja-resume-flair {
         display: inline-block;
         width: 7px; height: 7px; border-radius: 50%;
-        background: #6366f1;
-        box-shadow: 0 0 5px #6366f1;
+        background: #0ea5e9;
+        box-shadow: 0 0 6px rgba(14,165,233,0.8);
         flex-shrink: 0;
       }
       /* Menu — default opens below; [data-open-up=true] flips it above */
@@ -3281,11 +3342,11 @@ function ensureResumeAttachUI() {
         top: calc(100% + 8px);
         min-width: 260px;
         background: #0b1220;
-        border: 1px solid rgba(99,102,241,0.4);
+        border: 1px solid rgba(14,165,233,0.4);
         border-radius: 12px;
         padding: 6px;
         display: none;
-        box-shadow: 0 16px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(99,102,241,0.15);
+        box-shadow: 0 16px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(14,165,233,0.18);
         z-index: 2147483647;
       }
       #ja-resume-attach[data-open-up="true"] .ja-resume-menu {
@@ -3311,7 +3372,7 @@ function ensureResumeAttachUI() {
         color: #e2e8f0;
         transition: background 0.12s;
       }
-      #ja-resume-attach .ja-resume-item:hover { background: rgba(99,102,241,0.14); }
+      #ja-resume-attach .ja-resume-item:hover { background: rgba(14,165,233,0.18); }
       #ja-resume-attach .ja-resume-icon { font-size: 18px; }
       #ja-resume-attach .ja-resume-info { flex: 1; min-width: 0; }
       #ja-resume-attach .ja-resume-name {
@@ -3326,8 +3387,8 @@ function ensureResumeAttachUI() {
         font-size: 10px;
         padding: 2px 7px;
         border-radius: 999px;
-        background: rgba(99,102,241,0.2);
-        color: #a5b4fc;
+        background: rgba(14,165,233,0.2);
+        color: #bfdbfe;
         font-weight: 600;
         white-space: nowrap;
       }
@@ -3338,7 +3399,7 @@ function ensureResumeAttachUI() {
         text-align: center;
       }
       #ja-resume-attach .ja-resume-empty a {
-        color: #6366f1;
+        color: #60a5fa;
         text-decoration: none;
         font-weight: 600;
       }
@@ -3672,6 +3733,310 @@ function isTeachTarget(el) {
   return false;
 }
 
+function attachAiFocusTracking() {
+  if (aiFocusTrackingAttached) return;
+  aiFocusTrackingAttached = true;
+  const handler = (e) => {
+    const el = e.target;
+    if (!el || !isTeachTarget(el)) return;
+    lastFocusedField = el;
+  };
+  document.addEventListener('focusin', handler, true);
+  document.addEventListener('click', handler, true);
+}
+
+function buildAiJobContext() {
+  const info = extractJobInfoLocal();
+  const parts = [];
+  if (info.jobTitle) parts.push(`Job Title: ${info.jobTitle}`);
+  if (info.companyName) parts.push(`Company: ${info.companyName}`);
+  if (info.location) parts.push(`Location: ${info.location}`);
+  if (info.jobType) parts.push(`Job Type: ${info.jobType}`);
+  if (info.salaryRange) parts.push(`Salary: ${info.salaryRange}`);
+  let desc = info.jobDescription || getJobDescriptionText() || getPageTextSample();
+  if (desc) {
+    desc = desc.replace(/\s+/g, ' ').trim().substring(0, 4000);
+    parts.push(`Job Description:\n${desc}`);
+  }
+  return parts.join('\n');
+}
+
+function getQuestionFromField(el) {
+  if (!el) return '';
+  const key = getFieldKey(el) || getSiteLabel(el) || el.getAttribute?.('aria-label') || el.placeholder || el.name || el.id || '';
+  return cleanLabelText(String(key || '').replace(/\*/g, '').trim());
+}
+
+function insertAiAnswerIntoField(answer) {
+  if (!answer) return false;
+  const active = document.activeElement;
+  const target = (active && isTeachTarget(active)) ? active : lastFocusedField;
+  if (!target) return false;
+  if (target.tagName && target.tagName.toUpperCase() === 'SELECT') return false;
+  if (setEditableValue(target, answer)) return true;
+  const tag = (target.tagName || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA') {
+    setNativeValue(target, answer);
+    triggerEvents(target);
+    target.dispatchEvent(new Event('blur', { bubbles: true }));
+    return true;
+  }
+  return false;
+}
+
+function ensureAiAssistPanel() {
+  if (!shouldShowUi()) return;
+  if (document.getElementById('ja-ai-panel')) return;
+
+  const root = document.createElement('div');
+  root.id = 'ja-ai-panel';
+  root.innerHTML = `
+    <style>
+      #ja-ai-panel {
+        position: fixed; right: 18px; bottom: 18px; z-index: 2147483646;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+      }
+      #ja-ai-panel .ja-ai-fab {
+        border: none; border-radius: 999px; padding: 10px 14px;
+        font-size: 12px; font-weight: 700; letter-spacing: 0.4px;
+        background: linear-gradient(135deg, #0ea5e9, #22d3ee);
+        color: #f8fafc; cursor: pointer;
+        box-shadow: 0 10px 26px rgba(15,23,42,0.45), 0 0 0 1px rgba(14,165,233,0.35);
+        transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+      }
+      #ja-ai-panel .ja-ai-fab:hover { transform: translateY(-1px) scale(1.02); }
+      #ja-ai-panel.open .ja-ai-card { display: block; }
+      #ja-ai-panel .ja-ai-card {
+        display: none;
+        width: 330px;
+        margin-bottom: 10px;
+        background: linear-gradient(180deg, #0f172a 0%, #0b1220 100%);
+        border: 1px solid rgba(14,165,233,0.45);
+        border-radius: 16px;
+        padding: 14px 14px 12px 14px;
+        box-shadow: 0 14px 36px rgba(0,0,0,0.55), 0 0 0 1px rgba(14,165,233,0.2);
+        color: #e2e8f0;
+      }
+      #ja-ai-panel .ja-ai-header {
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      }
+      #ja-ai-panel .ja-ai-title { font-weight: 700; font-size: 14px; color: #e2e8f0; }
+      #ja-ai-panel .ja-ai-close {
+        border: none; background: transparent; color: #94a3b8;
+        font-size: 16px; cursor: pointer; padding: 0 4px;
+      }
+      #ja-ai-panel .ja-ai-sub { font-size: 11px; color: #94a3b8; margin: 6px 0 10px; }
+      #ja-ai-panel .ja-ai-quick {
+        display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;
+      }
+      #ja-ai-panel .ja-ai-quick button {
+        border: 1px solid rgba(148,163,184,0.25);
+        background: rgba(148,163,184,0.08);
+        color: #cbd5f5; border-radius: 999px;
+        padding: 4px 8px; font-size: 11px; cursor: pointer;
+      }
+      #ja-ai-panel .ja-ai-label { font-size: 11px; color: #94a3b8; margin: 6px 0 4px; }
+      #ja-ai-panel textarea {
+        width: 100%; min-height: 58px; resize: vertical;
+        background: #0b1220; color: #e2e8f0;
+        border: 1px solid rgba(148,163,184,0.2);
+        border-radius: 10px; padding: 8px; font-size: 12px;
+      }
+      #ja-ai-panel .ja-ai-actions {
+        display: flex; gap: 8px; justify-content: space-between; margin-top: 8px;
+      }
+      #ja-ai-panel .ja-ai-actions button,
+      #ja-ai-panel .ja-ai-footer button {
+        border: none; border-radius: 10px; padding: 6px 10px;
+        font-size: 12px; font-weight: 600; cursor: pointer;
+      }
+      #ja-ai-panel #ja-ai-use-field {
+        background: rgba(255,255,255,0.08); color: #cbd5f5;
+      }
+      #ja-ai-panel #ja-ai-generate {
+        background: #0ea5e9; color: #f8fafc;
+      }
+      #ja-ai-panel .ja-ai-output {
+        background: #0b1220;
+        border: 1px solid rgba(148,163,184,0.18);
+        border-radius: 10px; padding: 8px;
+        font-size: 12px; color: #e2e8f0;
+        min-height: 90px; white-space: pre-wrap;
+      }
+      #ja-ai-panel .ja-ai-footer { display: flex; gap: 8px; justify-content: space-between; margin-top: 8px; }
+      #ja-ai-panel #ja-ai-copy { background: rgba(255,255,255,0.08); color: #cbd5f5; }
+      #ja-ai-panel #ja-ai-insert { background: #0284c7; color: #f8fafc; }
+      #ja-ai-panel .ja-ai-status { margin-top: 6px; font-size: 11px; color: #94a3b8; min-height: 14px; }
+    </style>
+    <div class="ja-ai-card" role="dialog" aria-label="AI Assist Panel">
+      <div class="ja-ai-header">
+        <div class="ja-ai-title">AI Assist</div>
+        <button id="ja-ai-close" class="ja-ai-close" type="button">×</button>
+      </div>
+      <div class="ja-ai-sub">Draft answers using your profile + this job page.</div>
+      <div class="ja-ai-quick">
+        <button type="button" data-q="Why are you a good fit for this role?">Why I'm a good fit</button>
+        <button type="button" data-q="Summarize your most relevant experience for this job.">Relevant experience</button>
+        <button type="button" data-q="What excites you about this company?">Why this company</button>
+        <button type="button" data-q="Describe a project that matches this role.">Project example</button>
+      </div>
+      <div class="ja-ai-label">Question</div>
+      <textarea id="ja-ai-question" placeholder="Type a question or tap a quick prompt…"></textarea>
+      <div class="ja-ai-actions">
+        <button id="ja-ai-use-field" type="button">Use field label</button>
+        <button id="ja-ai-generate" type="button">Generate</button>
+      </div>
+      <div class="ja-ai-label">Answer</div>
+      <div id="ja-ai-output" class="ja-ai-output">Generated answer will appear here.</div>
+      <div class="ja-ai-footer">
+        <button id="ja-ai-copy" type="button">Copy</button>
+        <button id="ja-ai-insert" type="button">Insert into field</button>
+      </div>
+      <div id="ja-ai-status" class="ja-ai-status"></div>
+    </div>
+    <button id="ja-ai-toggle" class="ja-ai-fab" type="button">AI Assist</button>
+  `;
+
+  document.body.appendChild(root);
+
+  const toggleBtn = root.querySelector('#ja-ai-toggle');
+  const closeBtn = root.querySelector('#ja-ai-close');
+  const qInput = root.querySelector('#ja-ai-question');
+  const output = root.querySelector('#ja-ai-output');
+  const genBtn = root.querySelector('#ja-ai-generate');
+  const useFieldBtn = root.querySelector('#ja-ai-use-field');
+  const copyBtn = root.querySelector('#ja-ai-copy');
+  const insertBtn = root.querySelector('#ja-ai-insert');
+  const status = root.querySelector('#ja-ai-status');
+
+  const setOpen = (open) => {
+    aiPanelOpen = open;
+    root.classList.toggle('open', open);
+    if (open && qInput && !qInput.value) {
+      const q = getQuestionFromField(lastFocusedField);
+      if (q) qInput.value = q;
+    }
+  };
+
+  const setStatus = (msg, isError = false) => {
+    status.textContent = msg || '';
+    status.style.color = isError ? '#fca5a5' : '#94a3b8';
+  };
+
+  const setBusy = (busy, label) => {
+    aiPanelBusy = busy;
+    genBtn.disabled = busy;
+    genBtn.textContent = busy ? (label || 'Generating…') : 'Generate';
+  };
+
+  toggleBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    setOpen(!aiPanelOpen);
+  });
+  closeBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    setOpen(false);
+  });
+
+  root.querySelectorAll('.ja-ai-quick button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      qInput.value = btn.getAttribute('data-q') || '';
+      qInput.focus();
+    });
+  });
+
+  useFieldBtn.addEventListener('click', () => {
+    const label = getQuestionFromField(lastFocusedField);
+    if (!label) {
+      setStatus('Focus a field first to use its label.', true);
+      return;
+    }
+    qInput.value = label;
+    setStatus('Loaded field label.', false);
+    qInput.focus();
+  });
+
+  const generate = async () => {
+    const question = (qInput.value || '').trim();
+    if (!question) {
+      setStatus('Enter a question to generate an answer.', true);
+      return;
+    }
+    if (aiPanelBusy) return;
+    setBusy(true);
+    setStatus('Working on it…');
+    output.textContent = 'Generating answer…';
+    try {
+      const jobContext = buildAiJobContext();
+      const resp = await chrome.runtime.sendMessage({
+        type: 'AI_GENERATE_ANSWER',
+        question,
+        jobContext,
+      }).catch(() => null);
+      if (resp?.ok && resp.answer) {
+        aiLastAnswer = resp.answer;
+        aiLastQuestion = question;
+        output.textContent = resp.answer;
+        setStatus('Answer ready.');
+      } else {
+        output.textContent = 'No answer returned.';
+        setStatus(resp?.error || 'Failed to generate answer.', true);
+      }
+    } catch (err) {
+      output.textContent = 'Error generating answer.';
+      setStatus(err?.message || 'Failed to generate answer.', true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  genBtn.addEventListener('click', generate);
+  qInput.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      e.preventDefault();
+      generate();
+    }
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    if (!aiLastAnswer) {
+      setStatus('No answer to copy yet.', true);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(aiLastAnswer);
+      setStatus('Copied to clipboard.');
+    } catch (_) {
+      setStatus('Copy failed. Select and copy manually.', true);
+    }
+  });
+
+  insertBtn.addEventListener('click', () => {
+    if (!aiLastAnswer) {
+      setStatus('No answer to insert yet.', true);
+      return;
+    }
+    const ok = insertAiAnswerIntoField(aiLastAnswer);
+    if (ok) {
+      setStatus('Inserted into the focused field.');
+    } else {
+      setStatus('Focus a text field to insert.', true);
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!aiPanelOpen) return;
+    if (root.contains(e.target)) return;
+    setOpen(false);
+  }, true);
+}
+
+function initAiAssistPanel() {
+  if (!shouldShowUi()) return;
+  attachAiFocusTracking();
+  ensureAiAssistPanel();
+}
+
 function attachTeachHover() {
   if (teachHoverAttached) return;
   teachHoverAttached = true;
@@ -3735,7 +4100,7 @@ function hideTeachHover() {
 function resolveTeachTarget(startEl) {
   if (!startEl) return null;
   // Ignore clicks inside extension UI
-  if (startEl.closest?.('#ja-teach-overlay, #ja-teach-banner, #ja-dropdown-resolver, #ja-approval-banner, #ja-coverage-banner, #ja-review-panel, #ja-job-context-prompt, #ja-resume-attach, #ja-debug-overlay')) {
+  if (startEl.closest?.('#ja-teach-overlay, #ja-teach-banner, #ja-dropdown-resolver, #ja-approval-banner, #ja-coverage-banner, #ja-review-panel, #ja-job-context-prompt, #ja-resume-attach, #ja-debug-overlay, #ja-ai-panel')) {
     return null;
   }
   // If clicking on an option, map to its parent control
@@ -3822,7 +4187,7 @@ function showTeachBanner() {
         position: fixed; bottom: 18px; right: 18px; z-index: 2147483647;
         background: rgba(17,24,39,0.95); color: #fff; padding: 10px 14px;
         border-radius: 10px; border: 1px solid rgba(99,102,241,0.4);
-        font-size: 12px; font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-size: 12px; font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         box-shadow: 0 8px 20px rgba(0,0,0,0.35);
       }
       #ja-teach-banner strong { color: #a5b4fc; }
@@ -3868,7 +4233,7 @@ function showTeachOverlay({ el, label, signature, type, value }) {
         z-index: 2147483647; background: #0f172a; color: #e2e8f0;
         border: 1px solid rgba(99,102,241,0.4); border-radius: 12px;
         padding: 14px; min-width: 280px; max-width: 360px;
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; box-shadow: 0 12px 30px rgba(0,0,0,0.45);
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; box-shadow: 0 12px 30px rgba(0,0,0,0.45);
       }
       #ja-teach-overlay h4 { margin: 0 0 6px; font-size: 13px; color: #a5b4fc; }
       #ja-teach-overlay .label { font-size: 12px; margin-bottom: 10px; color: #cbd5f5; }
@@ -3882,7 +4247,7 @@ function showTeachOverlay({ el, label, signature, type, value }) {
         padding: 6px 10px; border-radius: 8px; border: none; cursor: pointer;
         font-size: 12px; font-weight: 600;
       }
-      #ja-teach-save { background: #6366f1; color: #fff; }
+      #ja-teach-save { background: #0ea5e9; color: #f8fafc; }
       #ja-teach-cancel { background: rgba(255,255,255,0.08); color: #cbd5f5; }
     </style>
     <h4>Teach Field</h4>
@@ -4040,10 +4405,10 @@ function showDropdownResolver(unresolved) {
       #ja-dropdown-resolver {
         position: fixed; bottom: 18px; right: 18px; z-index: 2147483646;
         background: #0b1220; color: #e2e8f0;
-        border: 1px solid rgba(10, 102, 194, 0.35);
+        border: 1px solid rgba(14, 165, 233, 0.35);
         border-radius: 12px; padding: 12px 14px; width: 320px;
         box-shadow: 0 12px 32px rgba(0,0,0,0.5);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
       #ja-dropdown-resolver h4 { margin: 0 0 8px 0; font-size: 13px; color: #93c5fd; }
@@ -4054,7 +4419,7 @@ function showDropdownResolver(unresolved) {
         border-radius: 8px; padding: 4px 6px; font-size: 12px; min-width: 140px;
       }
       #ja-dropdown-resolver .ja-dd-btn {
-        background: #0a66c2; color: #fff; border: none; border-radius: 8px;
+        background: #0ea5e9; color: #fff; border: none; border-radius: 8px;
         padding: 5px 10px; font-size: 12px; cursor: pointer;
       }
       #ja-dropdown-resolver .ja-dd-actions { display:flex; justify-content:flex-end; gap:8px; margin-top: 6px; }
@@ -4172,10 +4537,10 @@ function showReviewPanel() {
       #ja-review-panel {
         position: fixed; top: 18px; left: 18px; z-index: 2147483646;
         background: #0b1220; color: #e2e8f0;
-        border: 1px solid rgba(10, 102, 194, 0.35);
+        border: 1px solid rgba(14, 165, 233, 0.35);
         border-radius: 12px; padding: 12px 14px; width: 320px;
         box-shadow: 0 12px 32px rgba(0,0,0,0.5);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
       #ja-review-panel h4 { margin: 0 0 6px 0; font-size: 13px; color: #93c5fd; }
@@ -4185,7 +4550,7 @@ function showReviewPanel() {
       #ja-review-panel button {
         border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer;
       }
-      #ja-review-teach { background: #0a66c2; color: #fff; }
+      #ja-review-teach { background: #0ea5e9; color: #fff; }
       #ja-review-dismiss { background: rgba(255,255,255,0.08); color: #cbd5f5; }
       #ja-review-panel .ja-review-good { color:#86efac; }
     </style>
@@ -4269,7 +4634,7 @@ function showConfidenceOverlay(savedFields) {
         position: fixed; bottom: 18px; left: 18px; pointer-events: auto;
         background: #0b1220; border: 1px solid rgba(148,163,184,0.3);
         border-radius: 10px; padding: 8px 10px; color: #e2e8f0;
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; font-size: 11px;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; font-size: 11px;
       }
       .ja-conf-legend span { display: inline-flex; align-items:center; gap:6px; margin-right: 8px; }
       .ja-conf-legend button {
@@ -4347,7 +4712,7 @@ function showCoverageBanner(stats) {
         border: 1px solid rgba(56,189,248,0.35);
         border-radius: 12px; padding: 12px 14px;
         box-shadow: 0 8px 28px rgba(0,0,0,0.5);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; color: #e2e8f0; font-size: 12px;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; color: #e2e8f0; font-size: 12px;
         max-width: 320px;
       }
       #ja-coverage-banner .row { display:flex; gap:10px; align-items:center; justify-content: space-between; }
@@ -4357,7 +4722,7 @@ function showCoverageBanner(stats) {
         border: none; border-radius: 8px; padding: 6px 10px;
         font-size: 12px; font-weight: 600; cursor: pointer;
       }
-      #ja-coverage-teach { background: #38bdf8; color: #0b1220; }
+      #ja-coverage-teach { background: #0ea5e9; color: #f8fafc; }
       #ja-coverage-dismiss { background: rgba(255,255,255,0.08); color: #cbd5f5; }
     </style>
     <div class="row">
@@ -4473,7 +4838,7 @@ function showAutofillBanner(savedFields) {
         border-radius: 14px; padding: 14px 18px;
         display: flex; align-items: center; gap: 12px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(59,130,246,0.15);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         color: #e2e8f0; font-size: 14px;
         animation: ja-slide-in 0.35s cubic-bezier(0.34,1.56,0.64,1);
         max-width: 340px;
@@ -4492,7 +4857,7 @@ function showAutofillBanner(savedFields) {
         transition: all 0.18s;
       }
       #ja-yes { background: #3b82f6; color: #fff; }
-      #ja-yes:hover { background: #2563eb; transform: scale(1.04); }
+      #ja-yes:hover { background: #0b5cab; transform: scale(1.04); }
       #ja-no  { background: rgba(255,255,255,0.08); color: #94a3b8; }
       #ja-no:hover { background: rgba(255,255,255,0.15); }
       #ja-never { background: rgba(239, 68, 68, 0.1); color: #ef4444; }
@@ -4557,7 +4922,7 @@ function showSaveDataBanner(fields) {
         border-radius: 14px; padding: 14px 18px;
         display: flex; align-items: center; gap: 12px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(16, 185, 129, 0.15);
-        font-family: 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         color: #e2e8f0; font-size: 14px;
         animation: ja-slide-in 0.35s cubic-bezier(0.34,1.56,0.64,1);
         max-width: 360px;
@@ -4571,7 +4936,7 @@ function showSaveDataBanner(fields) {
         font-size: 13px; font-weight: 600; cursor: pointer;
         transition: all 0.18s;
       }
-      #ja-save-yes { background: #10b981; color: #fff; }
+      #ja-save-yes { background: #0284c7; color: #f8fafc; }
       #ja-save-yes:hover { background: #059669; transform: scale(1.04); }
       #ja-save-no  { background: rgba(255,255,255,0.08); color: #94a3b8; }
       #ja-save-no:hover { background: rgba(255,255,255,0.15); }
@@ -4970,6 +5335,7 @@ async function init() {
 
   try {
     console.log(`[FormPilot] Initializing on ${location.href}`);
+    ensureBrandFont();
 
     const [resp, profileResp, sessionResp] = await Promise.all([
       chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }),
@@ -5075,6 +5441,7 @@ async function init() {
     if (allowAuto) {
       attachLiveCapture();
       initResumeAttach();
+      initAiAssistPanel();
       
       const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
       const elementsToMap = collectElements(selectors);
@@ -5092,6 +5459,7 @@ async function init() {
         attachRecorder();
         attachLiveCapture();
         initResumeAttach();
+        initAiAssistPanel();
 
         if (savedCount > 0 || globalCount > 0) {
           if (getSessionFlag('autofillActive')) {

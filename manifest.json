@@ -59,7 +59,8 @@
     {
       "resources": [
         "dashboard/pdf.worker.min.js",
-        "dashboard/pdf.min.js"
+        "dashboard/pdf.min.js",
+        "assets/fonts/plus-jakarta-sans-latin-wght-normal.woff2"
       ],
       "matches": [
         "<all_urls>"

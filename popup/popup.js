@@ -6,6 +6,14 @@ let aiEnabled = false;
 let teachActive = false;
 let initInFlight = false;
 let initAttempts = 0;
+const THEME_KEY = 'ui_theme';
+let themePreference = 'system';
+let themeMediaQuery = null;
+let popupDragOffset = { x: 0, y: 0 };
+
+function isSiteDisabledLocal() {
+  return !!(siteData.disabled || siteData.enabled === false || siteData.flags?.neverPrompt);
+}
 
 function withTimeout(promise, ms, fallback = null) {
   let timeoutId;
@@ -26,6 +34,51 @@ function escHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
+function resolveTheme(pref) {
+  if (pref === 'dark' || pref === 'light') return pref;
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  return prefersDark ? 'dark' : 'light';
+}
+
+function updateThemeIcon(resolved) {
+  const icon = document.getElementById('theme-icon');
+  if (!icon) return;
+  if (resolved === 'dark') {
+    icon.innerHTML = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
+  } else {
+    icon.innerHTML = '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>';
+  }
+}
+
+function applyTheme(pref) {
+  themePreference = pref || 'system';
+  const resolved = resolveTheme(themePreference);
+  document.documentElement.dataset.theme = resolved;
+  updateThemeIcon(resolved);
+}
+
+async function initTheme() {
+  try {
+    const stored = await chrome.storage.local.get(THEME_KEY);
+    const pref = stored?.[THEME_KEY] || 'system';
+    applyTheme(pref);
+  } catch (_) {
+    applyTheme('system');
+  }
+  if (!themeMediaQuery && window.matchMedia) {
+    themeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    themeMediaQuery.addEventListener('change', () => {
+      if (themePreference === 'system') applyTheme('system');
+    });
+  }
+}
+
+async function cycleTheme() {
+  const next = themePreference === 'system' ? 'light' : themePreference === 'light' ? 'dark' : 'system';
+  applyTheme(next);
+  try { await chrome.storage.local.set({ [THEME_KEY]: next }); } catch (_) {}
+}
+
 function showToast(msg, type = 'info') {
   const existing = document.querySelector('.toast');
   if (existing) existing.remove();
@@ -43,7 +96,13 @@ function showToast(msg, type = 'info') {
 function renderFields(fields) {
   const list = document.getElementById('fields-list');
   const keys = Object.keys(fields || {});
-  document.getElementById('field-count').textContent = keys.length;
+  const disabled = isSiteDisabledLocal();
+  document.getElementById('field-count').textContent = disabled ? '—' : keys.length;
+
+  if (disabled) {
+    list.innerHTML = '<div class="empty-state">Extension is disabled for this site.</div>';
+    return;
+  }
 
   if (keys.length === 0) {
     list.innerHTML = '<div class="empty-state">No data saved yet.<br/>Enable the site and submit a form.</div>';
@@ -93,15 +152,20 @@ function updateStatusUI() {
   const st = document.getElementById('status-text');
   const btnSave = document.getElementById('btn-save');
   const btnFill = document.getElementById('btn-autofill');
+  const btnTeach = document.getElementById('btn-teach');
 
-  if (siteData.disabled) {
+  const disabled = isSiteDisabledLocal();
+
+  if (disabled) {
     tog.checked = false;
     sub.innerHTML = '<span style="color:var(--danger)">Extension disabled for this site</span>';
-    st.textContent = 'Blocked';
+    st.textContent = siteData.disabled ? 'Blocked' : 'Disabled';
     st.className = 'stat-value inactive';
     document.body.classList.add('site-disabled');
     btnSave.disabled = true;
     btnFill.disabled = true;
+    if (btnTeach) btnTeach.disabled = true;
+    renderFields({});
     return;
   }
 
@@ -112,6 +176,7 @@ function updateStatusUI() {
   st.className = siteData.enabled ? 'stat-value active' : 'stat-value inactive';
   btnSave.disabled = !siteData.enabled;
   btnFill.disabled = !siteData.enabled;
+  if (btnTeach) btnTeach.disabled = !siteData.enabled;
 }
 
 function setLoading(btnId, isLoading) {
@@ -128,6 +193,58 @@ function setLoading(btnId, isLoading) {
     }
     btn.disabled = false;
   }
+}
+
+async function initPopupDrag() {
+  const shell = document.getElementById('main-ui');
+  const handle = document.querySelector('.drag-handle');
+  if (!shell || !handle) return;
+
+  try {
+    const stored = await chrome.storage.local.get('popup_offset');
+    const saved = stored?.popup_offset;
+    if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+      popupDragOffset = { x: saved.x, y: saved.y };
+      shell.style.transform = `translate(${popupDragOffset.x}px, ${popupDragOffset.y}px)`;
+    }
+  } catch (_) {}
+
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  let baseX = 0;
+  let baseY = 0;
+
+  handle.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest('button, a, input, select, textarea')) return;
+    dragging = true;
+    handle.classList.add('dragging');
+    startX = e.clientX;
+    startY = e.clientY;
+    baseX = popupDragOffset.x;
+    baseY = popupDragOffset.y;
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    const maxX = 80;
+    const maxY = 120;
+    const nextX = Math.max(-maxX, Math.min(maxX, baseX + dx));
+    const nextY = Math.max(-maxY, Math.min(maxY, baseY + dy));
+    popupDragOffset = { x: nextX, y: nextY };
+    shell.style.transform = `translate(${nextX}px, ${nextY}px)`;
+  });
+
+  document.addEventListener('mouseup', async () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    try { await chrome.storage.local.set({ popup_offset: popupDragOffset }); } catch (_) {}
+  });
 }
 
 // ── Safe tab messaging ─────────────────────────────────────────
@@ -229,6 +346,15 @@ document.getElementById('enable-toggle').addEventListener('change', async (e) =>
       enabled: siteData.enabled,
       clearDisabled: siteData.enabled
     });
+    if (siteData.enabled) {
+      siteData.flags = siteData.flags || {};
+      siteData.flags.neverPrompt = false;
+      await chrome.runtime.sendMessage({
+        type: 'SET_SITE_FLAGS',
+        hostname: currentHostname,
+        flags: { neverPrompt: false }
+      });
+    }
     const tab = await getActiveTab();
     if (tab?.id) {
       await sendToTab(tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: siteData.enabled });
@@ -571,4 +697,8 @@ function setupAuthListeners() {
 }
 
 // ── Kickoff ────────────────────────────────────────────────────
+initTheme();
+initPopupDrag();
+const themeBtn = document.getElementById('btn-theme-toggle');
+if (themeBtn) themeBtn.addEventListener('click', () => { cycleTheme(); });
 init();

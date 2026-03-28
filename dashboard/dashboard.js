@@ -8,12 +8,83 @@ let aiSettings = {};
 let resumeVault = { items: [], defaultId: null };
 let cloudPrefs = { enabled: false, syncProfile: true, syncAutofill: false, syncApplications: false, syncAiSettings: false };
 let usageMetrics = {};
+let cloudStatus = { configured: false, loggedIn: false, user: null, lastSync: null };
+const THEME_KEY = 'ui_theme';
+let themePreference = 'system';
+let themeMediaQuery = null;
 
 // ── Helpers ────────────────────────────────────────────────────
+function bindEvent(id, event, handler) {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    el.addEventListener(event, handler);
+    return el;
+}
+
 function escHtml(str) {
     const d = document.createElement('div');
     d.textContent = String(str);
     return d.innerHTML;
+}
+
+function normalizeUrl(url) {
+    const raw = (url || '').trim();
+    if (!raw) return '';
+    if (/^(https?:)?\/\//i.test(raw)) return raw;
+    if (/^(mailto:|tel:)/i.test(raw)) return raw;
+    return 'https://' + raw;
+}
+
+function setStatePill(id, text, state) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove('state-on', 'state-off', 'state-warn');
+    if (state) el.classList.add(state);
+}
+
+function resolveTheme(pref) {
+    if (pref === 'dark' || pref === 'light') return pref;
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    return prefersDark ? 'dark' : 'light';
+}
+
+function applyTheme(pref) {
+    themePreference = pref || 'system';
+    const resolved = resolveTheme(themePreference);
+    document.documentElement.dataset.theme = resolved;
+    document.querySelectorAll('.theme-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.theme === themePreference);
+    });
+}
+
+async function initTheme() {
+    try {
+        const stored = await chrome.storage.local.get(THEME_KEY);
+        const pref = stored?.[THEME_KEY] || 'system';
+        applyTheme(pref);
+    } catch (_) {
+        applyTheme('system');
+    }
+    if (!themeMediaQuery && window.matchMedia) {
+        themeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+        themeMediaQuery.addEventListener('change', () => {
+            if (themePreference === 'system') applyTheme('system');
+        });
+    }
+    bindThemeToggle();
+}
+
+function bindThemeToggle() {
+    document.querySelectorAll('.theme-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const pref = btn.dataset.theme || 'system';
+            applyTheme(pref);
+            try {
+                await chrome.storage.local.set({ [THEME_KEY]: pref });
+            } catch (_) {}
+        });
+    });
 }
 
 function showToast(msg, type = 'info') {
@@ -130,11 +201,11 @@ function showConfirmModal(title, message, onConfirm) {
     document.getElementById('confirm-modal').hidden = false;
     confirmCallback = onConfirm;
 }
-document.getElementById('modal-cancel').addEventListener('click', () => {
+bindEvent('modal-cancel','click', () => {
     document.getElementById('confirm-modal').hidden = true;
     confirmCallback = null;
 });
-document.getElementById('modal-confirm').addEventListener('click', async () => {
+bindEvent('modal-confirm','click', async () => {
     document.getElementById('confirm-modal').hidden = true;
     if (confirmCallback) await confirmCallback();
     confirmCallback = null;
@@ -168,7 +239,7 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     });
 });
 
-document.getElementById('btn-view-all-apps').addEventListener('click', () => {
+bindEvent('btn-view-all-apps','click', () => {
     document.querySelector('[data-tab="tracker"]').click();
 });
 
@@ -176,6 +247,12 @@ document.getElementById('btn-view-all-apps').addEventListener('click', () => {
 async function loadAllData() {
     try {
         const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
+        cloudStatus = {
+            configured: !!authStatus?.configured,
+            loggedIn: !!authStatus?.loggedIn,
+            user: authStatus?.user || null,
+            lastSync: authStatus?.lastSync || null,
+        };
         // Allow local-only usage without login
         document.getElementById('dashboard-auth-shield').style.display = 'none';
         document.getElementById('main-dashboard-app').style.display = 'flex';
@@ -205,7 +282,6 @@ async function loadAllData() {
         renderInterviewAppSelect();
         renderDisabledSites();
         renderAiSettings();
-        renderCloudSync();
         loadResumeVault();
     } catch (err) {
         console.error('[Dashboard] Render error:', err);
@@ -216,6 +292,7 @@ async function loadAllData() {
 function renderOverview() {
     const sites = Object.keys(allData.sites || {});
     const activeSites = sites.filter(s => allData.sites[s]?.enabled && !allData.sites[s]?.disabled);
+    const disabledSites = sites.filter(s => allData.sites[s]?.disabled || allData.sites[s]?.enabled === false);
     const qualityScores = sites
         .map(s => getSiteQuality(allData.sites[s]))
         .filter(v => typeof v === 'number');
@@ -229,6 +306,13 @@ function renderOverview() {
     document.getElementById('stat-ai-status').textContent = aiSettings.enabled ? 'Active' : 'Off';
     const qualityEl = document.getElementById('stat-quality-score');
     if (qualityEl) qualityEl.textContent = avgQuality === null ? '--' : `${avgQuality}`;
+
+    const cloudText = cloudStatus.configured
+        ? (cloudStatus.loggedIn ? 'Cloud Sync: Connected' : 'Cloud Sync: Disconnected')
+        : 'Cloud Sync: Not Configured';
+    const cloudState = cloudStatus.configured ? (cloudStatus.loggedIn ? 'state-on' : 'state-warn') : 'state-off';
+    setStatePill('state-cloud', cloudText, cloudState);
+    setStatePill('state-disabled-sites', `Disabled Sites: ${disabledSites.length}`, disabledSites.length > 0 ? 'state-warn' : 'state-on');
 
     // Recent Applications
     const list = document.getElementById('recent-apps-list');
@@ -263,6 +347,7 @@ function renderOverview() {
         pct === 100 ? 'Your profile is complete! 🎉' :
             pct >= 50 ? 'Keep going! Add more to unlock better AI features.' :
                 'Upload your resume for instant AI-powered profile setup';
+    setStatePill('state-profile', `Profile: ${pct}% complete`, pct >= 80 ? 'state-on' : (pct >= 40 ? 'state-warn' : 'state-off'));
 }
 
 // ── METRICS TAB ───────────────────────────────────────────────
@@ -469,7 +554,7 @@ function attachSiteListeners() {
     });
 }
 
-document.getElementById('site-search').addEventListener('input', (e) => {
+bindEvent('site-search','input', (e) => {
     renderSites(e.target.value);
 });
 
@@ -517,8 +602,8 @@ function addSkill() {
     input.focus();
 }
 
-document.getElementById('btn-add-skill').addEventListener('click', addSkill);
-document.getElementById('skill-input').addEventListener('keydown', e => {
+bindEvent('btn-add-skill','click', addSkill);
+bindEvent('skill-input','keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); addSkill(); }
 });
 
@@ -558,7 +643,7 @@ function renderWorkHistory() {
     });
 }
 
-document.getElementById('btn-add-work').addEventListener('click', () => {
+bindEvent('btn-add-work','click', () => {
     if (!globalProfile.workHistory) globalProfile.workHistory = [];
     globalProfile.workHistory.push({ company: '', title: '', location: '', startDate: '', endDate: '', bullets: [] });
     renderWorkHistory();
@@ -595,14 +680,14 @@ function renderEducation() {
     });
 }
 
-document.getElementById('btn-add-edu').addEventListener('click', () => {
+bindEvent('btn-add-edu','click', () => {
     if (!globalProfile.education) globalProfile.education = [];
     globalProfile.education.push({ school: '', degree: '', field: '', endDate: '', gpa: '' });
     renderEducation();
 });
 
 // Save Profile
-document.getElementById('profile-form').addEventListener('submit', async (e) => {
+bindEvent('profile-form','submit', async (e) => {
     e.preventDefault();
     // Collect basic fields from form
     const basicFields = ['firstName', 'lastName', 'email', 'phone', 'linkedin', 'github', 'portfolio', 'address', 'city', 'state', 'zipcode', 'currentCompany', 'currentTitle', 'totalYearsExperience', 'summary'];
@@ -760,10 +845,10 @@ if (resumeVaultBtn && resumeVaultInput) {
 }
 
 // ── Resume Parsing ─────────────────────────────────────────────
-document.getElementById('btn-upload-resume').addEventListener('click', () => {
+bindEvent('btn-upload-resume','click', () => {
     document.getElementById('resume-file-input').click();
 });
-document.getElementById('resume-file-input').addEventListener('change', async (e) => {
+bindEvent('resume-file-input','change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
 
@@ -849,7 +934,7 @@ document.getElementById('resume-file-input').addEventListener('change', async (e
     e.target.value = '';
 });
 
-document.getElementById('btn-parse-resume').addEventListener('click', async () => {
+bindEvent('btn-parse-resume','click', async () => {
     const text = document.getElementById('resume-text').value.trim();
     if (!text) { showToast('Please paste or upload your resume text first', 'error'); return; }
 
@@ -891,14 +976,88 @@ document.getElementById('btn-parse-resume').addEventListener('click', async () =
 
 // ── APPLICATION TRACKER TAB ────────────────────────────────────
 let currentFilter = 'all';
+let currentTrackerView = 'board';
+let dragAppId = null;
+
+const TRACKER_STATUSES = ['applied', 'screening', 'interviewing', 'offer', 'rejected'];
+
+function getFilteredApplications() {
+    return currentFilter === 'all'
+        ? applications
+        : applications.filter(a => a.status === currentFilter);
+}
+
+function statusLabel(status) {
+    return status ? status.charAt(0).toUpperCase() + status.slice(1) : 'Unknown';
+}
+
+function renderTrackerSummary() {
+    const summaryRoot = document.querySelector('.tracker-summary');
+    if (!summaryRoot) return;
+    const counts = TRACKER_STATUSES.reduce((acc, status) => {
+        acc[status] = applications.filter(app => app.status === status).length;
+        return acc;
+    }, {});
+    const total = applications.length;
+
+    const totalEl = document.getElementById('summary-total');
+    if (totalEl) totalEl.textContent = total;
+    const mapping = {
+        applied: 'summary-applied',
+        screening: 'summary-screening',
+        interviewing: 'summary-interviewing',
+        offer: 'summary-offer',
+        rejected: 'summary-rejected',
+    };
+    Object.entries(mapping).forEach(([status, id]) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = counts[status] || 0;
+    });
+
+    document.querySelectorAll('.tracker-summary-item').forEach(item => {
+        const status = item.dataset.summaryStatus || 'all';
+        const active = currentFilter === status || (currentFilter === 'all' && status === 'all');
+        item.classList.toggle('active', active);
+    });
+}
+
+function bindTrackerSummary() {
+    if (window._trackerSummaryBound) return;
+    window._trackerSummaryBound = true;
+    document.querySelectorAll('.tracker-summary-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const status = item.dataset.summaryStatus || 'all';
+            currentFilter = status;
+            document.querySelectorAll('.filter-btn').forEach(b => {
+                b.classList.toggle('active', b.dataset.status === status);
+            });
+            renderTracker();
+        });
+    });
+}
 
 function renderTracker() {
     const list = document.getElementById('applications-list');
-    const filtered = currentFilter === 'all'
-        ? applications
-        : applications.filter(a => a.status === currentFilter);
+    const board = document.getElementById('applications-board');
+    const filtered = getFilteredApplications();
 
     document.getElementById('tracker-count').textContent = `${filtered.length} application${filtered.length !== 1 ? 's' : ''}`;
+    renderTrackerSummary();
+    bindTrackerSummary();
+
+    if (currentTrackerView === 'list') {
+        board.hidden = true;
+        list.hidden = false;
+        renderTrackerList(filtered);
+    } else {
+        list.hidden = true;
+        board.hidden = false;
+        renderTrackerBoard(filtered);
+    }
+}
+
+function renderTrackerList(filtered) {
+    const list = document.getElementById('applications-list');
 
     if (filtered.length === 0) {
         list.innerHTML = '<div class="empty-state">No applications found.<br>Applications auto-log when you apply, or add them manually.</div>';
@@ -914,6 +1073,9 @@ function renderTracker() {
           <div title="AI Match Score" style="display:flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:${msColor};padding:3px 7px;background:${msColor}15;border-radius:20px;border:1px solid ${msColor}33;">
             🤖 ${msLabel}
           </div>`;
+        const linkIcon = app.url
+            ? `<a class="app-link-icon" href="${normalizeUrl(app.url)}" target="_blank" title="Open job link">↗</a>`
+            : '';
         return `
         <div class="app-card" data-app-id="${app.id}">
             <div class="app-card-header" data-apptoggle="${app.id}">
@@ -925,6 +1087,7 @@ function renderTracker() {
                     </div>
                 </div>
                 <div class="app-card-right">
+                    ${linkIcon}
                     ${matchBadge}
                     <span class="app-card-date">${relativeDate(app.appliedAt)}</span>
                     <span class="app-status-badge ${app.status}">${app.status}</span>
@@ -944,7 +1107,7 @@ function renderTracker() {
                     <div class="app-detail-item">
                         <span class="app-detail-label">Status</span>
                         <select class="app-status-select" data-appstatus="${app.id}">
-                            ${['applied', 'screening', 'interviewing', 'offer', 'rejected'].map(s =>
+                            ${TRACKER_STATUSES.map(s =>
         `<option value="${s}" ${s === app.status ? 'selected' : ''}>${s}</option>`
     ).join('')}
                         </select>
@@ -956,7 +1119,7 @@ function renderTracker() {
                             ${ms}/100 &mdash; ${app.matchDetails?.recommendation ? escHtml(app.matchDetails.recommendation.substring(0, 60)) : ''}
                         </span>
                     </div>` : ''}
-                    ${app.url ? `<div class="app-detail-item"><span class="app-detail-label">URL</span><a href="${app.url}" target="_blank" style="color:var(--blue-400);font-size:13px;text-decoration:none;">Open →</a></div>` : ''}
+                    ${app.url ? `<div class="app-detail-item"><span class="app-detail-label">URL</span><a href="${normalizeUrl(app.url)}" target="_blank" class="app-link-icon" style="border:none;padding:0;">Open →</a></div>` : ''}
                 </div>
                 <div class="app-notes-area">
                     <label>Notes</label>
@@ -973,6 +1136,62 @@ function renderTracker() {
         </div>`;
     }).join('');
     attachTrackerListeners();
+}
+
+function renderTrackerBoard(filtered) {
+    const board = document.getElementById('applications-board');
+
+    if (filtered.length === 0) {
+        board.innerHTML = '<div class="empty-state">No applications found.<br>Applications auto-log when you apply, or add them manually.</div>';
+        return;
+    }
+
+    const statuses = currentFilter === 'all' ? TRACKER_STATUSES : [currentFilter];
+    const grouped = {};
+    statuses.forEach(s => { grouped[s] = []; });
+    filtered.forEach(app => {
+        if (grouped[app.status]) grouped[app.status].push(app);
+    });
+
+    const columns = statuses.map(status => {
+        const items = grouped[status] || [];
+        const cards = items.map(app => {
+            const hasMatch = typeof app.matchScore === 'number';
+            const ms = hasMatch ? app.matchScore : null;
+            const msColor = ms !== null ? (ms >= 75 ? '#22c55e' : ms >= 50 ? '#f59e0b' : '#ef4444') : 'var(--text-dim)';
+            const matchBadge = hasMatch
+                ? `<span style="font-size:10px;font-weight:700;color:${msColor};background:${msColor}15;border-radius:12px;padding:2px 6px;border:1px solid ${msColor}33;">🤖 ${ms}%</span>`
+                : '';
+            return `
+              <div class="kanban-card" data-app-id="${app.id}">
+                <div class="kanban-card-header">
+                  <div class="kanban-card-title">${escHtml(app.companyName)}</div>
+                  <span class="kanban-drag" draggable="true" data-app-id="${app.id}" title="Drag to move">⋮⋮</span>
+                </div>
+                <div class="kanban-card-role">${escHtml(app.jobTitle || 'Untitled Role')}</div>
+                <div class="kanban-card-meta">
+                  <span>${relativeDate(app.appliedAt)}</span>
+                  ${matchBadge}
+                  ${app.url ? `<a class="kanban-card-link" href="${normalizeUrl(app.url)}" target="_blank">Open</a>` : ''}
+                </div>
+              </div>
+            `;
+        }).join('');
+        return `
+          <div class="kanban-column" data-status="${status}">
+            <div class="kanban-column-header">
+              <span>${statusLabel(status)}</span>
+              <span class="kanban-count">${items.length}</span>
+            </div>
+            <div class="kanban-list">
+              ${cards || '<div class="empty-state" style="padding:6px 8px;">No items</div>'}
+            </div>
+          </div>
+        `;
+    }).join('');
+
+    board.innerHTML = `<div class="kanban-board">${columns}</div>`;
+    attachBoardListeners();
 }
 
 function attachTrackerListeners() {
@@ -997,6 +1216,12 @@ function attachTrackerListeners() {
                 renderOverview();
                 showToast('✓ Status updated', 'success');
             }
+        });
+    });
+    // Prevent job link clicks from toggling cards
+    document.querySelectorAll('.app-link-icon').forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.stopPropagation();
         });
     });
     // Notes save on blur
@@ -1121,6 +1346,47 @@ function attachTrackerListeners() {
     });
 }
 
+function attachBoardListeners() {
+    document.querySelectorAll('.kanban-drag').forEach(handle => {
+        handle.addEventListener('dragstart', (e) => {
+            const id = handle.dataset.appId;
+            dragAppId = id;
+            e.dataTransfer.setData('text/plain', id);
+            e.dataTransfer.effectAllowed = 'move';
+        });
+        handle.addEventListener('dragend', () => {
+            dragAppId = null;
+            document.querySelectorAll('.kanban-column').forEach(col => col.classList.remove('drag-over'));
+        });
+    });
+
+    document.querySelectorAll('.kanban-column').forEach(col => {
+        col.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            col.classList.add('drag-over');
+        });
+        col.addEventListener('dragleave', () => {
+            col.classList.remove('drag-over');
+        });
+        col.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            col.classList.remove('drag-over');
+            const id = e.dataTransfer.getData('text/plain') || dragAppId;
+            const status = col.dataset.status;
+            if (!id || !status) return;
+            const app = applications.find(a => a.id === id);
+            if (!app || app.status === status) return;
+            const resp = await chrome.runtime.sendMessage({ type: 'APP_UPDATE', id, updates: { status } });
+            if (resp.ok) {
+                applications = resp.apps;
+                renderTracker();
+                renderOverview();
+                showToast(`✓ Moved to ${statusLabel(status)}`, 'success');
+            }
+        });
+    });
+}
+
 // Filter buttons
 document.querySelectorAll('.filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1131,20 +1397,30 @@ document.querySelectorAll('.filter-btn').forEach(btn => {
     });
 });
 
+document.querySelectorAll('.view-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentTrackerView = btn.dataset.view || 'board';
+        renderTracker();
+    });
+});
+
 // Add Application Modal
-document.getElementById('btn-add-application').addEventListener('click', () => {
+bindEvent('btn-add-application','click', () => {
     document.getElementById('add-app-modal').hidden = false;
 });
-document.getElementById('add-app-cancel').addEventListener('click', () => {
+bindEvent('add-app-cancel','click', () => {
     document.getElementById('add-app-modal').hidden = true;
 });
-document.getElementById('add-app-save').addEventListener('click', async () => {
+bindEvent('add-app-save','click', async () => {
+    const rawUrl = document.getElementById('app-url').value.trim();
     const app = {
         companyName: document.getElementById('app-company').value.trim(),
         jobTitle: document.getElementById('app-title').value.trim(),
         location: document.getElementById('app-location').value.trim(),
         status: document.getElementById('app-status').value,
-        url: document.getElementById('app-url').value.trim(),
+        url: normalizeUrl(rawUrl),
         jobDescription: document.getElementById('app-jd').value.trim(),
     };
     if (!app.companyName) { showToast('Company name is required', 'error'); return; }
@@ -1171,12 +1447,12 @@ function renderInterviewAppSelect() {
         ).join('');
 }
 
-document.getElementById('interview-app-select').addEventListener('change', (e) => {
+bindEvent('interview-app-select','change', (e) => {
     const app = applications.find(a => a.id === e.target.value);
     if (app) document.getElementById('interview-jd-input').value = app.jobDescription || '';
 });
 
-document.getElementById('btn-generate-interview').addEventListener('click', async () => {
+bindEvent('btn-generate-interview','click', async () => {
     const jd = document.getElementById('interview-jd-input').value.trim();
     if (!jd) { showToast('Please select an application or paste a job description', 'error'); return; }
     const btn = document.getElementById('btn-generate-interview');
@@ -1243,20 +1519,29 @@ function renderQuestionsToAsk(containerId, questions) {
 
 // ── SETTINGS TAB ───────────────────────────────────────────────
 function renderAiSettings() {
-    const provider = aiSettings.provider || 'built-in';
-    document.getElementById('ai-provider').value = provider;
-    document.getElementById('ai-model').value = aiSettings.model || 'gemini-2.0-flash';
-    document.getElementById('ai-api-key').value = aiSettings.apiKey || '';
-    document.getElementById('ai-enabled').checked = aiSettings.enabled !== false; // default true
+    const providerEl = document.getElementById('ai-provider');
+    if (!providerEl) return;
+    const provider = aiSettings.provider || 'groq';
+    providerEl.value = provider;
+    const modelEl = document.getElementById('ai-model');
+    if (modelEl) modelEl.value = aiSettings.model || 'llama-3.3-70b-versatile';
+    const keyEl = document.getElementById('ai-api-key');
+    if (keyEl) keyEl.value = aiSettings.apiKey || '';
+    const enabledEl = document.getElementById('ai-enabled');
+    if (enabledEl) enabledEl.checked = aiSettings.enabled !== false; // default true
 
     updateProviderUI(provider);
     checkBuiltInAIStatus();
 }
 
 function updateProviderUI(provider) {
+    const providerEl = document.getElementById('ai-provider');
+    if (!providerEl) return;
     const isBuiltIn = provider === 'built-in';
-    document.getElementById('model-group').style.display = isBuiltIn ? 'none' : '';
-    document.getElementById('api-key-group').style.display = isBuiltIn ? 'none' : '';
+    const modelGroup = document.getElementById('model-group');
+    const keyGroup = document.getElementById('api-key-group');
+    if (modelGroup) modelGroup.style.display = isBuiltIn ? 'none' : '';
+    if (keyGroup) keyGroup.style.display = isBuiltIn ? 'none' : '';
 
     if (!isBuiltIn) {
         // Populate models dynamically from the registry
@@ -1264,6 +1549,7 @@ function updateProviderUI(provider) {
             if (!resp || !resp.providers || !resp.providers[provider]) return;
             const prov = resp.providers[provider];
             const modelSel = document.getElementById('ai-model');
+            if (!modelSel) return;
             modelSel.innerHTML = prov.models.map(m =>
                 `<option value="${m.id}">${m.name}</option>`
             ).join('');
@@ -1273,7 +1559,7 @@ function updateProviderUI(provider) {
             }
             // Update key hint
             const hint = document.getElementById('api-key-hint');
-            if (prov.keyUrl) {
+            if (hint && prov.keyUrl) {
                 hint.innerHTML = `Get your API key at <a href="${prov.keyUrl}" target="_blank" rel="noopener">${prov.keyUrl.replace('https://', '')}</a>`;
             }
         });
@@ -1285,6 +1571,7 @@ async function checkBuiltInAIStatus() {
     const text = document.getElementById('builtin-status-text');
     const hint = document.getElementById('builtin-status-hint');
     const box = document.getElementById('builtin-status');
+    if (!icon || !text || !hint || !box) return;
 
     try {
         const resp = await chrome.runtime.sendMessage({ type: 'AI_CHECK_BUILTIN' });
@@ -1312,16 +1599,16 @@ async function checkBuiltInAIStatus() {
     }
 }
 
-document.getElementById('ai-provider').addEventListener('change', (e) => {
+bindEvent('ai-provider','change', (e) => {
     updateProviderUI(e.target.value);
 });
 
-document.getElementById('btn-toggle-key').addEventListener('click', () => {
+bindEvent('btn-toggle-key','click', () => {
     const input = document.getElementById('ai-api-key');
     input.type = input.type === 'password' ? 'text' : 'password';
 });
 
-document.getElementById('btn-save-ai').addEventListener('click', async () => {
+bindEvent('btn-save-ai','click', async () => {
     const provider = document.getElementById('ai-provider').value;
     const isBuiltIn = provider === 'built-in';
     const settings = {
@@ -1340,7 +1627,7 @@ document.getElementById('btn-save-ai').addEventListener('click', async () => {
     setTimeout(() => { msg.className = 'status-msg'; }, 3000);
 });
 
-document.getElementById('btn-test-ai').addEventListener('click', async () => {
+bindEvent('btn-test-ai','click', async () => {
     const btn = document.getElementById('btn-test-ai');
     const msg = document.getElementById('ai-status-msg');
     const provider = document.getElementById('ai-provider').value;
@@ -1403,7 +1690,7 @@ function renderDisabledSites() {
 }
 
 // Export
-document.getElementById('btn-export').addEventListener('click', async () => {
+bindEvent('btn-export','click', async () => {
     const exportData = {
         version: '2.0.0',
         exportedAt: new Date().toISOString(),
@@ -1422,10 +1709,10 @@ document.getElementById('btn-export').addEventListener('click', async () => {
 });
 
 // Import
-document.getElementById('btn-import').addEventListener('click', () => {
+bindEvent('btn-import','click', () => {
     document.getElementById('import-file').click();
 });
-document.getElementById('import-file').addEventListener('change', async (e) => {
+bindEvent('import-file','change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     try {
@@ -1471,7 +1758,7 @@ document.getElementById('import-file').addEventListener('change', async (e) => {
 });
 
 // Nuke
-document.getElementById('btn-nuke').addEventListener('click', () => {
+bindEvent('btn-nuke','click', () => {
     showConfirmModal('Delete All Data', 'This will permanently delete ALL extension data including sites, profile, applications, and AI settings. This cannot be undone.', async () => {
         await chrome.storage.local.clear();
         showToast('✓ All data deleted', 'success');
@@ -1489,6 +1776,8 @@ function withTimeout(promise, ms, fallback = null) {
 }
 
 async function renderCloudSync() {
+    const badge = document.getElementById('cloud-status-badge');
+    if (!badge) return;
     // Load config (not displayed in UI)
     try {
         await chrome.runtime.sendMessage({ type: 'CLOUD_GET_CONFIG' });
@@ -1496,11 +1785,11 @@ async function renderCloudSync() {
 
     const statusResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
     const { configured, loggedIn, user, lastSync } = statusResp;
+    cloudStatus = { configured: !!configured, loggedIn: !!loggedIn, user: user || null, lastSync: lastSync || null };
     const prefsResp = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_PREFS' }).catch(() => null);
     if (prefsResp?.prefs) cloudPrefs = prefsResp.prefs;
 
     const msgEl = document.getElementById('cloud-auth-msg');
-    const badge = document.getElementById('cloud-status-badge');
     const authForms = document.getElementById('cloud-auth-forms');
     const loggedInView = document.getElementById('cloud-logged-in');
     const prefsWrap = document.getElementById('cloud-sync-prefs');
@@ -1551,6 +1840,8 @@ async function renderCloudSync() {
     if (autofillEl) autofillEl.checked = !!cloudPrefs.syncAutofill;
     if (appsEl) appsEl.checked = !!cloudPrefs.syncApplications;
     if (aiEl) aiEl.checked = !!cloudPrefs.syncAiSettings;
+
+    renderOverview();
 
     setupCloudPrefListeners();
 }
@@ -1645,154 +1936,156 @@ function setupCloudPrefListeners() {
     }
 }
 
+const cloudUiRoot = document.getElementById('cloud-status-badge');
+if (cloudUiRoot) {
+    bindEvent('btn-cloud-signin','click', async () => {
+        const email = document.getElementById('cloud-email').value;
+        const pwd = document.getElementById('cloud-password').value;
+        const msg = document.getElementById('cloud-auth-msg');
+        const btn = document.getElementById('btn-cloud-signin');
 
-document.getElementById('btn-cloud-signin').addEventListener('click', async () => {
-    const email = document.getElementById('cloud-email').value;
-    const pwd = document.getElementById('cloud-password').value;
-    const msg = document.getElementById('cloud-auth-msg');
-    const btn = document.getElementById('btn-cloud-signin');
-
-    if (!email || !pwd) {
-        msg.textContent = '❌ Email and password required.';
-        msg.className = 'status-msg error';
-        return;
-    }
-
-    // Ensure cloud is configured before attempting sign-in
-    try {
-        const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
-        if (!status?.configured) {
-            msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
+        if (!email || !pwd) {
+            msg.textContent = '❌ Email and password required.';
             msg.className = 'status-msg error';
             return;
         }
-    } catch (_) {}
 
-    setLoading(btn, true);
-    msg.textContent = 'Signing in...';
-    msg.className = 'status-msg';
-    
-    try {
-        const resp = await withTimeout(
-            chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd }).catch(() => null),
-            6000,
-            null
-        );
-        if (!resp) {
-            msg.textContent = '❌ Background not responding. Reload extension.';
-            msg.className = 'status-msg error';
-            return;
-        }
-        if (resp.ok) {
-            msg.textContent = '✓ Sign in successful!';
-            msg.className = 'status-msg success';
-            document.getElementById('cloud-email').value = '';
-            document.getElementById('cloud-password').value = '';
-            await loadAllData();
-        } else {
-            msg.textContent = '❌ ' + resp.error;
-            msg.className = 'status-msg error';
-        }
-    } catch (err) {
-        msg.textContent = '❌ ' + err.message;
-        msg.className = 'status-msg error';
-    } finally {
-        setLoading(btn, false);
-    }
-});
-
-document.getElementById('btn-cloud-signup').addEventListener('click', async () => {
-    const email = document.getElementById('cloud-email').value;
-    const pwd = document.getElementById('cloud-password').value;
-    const msg = document.getElementById('cloud-auth-msg');
-    const btn = document.getElementById('btn-cloud-signup');
-
-    if (!email || !pwd) {
-        msg.textContent = '❌ Email and password required.';
-        msg.className = 'status-msg error';
-        return;
-    }
-
-    // Ensure cloud is configured before attempting sign-up
-    try {
-        const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
-        if (!status?.configured) {
-            msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
-            msg.className = 'status-msg error';
-            return;
-        }
-    } catch (_) {}
-
-    setLoading(btn, true);
-    msg.textContent = 'Creating account...';
-    msg.className = 'status-msg';
-    
-    try {
-        const resp = await withTimeout(
-            chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_UP', email, password: pwd }).catch(() => null),
-            6000,
-            null
-        );
-        if (!resp) {
-            msg.textContent = '❌ Background not responding. Reload extension.';
-            msg.className = 'status-msg error';
-            return;
-        }
-        if (resp.ok) {
-            msg.textContent = '✓ Account created & logged in!';
-            msg.className = 'status-msg success';
-            document.getElementById('cloud-email').value = '';
-            document.getElementById('cloud-password').value = '';
-            await loadAllData();
-        } else {
-            msg.textContent = '❌ ' + resp.error;
-            msg.className = 'status-msg error';
-        }
-    } catch (err) {
-        msg.textContent = '❌ ' + err.message;
-        msg.className = 'status-msg error';
-    } finally {
-        setLoading(btn, false);
-    }
-});
-
-document.getElementById('btn-cloud-sync').addEventListener('click', async () => {
-    const btn = document.getElementById('btn-cloud-sync');
-    setLoading(btn, true);
-    showToast('Syncing with cloud...', 'success');
-    
-    try {
-        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SYNC' });
-        if (resp.ok) {
-            showToast('✓ Cloud sync complete', 'success');
-            await loadAllData();
-        } else {
-            showToast('❌ Sync failed: ' + resp.error, 'error');
-        }
-    } catch (err) {
-        showToast('❌ Sync failed: ' + err.message, 'error');
-    } finally {
-        setLoading(btn, false);
-    }
-});
-
-document.getElementById('btn-cloud-signout').addEventListener('click', async () => {
-    // 1. Clear Google Identity Cache if possible
-    try {
-        chrome.identity.getAuthToken({ interactive: false }, (token) => {
-            if (token) {
-                chrome.identity.removeCachedAuthToken({ token }, () => {
-                    console.log('Google token cleared from cache');
-                });
+        // Ensure cloud is configured before attempting sign-in
+        try {
+            const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
+            if (!status?.configured) {
+                msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
+                msg.className = 'status-msg error';
+                return;
             }
-        });
-    } catch (e) { console.warn('Identity clear failed:', e); }
+        } catch (_) {}
 
-    // 2. Logout from Firebase
-    await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
-    showToast('Signed out. Local data for this account is still saved.', 'success');
-    await loadAllData();
-});
+        setLoading(btn, true);
+        msg.textContent = 'Signing in...';
+        msg.className = 'status-msg';
+        
+        try {
+            const resp = await withTimeout(
+                chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd }).catch(() => null),
+                6000,
+                null
+            );
+            if (!resp) {
+                msg.textContent = '❌ Background not responding. Reload extension.';
+                msg.className = 'status-msg error';
+                return;
+            }
+            if (resp.ok) {
+                msg.textContent = '✓ Sign in successful!';
+                msg.className = 'status-msg success';
+                document.getElementById('cloud-email').value = '';
+                document.getElementById('cloud-password').value = '';
+                await loadAllData();
+            } else {
+                msg.textContent = '❌ ' + resp.error;
+                msg.className = 'status-msg error';
+            }
+        } catch (err) {
+            msg.textContent = '❌ ' + err.message;
+            msg.className = 'status-msg error';
+        } finally {
+            setLoading(btn, false);
+        }
+    });
+
+    bindEvent('btn-cloud-signup','click', async () => {
+        const email = document.getElementById('cloud-email').value;
+        const pwd = document.getElementById('cloud-password').value;
+        const msg = document.getElementById('cloud-auth-msg');
+        const btn = document.getElementById('btn-cloud-signup');
+
+        if (!email || !pwd) {
+            msg.textContent = '❌ Email and password required.';
+            msg.className = 'status-msg error';
+            return;
+        }
+
+        // Ensure cloud is configured before attempting sign-up
+        try {
+            const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
+            if (!status?.configured) {
+                msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
+                msg.className = 'status-msg error';
+                return;
+            }
+        } catch (_) {}
+
+        setLoading(btn, true);
+        msg.textContent = 'Creating account...';
+        msg.className = 'status-msg';
+        
+        try {
+            const resp = await withTimeout(
+                chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_UP', email, password: pwd }).catch(() => null),
+                6000,
+                null
+            );
+            if (!resp) {
+                msg.textContent = '❌ Background not responding. Reload extension.';
+                msg.className = 'status-msg error';
+                return;
+            }
+            if (resp.ok) {
+                msg.textContent = '✓ Account created & logged in!';
+                msg.className = 'status-msg success';
+                document.getElementById('cloud-email').value = '';
+                document.getElementById('cloud-password').value = '';
+                await loadAllData();
+            } else {
+                msg.textContent = '❌ ' + resp.error;
+                msg.className = 'status-msg error';
+            }
+        } catch (err) {
+            msg.textContent = '❌ ' + err.message;
+            msg.className = 'status-msg error';
+        } finally {
+            setLoading(btn, false);
+        }
+    });
+
+    bindEvent('btn-cloud-sync','click', async () => {
+        const btn = document.getElementById('btn-cloud-sync');
+        setLoading(btn, true);
+        showToast('Syncing with cloud...', 'success');
+        
+        try {
+            const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SYNC' });
+            if (resp.ok) {
+                showToast('✓ Cloud sync complete', 'success');
+                await loadAllData();
+            } else {
+                showToast('❌ Sync failed: ' + resp.error, 'error');
+            }
+        } catch (err) {
+            showToast('❌ Sync failed: ' + err.message, 'error');
+        } finally {
+            setLoading(btn, false);
+        }
+    });
+
+    bindEvent('btn-cloud-signout','click', async () => {
+        // 1. Clear Google Identity Cache if possible
+        try {
+            chrome.identity.getAuthToken({ interactive: false }, (token) => {
+                if (token) {
+                    chrome.identity.removeCachedAuthToken({ token }, () => {
+                        console.log('Google token cleared from cache');
+                    });
+                }
+            });
+        } catch (e) { console.warn('Identity clear failed:', e); }
+
+        // 2. Logout from Firebase
+        await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
+        showToast('Signed out. Local data for this account is still saved.', 'success');
+        await loadAllData();
+    });
+}
 
 // ── Dashboard Auth Listeners ───────────────────────────────────
 function setupDashAuth() {
@@ -1855,6 +2148,7 @@ function setupDashAuth() {
 }
 
 // ── Init ───────────────────────────────────────────────
+initTheme();
 setupDashAuth();
 loadAllData().then(() => {
     // Handle hash-based tab navigation (e.g. #tab-profile from popup)

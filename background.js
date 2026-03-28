@@ -1027,6 +1027,8 @@ function queueCloudSync() {
       }
       if (auth && isCloudConfigured() && prefs.enabled) {
         console.log('[Cloud] Auto-syncing...');
+        // Pull latest first to keep local in sync, then push merged updates
+        await pullAllFromCloud(prefs);
         await pushAllToCloud(prefs);
         console.log('[Cloud] Auto-sync complete.');
       }
@@ -1035,3 +1037,40 @@ function queueCloudSync() {
     }
   }, 5000); // 5 second debounce
 }
+
+// ── Periodic Cloud Pull (keeps local updated) ──────────────────
+const CLOUD_PULL_ALARM = 'cloud_pull_alarm';
+if (chrome.alarms) {
+  chrome.alarms.create(CLOUD_PULL_ALARM, { periodInMinutes: 3 });
+  chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm?.name !== CLOUD_PULL_ALARM) return;
+    try {
+      const auth = await AuthStore.getAuthState();
+      const { prefs } = await getCloudPrefs();
+      if (typeof ensureFirebaseConfigLoaded === 'function') {
+        await ensureFirebaseConfigLoaded();
+      }
+      if (auth && isCloudConfigured() && prefs.enabled) {
+        await pullAllFromCloud(prefs);
+      }
+    } catch (err) {
+      console.warn('[Cloud] Periodic pull failed:', err.message);
+    }
+  });
+}
+
+// One-time pull on service worker start (if already logged in)
+(async () => {
+  try {
+    const auth = await AuthStore.getAuthState();
+    const { prefs } = await getCloudPrefs();
+    if (typeof ensureFirebaseConfigLoaded === 'function') {
+      await ensureFirebaseConfigLoaded();
+    }
+    if (auth && isCloudConfigured() && prefs.enabled) {
+      await pullAllFromCloud(prefs);
+    }
+  } catch (err) {
+    console.warn('[Cloud] Startup pull failed:', err.message);
+  }
+})();

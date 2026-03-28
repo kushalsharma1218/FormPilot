@@ -9,6 +9,9 @@ const AIAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
   getUserKey: async (baseKey) => baseKey,
 };
 const AIUtils = (globalThis.JobAutofill && JobAutofill.AIUtils) || null;
+const PRIVATE_AI_CONFIG = globalThis.PRIVATE_AI_CONFIG || (globalThis.PRIVATE_GROQ_API_KEY
+  ? { provider: 'groq', apiKey: globalThis.PRIVATE_GROQ_API_KEY, model: 'llama-3.3-70b-versatile', enabled: true }
+  : null);
 const extractJSON = AIUtils?.extractJSON || function (text) {
   if (!text || typeof text !== 'string') {
     throw new Error('AI returned empty or non-string response');
@@ -55,11 +58,19 @@ const retryWithBackoff = AIUtils?.retryWithBackoff || async function (fn, maxAtt
 };
 
 async function getAiSettings() {
+  if (PRIVATE_AI_CONFIG && PRIVATE_AI_CONFIG.apiKey) {
+    return {
+      enabled: PRIVATE_AI_CONFIG.enabled !== false,
+      provider: PRIVATE_AI_CONFIG.provider || 'groq',
+      apiKey: PRIVATE_AI_CONFIG.apiKey || '',
+      model: PRIVATE_AI_CONFIG.model || 'llama-3.3-70b-versatile',
+    };
+  }
   const key = await AIAuthStore.getUserKey(AI_SETTINGS_KEY);
   const result = await chrome.storage.local.get(key);
   return result[key] || {
     enabled: true,
-    provider: 'built-in',
+    provider: 'groq',
     apiKey: '',
     model: '',
   };
