@@ -5597,7 +5597,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }),
       chrome.runtime.sendMessage({ type: 'SESSION_GET', hostname }).catch(() => ({ ok: false, fields: {} })),
     ])
-      .then(([resp, sessionResp]) => {
+      .then(async ([resp, sessionResp]) => {
         const site = resp?.site || { enabled: true, fields: {}, mappings: [], flags: {} };
         currentSiteMappings = site.mappings || currentSiteMappings;
         siteData = site;
@@ -5606,6 +5606,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (isSiteDisabled()) {
           sendResponse({ ok: false, error: 'Site disabled' });
           return;
+        }
+        if (!currentGlobalProfile || Object.keys(currentGlobalProfile).length === 0) {
+          const profResp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }).catch(() => null);
+          currentGlobalProfile = profResp?.profile || {};
         }
         const merged = normalizeStoredFieldKeys({ ...(site.fields || {}), ...(sessionResp?.fields || {}) });
 
