@@ -254,6 +254,11 @@ async function getActiveTab() {
 }
 
 async function sendToTab(tabId, message) {
+  if (!tabId) return null;
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'BROADCAST_TO_FRAMES', tabId, payload: message });
+    if (resp && typeof resp.ok !== 'undefined') return resp;
+  } catch (_) {}
   try {
     return await chrome.tabs.sendMessage(tabId, message);
   } catch {

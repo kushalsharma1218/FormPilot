@@ -19,6 +19,73 @@ const SESSION_KEY = 'autofill_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CLOUD_PREFS_KEY = 'cloud_sync_prefs';
 const METRIC_TIME_PER_FIELD_SEC = 8;
+const DEBUG_LOG_KEY = 'fp_debug_logs';
+const DEBUG_LOG_MAX = 500;
+
+// ── Frame Registry (for iframe-aware messaging) ────────────────
+const FRAME_REGISTRY = new Map(); // tabId -> Set(frameId)
+let debugLogBuffer = [];
+let debugFlushTimer = null;
+
+function registerFrame(sender) {
+  const tabId = sender?.tab?.id;
+  const frameId = sender?.frameId;
+  if (tabId === undefined || frameId === undefined) return;
+  let set = FRAME_REGISTRY.get(tabId);
+  if (!set) {
+    set = new Set();
+    FRAME_REGISTRY.set(tabId, set);
+  }
+  set.add(frameId);
+}
+
+async function broadcastToTabFrames(tabId, payload) {
+  if (tabId === undefined || tabId === null) return { ok: false, error: 'Missing tabId' };
+  const frames = FRAME_REGISTRY.get(tabId);
+  const frameIds = new Set([0, ...(frames ? Array.from(frames) : [])]);
+  const results = await Promise.allSettled(
+    Array.from(frameIds).map(frameId =>
+      chrome.tabs.sendMessage(tabId, payload, { frameId }).catch(() => null)
+    )
+  );
+  const ok = results.some(r => r.status === 'fulfilled' && r.value && r.value.ok);
+  return { ok };
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  FRAME_REGISTRY.delete(tabId);
+});
+
+async function flushDebugLogs() {
+  if (debugLogBuffer.length === 0) return;
+  const buffer = debugLogBuffer.splice(0, debugLogBuffer.length);
+  if (debugFlushTimer) {
+    clearTimeout(debugFlushTimer);
+    debugFlushTimer = null;
+  }
+  try {
+    const key = await AuthStore.getUserKey(DEBUG_LOG_KEY);
+    const result = await chrome.storage.local.get(key);
+    let logs = Array.isArray(result[key]) ? result[key] : [];
+    logs = logs.concat(buffer);
+    if (logs.length > DEBUG_LOG_MAX) logs = logs.slice(-DEBUG_LOG_MAX);
+    await chrome.storage.local.set({ [key]: logs });
+  } catch (err) {
+    console.warn('[Background] Debug log flush failed:', err?.message || err);
+  }
+}
+
+function queueDebugLog(entry) {
+  if (!entry) return;
+  const sanitized = { ...entry };
+  if (sanitized.value) delete sanitized.value;
+  debugLogBuffer.push(sanitized);
+  if (debugLogBuffer.length >= 80) {
+    flushDebugLogs();
+  } else if (!debugFlushTimer) {
+    debugFlushTimer = setTimeout(flushDebugLogs, 1500);
+  }
+}
 
 // ── Storage Helpers (Account Aware) ────────────────────────────
 const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
@@ -463,6 +530,47 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 async function handleMessage(msg, sender) {
   // ── Autofill / Site Data ─────────────────────────────────────
   switch (msg.type) {
+    case 'FRAME_HELLO': {
+      registerFrame(sender);
+      return { ok: true };
+    }
+
+    case 'BROADCAST_TO_FRAMES': {
+      const tabId = msg.tabId !== undefined ? msg.tabId : sender?.tab?.id;
+      return await broadcastToTabFrames(tabId, msg.payload);
+    }
+
+    case 'LOG_EVENT': {
+      registerFrame(sender);
+      const now = new Date().toISOString();
+      queueDebugLog({
+        ts: now,
+        tabId: sender?.tab?.id,
+        frameId: sender?.frameId,
+        ...msg.event
+      });
+      return { ok: true };
+    }
+
+    case 'LOG_GET': {
+      await flushDebugLogs();
+      const key = await AuthStore.getUserKey(DEBUG_LOG_KEY);
+      const result = await chrome.storage.local.get(key);
+      const logs = Array.isArray(result[key]) ? result[key] : [];
+      return { ok: true, logs };
+    }
+
+    case 'LOG_CLEAR': {
+      const key = await AuthStore.getUserKey(DEBUG_LOG_KEY);
+      await chrome.storage.local.set({ [key]: [] });
+      debugLogBuffer = [];
+      if (debugFlushTimer) {
+        clearTimeout(debugFlushTimer);
+        debugFlushTimer = null;
+      }
+      return { ok: true };
+    }
+
     case 'GET_SITE_KEY': {
       const data = await getData();
       return { siteKey: resolveSiteKey(data, msg.hostname) };
@@ -483,8 +591,8 @@ async function handleMessage(msg, sender) {
       if (msg.clearDisabled) data.sites[siteKey].disabled = false;
       await saveData(data);
       queueCloudSync();
-      if (sender?.tab?.id) {
-        chrome.tabs.sendMessage(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: data.sites[siteKey].enabled }).catch(() => {});
+      if (sender?.tab?.id !== undefined) {
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: data.sites[siteKey].enabled }).catch(() => {});
       }
       return { ok: true };
     }
@@ -611,8 +719,8 @@ async function handleMessage(msg, sender) {
       data.sites[siteKey].flags = { ...(data.sites[siteKey].flags || {}), ...(msg.flags || {}) };
       await saveData(data);
       queueCloudSync();
-      if (sender?.tab?.id) {
-        chrome.tabs.sendMessage(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', flags: data.sites[siteKey].flags }).catch(() => {});
+      if (sender?.tab?.id !== undefined) {
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', flags: data.sites[siteKey].flags }).catch(() => {});
       }
       return { ok: true, flags: data.sites[siteKey].flags };
     }

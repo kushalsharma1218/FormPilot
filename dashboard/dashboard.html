@@ -813,6 +813,20 @@
                     </div>
                 </div>
 
+                <!-- Diagnostics -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Diagnostics</h2>
+                    </div>
+                    <p class="card-hint">Local-only debug logs for troubleshooting. Logs never sync to cloud.</p>
+                    <div class="data-actions">
+                        <button class="btn btn-secondary" id="btn-debug-refresh">Refresh Logs</button>
+                        <button class="btn btn-secondary" id="btn-debug-copy">Copy Logs</button>
+                        <button class="btn btn-secondary" id="btn-debug-clear">Clear Logs</button>
+                    </div>
+                    <pre id="debug-log-output" class="debug-log-output">No logs yet.</pre>
+                </div>
+
                 <!-- Danger Zone -->
                 <div class="card card-danger">
                     <div class="card-header">

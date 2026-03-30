@@ -75,6 +75,8 @@ let debugOverlayEnabled = false;
 const LEARNING_SESSION_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const ACCURACY_MODE = false;
 const DEBUG_AUTOFILL = true; // ← set false to silence debug logs
+const CONFIDENCE_OVERLAY_ENABLED = false;
+const LOG_CAPTURE_ENABLED = true;
 // Low/mid confidence fields are filled immediately; user can correct them after
 const APPROVAL_REQUIRED_LEVEL = 'none';
 const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
@@ -132,7 +134,7 @@ function isTopFrame() {
 function shouldShowUi() {
   if (isSiteDisabled()) return false;
   if (!isTopFrame()) return false;
-  if (!isJobContextPage()) return false;
+  if (!isJobFlowEligible()) return false;
   return true;
 }
 
@@ -239,6 +241,7 @@ function setFormPreference(signature, approved) {
   setSiteFlag('approvedForms', approvedForms);
   setSiteFlag('ignoredForms', ignoredForms);
   if (isJobContextPage.cache) isJobContextPage.cache = null;
+  if (isJobFlowEligible.cache) isJobFlowEligible.cache = null;
 }
 
 function showJobContextPrompt() {
@@ -344,9 +347,65 @@ function suppressSiteUi() {
 }
 
 function cleanLabelText(text) {
-  if (FieldUtils && FieldUtils.cleanLabelText) return FieldUtils.cleanLabelText(text);
-  if (!text) return '';
-  return String(text).replace(/\*/g, '').replace(/:\s*$/, '').trim();
+  let t = text;
+  if (FieldUtils && FieldUtils.cleanLabelText) {
+    try { t = FieldUtils.cleanLabelText(t); } catch (_) {}
+  }
+  if (!t) return '';
+  t = String(t).replace(/\*/g, '').replace(/:\s*$/, '').trim();
+  // Strip common error phrases anywhere in the string
+  t = t.replace(/\berror:\s*/ig, '').trim();
+  t = t.replace(/\brequired:\s*/ig, '').trim();
+  t = t.replace(/\bcan(?:not)?\s+be\s+left\s+blank\.?/ig, '').trim();
+  t = t.replace(/\bis\s+required\.?/ig, '').trim();
+  t = t.replace(/\bis\s+invalid\.?/ig, '').trim();
+  t = t.replace(/\s+/g, ' ').trim();
+  return t;
+}
+
+function isErrorLabelText(text) {
+  if (!text) return false;
+  const t = String(text).toLowerCase().replace(/\s+/g, ' ').trim();
+  return t.startsWith('error:')
+    || t.includes('cannot be left blank')
+    || t.includes('can not be left blank')
+    || t.includes('is required')
+    || t.includes('is invalid');
+}
+
+function isErrorElement(el) {
+  if (!el) return false;
+  const role = el.getAttribute?.('role') || '';
+  const ariaLive = el.getAttribute?.('aria-live') || '';
+  const cls = (el.className || '').toString();
+  if (role === 'alert' || ariaLive) return true;
+  if (/error|invalid|alert|validation/i.test(cls)) return true;
+  const text = el.innerText || el.textContent || '';
+  return isErrorLabelText(text);
+}
+
+function logEvent(event) {
+  if (!LOG_CAPTURE_ENABLED) return;
+  try {
+    const payload = {
+      url: location.href,
+      frameType: (window === window.top) ? 'top' : 'child',
+      ...event
+    };
+    chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: payload }).catch(() => {});
+  } catch (_) {}
+}
+
+function normalizeStoredFieldKeys(fields) {
+  if (!fields || typeof fields !== 'object') return fields || {};
+  const out = {};
+  Object.entries(fields).forEach(([key, val]) => {
+    const clean = cleanLabelText(key);
+    const isErrorKey = isErrorLabelText(key) || /error:|cannot be left blank|is required|is invalid/i.test(key);
+    if (!isErrorKey && key) out[key] = val;
+    if (clean && !isErrorLabelText(clean) && out[clean] === undefined) out[clean] = val;
+  });
+  return out;
 }
 
 function escapeHtml(str) {
@@ -413,6 +472,69 @@ function normalizeValueForField(val, el, fieldKey) {
   }
 
   return [v];
+}
+
+function normalizeForCompare(val, type, fieldKey) {
+  if (val === undefined || val === null) return '';
+  let v = String(val).trim();
+  if (!v) return '';
+  if (type === 'phone') return v.replace(/\D/g, '').slice(-10);
+  if (type === 'email') return v.toLowerCase();
+  if (type === 'url' || /linkedin|github|portfolio|website/i.test(fieldKey || '')) {
+    v = v.replace(/^https?:\/\//i, '').replace(/\/+$/g, '');
+    return v.toLowerCase();
+  }
+  return v.toLowerCase();
+}
+
+function alreadyMatches(el, fieldKey, desiredVal) {
+  const current = getFieldValue(el);
+  if (!current) return false;
+  const type = inferFieldType(el, fieldKey);
+  const desiredNorm = normalizeForCompare(desiredVal, type, fieldKey);
+  const currentNorm = normalizeForCompare(current, type, fieldKey);
+  return !!desiredNorm && desiredNorm === currentNorm;
+}
+
+function isUsableTextTarget(el) {
+  if (!el) return false;
+  const tag = el.tagName?.toUpperCase();
+  const type = (el.type || '').toLowerCase();
+  const role = el.getAttribute?.('role') || '';
+  if (el.disabled || el.readOnly) return false;
+  if (el.getAttribute?.('aria-hidden') === 'true') return false;
+  if (type === 'hidden' || type === 'submit' || type === 'button' || type === 'reset' || type === 'file' || type === 'password') return false;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return true;
+  if (el.isContentEditable || role === 'textbox') return true;
+  return false;
+}
+
+function findBestFillTarget(el, fieldKey) {
+  if (!el) return null;
+  const containers = [
+    el.closest?.('[data-automation-id],[data-testid],[data-test],[data-qa],[data-field],[data-field-id],[data-field-name],[data-field-key]'),
+    el.closest?.('.form-field,.field,.input-group,.field-wrapper,.form-group,[role="group"]'),
+    el.parentElement
+  ].filter(Boolean);
+  const scope = containers[0] || document;
+  const selector = 'input, textarea, [contenteditable="true"], [role="textbox"]';
+  const candidates = [];
+  scope.querySelectorAll(selector).forEach(candidate => {
+    if (candidate === el) return;
+    if (!isUsableTextTarget(candidate)) return;
+    if (!isVisibleElement(candidate)) return;
+    const label = getFieldKey(candidate) || getSiteLabel(candidate) || candidate.getAttribute?.('aria-label') || candidate.placeholder || '';
+    if (!label || isErrorLabelText(label)) return;
+    const score = Math.max(
+      scoreStringMatch(label, fieldKey),
+      scoreStringMatch(label, cleanLabelText(fieldKey))
+    );
+    if (score <= 0) return;
+    candidates.push({ el: candidate, score });
+  });
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].el || null;
 }
 
 // Boolean / Yes-No smart resolver for select/radio options
@@ -524,6 +646,7 @@ function inferProfileKeyFromLabel(label) {
   if (/zip|postal/.test(l)) return 'zipcode';
   if (/job title|current title|position/.test(l)) return 'currentTitle';
   if (/company|employer/.test(l)) return 'currentCompany';
+  if (/years?.*experience|experience.*years|total.*experience/.test(l)) return 'totalYearsExperience';
   return null;
 }
 
@@ -580,9 +703,91 @@ function validateValueForType(type, value) {
   }
 }
 
+// ── Auto-Learn (update global profile from user input) ─────────
+let pendingProfileUpdates = {};
+let profileUpdateTimer = null;
+const PROFILE_LEARN_DEBOUNCE_MS = 1200;
+
+function normalizeLearnedValue(el, value) {
+  const decoded = decodeSelectValue(value);
+  const raw = (decoded.text || decoded.value || value || '').toString().trim();
+  if (!raw) return '';
+  // Avoid capturing placeholder-like values
+  if (isPlaceholderText(raw)) return '';
+  // Clamp very long values
+  return raw.length > 180 ? raw.slice(0, 180) : raw;
+}
+
+function resolveProfileKeyFromField(el, fieldKey) {
+  const hints = [
+    fieldKey,
+    getSiteLabel(el),
+    el?.getAttribute?.('aria-label'),
+    el?.getAttribute?.('name'),
+    el?.getAttribute?.('id'),
+    el?.getAttribute?.('placeholder')
+  ].filter(Boolean);
+
+  for (const hint of hints) {
+    const clean = cleanLabelText(hint);
+    if (!clean) continue;
+    if (currentGlobalProfile && Object.prototype.hasOwnProperty.call(currentGlobalProfile, clean)) {
+      return clean;
+    }
+    const inferred = inferProfileKeyFromLabel(clean);
+    if (inferred) return inferred;
+    for (const h of GLOBAL_HEURISTICS) {
+      if (h.regex.test(clean)) return h.pId;
+    }
+  }
+  return null;
+}
+
+function queueProfileUpdate(profileKey, value) {
+  if (!profileKey || !value) return;
+  pendingProfileUpdates[profileKey] = value;
+  if (profileUpdateTimer) clearTimeout(profileUpdateTimer);
+  profileUpdateTimer = setTimeout(async () => {
+    const updates = { ...pendingProfileUpdates };
+    pendingProfileUpdates = {};
+    try {
+      let profile = currentGlobalProfile || {};
+      if (!profile || Object.keys(profile).length === 0) {
+        const resp = await chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }).catch(() => null);
+        profile = resp?.profile || {};
+      }
+      let changed = false;
+      Object.entries(updates).forEach(([key, val]) => {
+        if (val === undefined || val === null || val === '') return;
+        if (profile[key] !== val) {
+          profile[key] = val;
+          changed = true;
+        }
+      });
+      if (changed) {
+        currentGlobalProfile = { ...profile };
+        chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => {});
+      }
+    } catch (_) { }
+  }, PROFILE_LEARN_DEBOUNCE_MS);
+}
+
+function maybeAutoLearnProfile(el, fieldKey, value) {
+  if (!el || !fieldKey) return;
+  const profileKey = resolveProfileKeyFromField(el, fieldKey);
+  if (!profileKey) return;
+  const normalized = normalizeLearnedValue(el, value);
+  if (!normalized) return;
+  const type = inferFieldType(el, fieldKey);
+  if (!validateValueForType(type, normalized)) return;
+  queueProfileUpdate(profileKey, normalized);
+}
+
 function shouldFillValue(el, fieldKey, value) {
   const tag = el?.tagName?.toUpperCase();
   const role = el?.getAttribute?.('role') || '';
+  if (el?.disabled || el?.readOnly) return false;
+  if (el?.getAttribute?.('aria-hidden') === 'true') return false;
   if (tag === 'SELECT' || role === 'listbox' || role === 'combobox') return true;
   const type = inferFieldType(el, fieldKey);
   return validateValueForType(type, value);
@@ -611,7 +816,7 @@ function showApprovalBanner() {
   if (document.getElementById('ja-approval-banner')) return;
   if (!shouldShowUi()) return;
   if (getSessionFlag('promptSkipped')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   const banner = document.createElement('div');
   banner.id = 'ja-approval-banner';
   banner.innerHTML = `
@@ -663,6 +868,23 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   const tag = el.tagName?.toUpperCase();
   const type = (el.type || '').toLowerCase();
 
+  // If element isn't interactable, try a proxy input at the same screen position
+  if (!isElementInteractable(el)) {
+    const proxy = findProxyInput(el);
+    if (proxy && proxy !== el) {
+      return applyValueToElement(proxy, fieldKey, primaryVal, altVal);
+    }
+  }
+
+  // If target is not usable, try to find a better one in the same field group
+  if (!isUsableTextTarget(el) && tag !== 'SELECT') {
+    const altTarget = findBestFillTarget(el, fieldKey);
+    if (altTarget && altTarget !== el) {
+      return applyValueToElement(altTarget, fieldKey, primaryVal, altVal);
+    }
+    return false;
+  }
+
   // ── Checkbox ────────────────────────────────────────────────────
   if (type === 'checkbox') {
     // Prefer clicking the element (works for both native + Radix)
@@ -709,7 +931,44 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   // ── Text / email / tel / textarea ───────────────────────────────
   // Use the universal fill (execCommand → native setter fallback)
   universalFillText(el, primaryVal);
-  return true;
+  if (alreadyMatches(el, fieldKey, primaryVal)) return true;
+  if (altVal && altVal !== primaryVal) {
+    universalFillText(el, altVal);
+    if (alreadyMatches(el, fieldKey, altVal)) return true;
+  }
+
+  // Fallback: try a sibling/alternate input in the same container
+  const altTarget = findBestFillTarget(el, fieldKey);
+  if (altTarget && altTarget !== el) {
+    universalFillText(altTarget, primaryVal);
+    if (alreadyMatches(altTarget, fieldKey, primaryVal)) return true;
+    if (altVal && altVal !== primaryVal) {
+      universalFillText(altTarget, altVal);
+      if (alreadyMatches(altTarget, fieldKey, altVal)) return true;
+    }
+  }
+  return false;
+}
+
+function ensureValueSticks(el, fieldKey, primaryVal, altVal, attempts = 2) {
+  if (!el || attempts <= 0) return;
+  const expected = String(primaryVal ?? '').trim();
+  if (!expected) return;
+  const check = () => {
+    const current = String(getFieldValue(el) || '').trim();
+    logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: current === expected });
+    if (current === expected) return;
+    // If React/Vue controlled input overwrote our value, re-apply once or twice
+    const applied = applyValueToElement(el, fieldKey, primaryVal, altVal);
+    if (!applied) {
+      const altTarget = findBestFillTarget(el, fieldKey);
+      if (altTarget && altTarget !== el) {
+        applyValueToElement(altTarget, fieldKey, primaryVal, altVal);
+      }
+    }
+    ensureValueSticks(el, fieldKey, primaryVal, altVal, attempts - 1);
+  };
+  setTimeout(check, 180);
 }
 
 function isPlaceholderText(text) {
@@ -1288,6 +1547,38 @@ function getJobSignalScore() {
   return { score, hostMatch, headingHits, labelHits, strongLabelHits, resumeSignal, fieldCount, atsMarkers, schemaSignal, formIntent };
 }
 
+function isPotentialJobForm() {
+  const login = getLoginSignalScore();
+  if (login.passwordInput) return false;
+
+  const job = getJobSignalScore();
+  const formIntent = job.formIntent || getBestFormIntent();
+  const formScore = formIntent?.score || 0;
+  const nonJobScore = getNonJobSignalScore();
+
+  if (login.score >= 7 && job.score < 4 && formScore < 3) return false;
+  if (nonJobScore >= 4 && job.score < 4 && formScore < 3 && !job.hostMatch) return false;
+
+  if (job.hostMatch || job.atsMarkers || job.resumeSignal || job.schemaSignal) return true;
+  if (formScore >= 3) return true;
+  if (job.fieldCount >= 4 && (job.labelHits >= 1 || job.strongLabelHits >= 1)) return true;
+
+  return false;
+}
+
+function isJobFlowEligible() {
+  const now = Date.now();
+  const host = location.hostname || '';
+  const path = `${location.pathname || ''}${location.search || ''}${location.hash || ''}`;
+  const cacheKey = `${host}${path}`;
+  if (isJobFlowEligible.cache && isJobFlowEligible.cache.key === cacheKey && (now - isJobFlowEligible.cache.ts) < 8000) {
+    return isJobFlowEligible.cache.value;
+  }
+  const eligible = isJobContextPage() || isPotentialJobForm();
+  isJobFlowEligible.cache = { value: eligible, ts: now, key: cacheKey };
+  return eligible;
+}
+
 function getLoginSignalScore() {
   let score = 0;
   const path = `${location.pathname || ''}${location.search || ''}${location.hash || ''}`;
@@ -1322,7 +1613,11 @@ function getLoginSignalScore() {
 function isLikelyLoginForm() {
   const login = getLoginSignalScore();
   if (login.passwordInput) return true;
-  return login.score >= 6;
+  if (login.score < 6) return false;
+  const job = getJobSignalScore();
+  const formIntent = job.formIntent || getBestFormIntent();
+  const formScore = formIntent?.score || 0;
+  return login.score >= 7 && job.score < 4 && formScore < 3;
 }
 
 function isJobContextPage() {
@@ -1351,6 +1646,17 @@ function isJobContextPage() {
     jobContextState = { status: 'login', signature: formIntent.signature || '', jobScore: job.score || 0, formScore, loginScore: login.score || 0, ts: now };
     isJobContextPage.cache = { value: false, ts: now, key: cacheKey };
     return false;
+  }
+
+  // Workday (and similar ATS) application steps often lack a job description on page.
+  // If we detect Workday and there are real fields, treat as a job context.
+  if (isWorkdayPage()) {
+    const wdFieldCount = job.fieldCount || 0;
+    if (wdFieldCount >= 2 || formScore >= 2) {
+      jobContextState = { status: 'job', signature: formIntent.signature || '', jobScore: job.score || 0, formScore, loginScore: login.score || 0, ts: now };
+      isJobContextPage.cache = { value: true, ts: now, key: cacheKey };
+      return true;
+    }
   }
   const pref = getFormPreference(formIntent.signature);
   if (pref === 'approved') {
@@ -1460,7 +1766,7 @@ async function maybeAutoTrackApplication(stage) {
   if (isSiteDisabled()) return;
   if (stage !== 'final') return;
   if (getSessionFlag('appAdded')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
 
   const localInfo = extractJobInfoLocal();
   let mergedInfo = { ...localInfo };
@@ -1518,7 +1824,9 @@ const GLOBAL_HEURISTICS = [
   { pId: 'city', regex: /city/i },
   { pId: 'state', regex: /state|province/i },
   { pId: 'zipcode', regex: /zip|postal|post\s*code/i },
-  { pId: 'currentCompany', regex: /company|employer/i }
+  { pId: 'currentTitle', regex: /current title|job title|position/i },
+  { pId: 'currentCompany', regex: /company|employer/i },
+  { pId: 'totalYearsExperience', regex: /years?.*experience|experience.*years|total.*experience/i }
 ];
 
 function getGlobalMatch(fieldKey) {
@@ -1647,9 +1955,15 @@ function getAncestorLabelText(el) {
     || container.getAttribute('data-label')
     || container.getAttribute('data-title')
     || container.getAttribute('aria-label');
-  if (attrLabel && String(attrLabel).trim()) return cleanLabelText(attrLabel);
+  if (attrLabel && String(attrLabel).trim()) {
+    const cleaned = cleanLabelText(attrLabel);
+    return isErrorLabelText(cleaned) ? '' : cleaned;
+  }
   const labelEl = container.querySelector('label, [data-automation-id*="label"], [data-qa*="label"], [data-testid*="label"], [data-test*="label"], .label, .field-label, .input-label');
-  if (labelEl?.innerText?.trim()) return cleanLabelText(labelEl.innerText);
+  if (labelEl?.innerText?.trim()) {
+    const cleaned = cleanLabelText(labelEl.innerText);
+    return isErrorLabelText(cleaned) ? '' : cleaned;
+  }
   return '';
 }
 
@@ -1874,16 +2188,25 @@ function getFieldKey(el) {
       .map(id => getNodeTextById(root, id))
       .filter(Boolean).join(' ');
     labelledByText = cleanLabelText(labelledByText);
+    if (isErrorLabelText(labelledByText)) labelledByText = '';
   }
 
-  // 1b. aria-describedby (some frameworks use it for label-like text)
+  // 1b. aria-describedby (often error/help text) — only use if non-error
   const describedBy = el.getAttribute('aria-describedby');
   let describedByText = '';
   if (describedBy) {
-    describedByText = describedBy.split(' ')
-      .map(id => getNodeTextById(root, id))
-      .filter(Boolean).join(' ');
-    describedByText = cleanLabelText(describedByText);
+    const parts = describedBy.split(/\s+/).filter(Boolean);
+    const texts = [];
+    parts.forEach(id => {
+      const text = getNodeTextById(root, id);
+      if (!text) return;
+      const elById = document.getElementById?.(id) || (root && root !== document ? queryInRoot(root, `#${escapeForSelector(id)}`) : null);
+      if (isErrorElement(elById)) return;
+      if (isErrorLabelText(text)) return;
+      texts.push(text);
+    });
+    describedByText = cleanLabelText(texts.join(' '));
+    if (isErrorLabelText(describedByText)) describedByText = '';
   }
 
   // 2. label[for="ID"]
@@ -1892,12 +2215,14 @@ function getFieldKey(el) {
     const safeId = escapeForSelector(el.id);
     const label = queryInRoot(root, `label[for="${safeId}"]`) || document.querySelector(`label[for="${safeId}"]`);
     if (label && label.innerText.trim()) labelForText = cleanLabelText(label.innerText.trim());
+    if (isErrorLabelText(labelForText)) labelForText = '';
   }
 
   // 3. Closest label parent
   let parentLabelText = '';
   const parentLabel = el.closest('label');
   if (parentLabel && parentLabel.innerText.trim()) parentLabelText = cleanLabelText(parentLabel.innerText.trim());
+  if (isErrorLabelText(parentLabelText)) parentLabelText = '';
 
   // 4. Preceding sibling label (common in simple layouts)
   let prevLabelText = '';
@@ -1905,6 +2230,7 @@ function getFieldKey(el) {
   if (prev && (prev.tagName === 'LABEL' || prev.classList.contains('label'))) {
     if (prev.innerText.trim()) prevLabelText = cleanLabelText(prev.innerText.trim());
   }
+  if (isErrorLabelText(prevLabelText)) prevLabelText = '';
 
   // 5. Ancestor Text Fallback (New)
   // If no direct label found, check the closest container for heading text
@@ -1914,9 +2240,12 @@ function getFieldKey(el) {
     const heading = container.querySelector('h1, h2, h3, h4, .title, .heading');
     if (heading && heading.innerText.trim()) headingText = cleanLabelText(heading.innerText.trim());
   }
+  if (isErrorLabelText(headingText)) headingText = '';
 
-  const siteLabel = getSiteLabel(el);
-  const ancestorLabelText = getAncestorLabelText(el);
+  let siteLabel = getSiteLabel(el);
+  let ancestorLabelText = getAncestorLabelText(el);
+  if (isErrorLabelText(siteLabel)) siteLabel = '';
+  if (isErrorLabelText(ancestorLabelText)) ancestorLabelText = '';
   const dataAutomationLabel = el.getAttribute('data-automation-label')
     || el.getAttribute('data-qa-label')
     || el.getAttribute('data-field-label')
@@ -1940,35 +2269,51 @@ function getFieldKey(el) {
   // 6. Prefer name > stable id > aria-label > placeholder
   const candidates = {
     labelledByText,
-    describedByText,
     labelForText,
     parentLabelText,
     prevLabelText,
     headingText,
     siteLabel,
-    dataAutomationLabel,
+    dataAutomationLabel: cleanLabelText(dataAutomationLabel),
     ancestorLabelText,
-    dataLabel,
-    name: el.name,
-    dataField,
-    ariaLabel: el.getAttribute('aria-label'),
-    placeholder: el.placeholder,
-    dataAutomationId: el.getAttribute('data-automation-id'),
-    dataQa: el.getAttribute('data-qa'),
-    dataTest: el.getAttribute('data-test') || el.getAttribute('data-testid'),
-    dataName: el.getAttribute('data-name'),
-    ancestorAutomationId,
-    ancestorTestId,
+    dataLabel: cleanLabelText(dataLabel),
+    describedByText,
+    name: cleanLabelText(el.name),
+    dataField: cleanLabelText(dataField),
+    ariaLabel: cleanLabelText(el.getAttribute('aria-label')),
+    placeholder: cleanLabelText(el.placeholder),
+    dataAutomationId: cleanLabelText(el.getAttribute('data-automation-id')),
+    dataQa: cleanLabelText(el.getAttribute('data-qa')),
+    dataTest: cleanLabelText(el.getAttribute('data-test') || el.getAttribute('data-testid')),
+    dataName: cleanLabelText(el.getAttribute('data-name')),
+    ancestorAutomationId: cleanLabelText(ancestorAutomationId),
+    ancestorTestId: cleanLabelText(ancestorTestId),
   };
 
   if (FieldUtils && FieldUtils.selectFieldKey) {
-    return FieldUtils.selectFieldKey(candidates);
+    const selected = FieldUtils.selectFieldKey(candidates);
+    const cleaned = cleanLabelText(selected);
+    if (cleaned && !isErrorLabelText(selected) && !isErrorLabelText(cleaned)) return cleaned || selected;
+    // If FieldUtils picked an error label, try better fallbacks
+    const altCandidates = [
+      labelForText,
+      parentLabelText,
+      prevLabelText,
+      siteLabel,
+      ancestorLabelText,
+      dataAutomationLabel,
+      dataLabel,
+      el.getAttribute('aria-label'),
+      el.placeholder
+    ].map(cleanLabelText).filter(Boolean);
+    const alt = altCandidates.find(c => !isErrorLabelText(c));
+    const finalKey = alt || cleaned || selected;
+    return isErrorLabelText(finalKey) ? null : finalKey;
   }
 
   // Fallback: simplified selection
   const fallbackOrder = [
     labelledByText,
-    describedByText,
     labelForText,
     parentLabelText,
     prevLabelText,
@@ -1977,6 +2322,7 @@ function getFieldKey(el) {
     dataAutomationLabel,
     ancestorLabelText,
     dataLabel,
+    describedByText,
     el.name,
     dataField,
     el.getAttribute('aria-label'),
@@ -1992,7 +2338,9 @@ function getFieldKey(el) {
   for (const c of fallbackOrder) {
     if (!c || !String(c).trim()) continue;
     if (isUnstableId(c)) continue;
-    return String(c).trim();
+    const cleaned = cleanLabelText(c);
+    if (cleaned && !isErrorLabelText(c) && !isErrorLabelText(cleaned)) return cleaned;
+    if (!isErrorLabelText(c) && !isErrorLabelText(cleaned)) return String(c).trim();
   }
   return null;
 }
@@ -2181,7 +2529,16 @@ function getStoredValue(el) {
 function queueCapture(fields) {
   if (!fields || Object.keys(fields).length === 0) return;
   if (isSiteDisabled()) return;
-  pendingCapture = { ...pendingCapture, ...fields };
+  const filtered = {};
+  Object.entries(fields).forEach(([key, val]) => {
+    if (!key) return;
+    if (isErrorLabelText(key)) return;
+    const clean = cleanLabelText(key);
+    if (!clean || isErrorLabelText(clean)) return;
+    filtered[clean] = val;
+  });
+  if (Object.keys(filtered).length === 0) return;
+  pendingCapture = { ...pendingCapture, ...filtered };
   if (captureTimer) clearTimeout(captureTimer);
   captureTimer = setTimeout(async () => {
     const payload = { ...pendingCapture };
@@ -2214,6 +2571,7 @@ function isWorkdayPage() {
     window.workday ||
     document.querySelector('[data-automation-id="applyFlowPage"]') ||
     document.querySelector('[data-automation-id="applyFlowReviewPage"]') ||
+    document.querySelector('[data-automation-id*="firstName"], [data-automation-id*="lastName"], [data-automation-id*="email"], [data-automation-id*="phone"]') ||
     /myworkdayjobs\.com|myworkday\.com/i.test(location.hostname)
   );
 }
@@ -2406,7 +2764,7 @@ function getFormFields() {
     if (isSensitiveField(el)) return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
-    if (!key) return;
+    if (!key || isErrorLabelText(key)) return;
     elements.push({ el, key, type });
   });
   const keyCounts = {};
@@ -2432,7 +2790,7 @@ function getFormFields() {
   collectElements('input[type=radio]:checked').forEach(el => {
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el) || el.name;
-    if (!key) return;
+    if (!key || isErrorLabelText(key)) return;
     const rawVal = el.value || '';
     const label = getRadioOptionLabel(el);
     if (!rawVal || rawVal === 'on' || rawVal === 'true' || rawVal === '1') {
@@ -2448,7 +2806,7 @@ function getFormFields() {
     if (el.tagName === 'INPUT') return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
-    if (!key) return;
+    if (!key || isErrorLabelText(key)) return;
     comboEls.push({ el, key });
   });
   const comboCounts = {};
@@ -2466,7 +2824,7 @@ function getFormFields() {
     const mapped = resolveMappedKey(listbox);
     const key = mapped.key || getFieldKey(listbox);
     const selected = listbox.querySelectorAll('[role="option"][aria-selected="true"]');
-    if (!key) return;
+    if (!key || isErrorLabelText(key)) return;
     if (selected.length > 0) {
       const values = Array.from(selected).map(o =>
         o.getAttribute('data-value') || o.getAttribute('value') || o.innerText?.trim()
@@ -2489,12 +2847,12 @@ function getFormFields() {
 
 function triggerEvents(el) {
   // React needs InputEvent (not plain Event) to fire synthetic onChange
-  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
   if (typeof InputEvent !== 'undefined') {
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.value }));
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: el.value, inputType: 'insertText' }));
   }
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  el.dispatchEvent(new Event('keyup', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  el.dispatchEvent(new Event('keyup', { bubbles: true, composed: true }));
 }
 
 function getValueSetter(el) {
@@ -2516,6 +2874,8 @@ function getValueSetter(el) {
 // text-input pipeline that all frameworks hook into.
 function universalFillText(el, value) {
   try {
+    el.dispatchEvent(new Event('focus', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('focusin', { bubbles: true, composed: true }));
     el.focus();
     // Select all so we replace existing content, but avoid throwing on email/number types
     const noSelectTypes = ['email', 'number', 'tel', 'date', 'month', 'week', 'time', 'datetime-local'];
@@ -2531,20 +2891,26 @@ function universalFillText(el, value) {
     }
     
     // execCommand fires the correct browser events that React/Vue listen to
-    const ok = document.execCommand('insertText', false, String(value));
-    if (ok && el.value === String(value)) return true;
+    document.execCommand('insertText', false, String(value));
   } catch (_) { }
-  // Fallback: native setter + InputEvent
+  // Always finalize with native setter + React value tracker + InputEvent
   const setter = getValueSetter(el);
+  const prev = el.value;
   if (setter) setter.call(el, value);
   else el.value = value;
-  if (typeof InputEvent !== 'undefined') {
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(value), inputType: 'insertText' }));
-  } else {
-    el.dispatchEvent(new Event('input', { bubbles: true }));
+  try { el.defaultValue = String(value); } catch (_) {}
+  try { el.setAttribute?.('value', String(value)); } catch (_) {}
+  const tracker = el._valueTracker;
+  if (tracker && typeof tracker.setValue === 'function') {
+    tracker.setValue(prev);
   }
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-  el.dispatchEvent(new Event('blur', { bubbles: true }));
+  if (typeof InputEvent !== 'undefined') {
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: String(value), inputType: 'insertText' }));
+  } else {
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+  }
+  el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  el.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
   return true;
 }
 
@@ -2722,6 +3088,7 @@ function fillListboxSafely(listboxEl, decoded, fieldKey, unresolvedDropdowns) {
 
 function fillFields(savedFields, opts = {}) {
   if (isSiteDisabled()) return;
+  savedFields = normalizeStoredFieldKeys(savedFields || {});
   const skipObserver = !!opts.skipObserver;
   if (DEBUG_AUTOFILL && !skipObserver) {
     console.group('[FormPilot DEBUG] fillFields() called');
@@ -2746,7 +3113,7 @@ function fillFields(savedFields, opts = {}) {
     stats.detected += 1;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el) || el.name;
-    if (!key) return;
+    if (!key || isErrorLabelText(key)) return;
     let val = savedFields[key];
     if (val !== undefined && val !== null) {
       const decodedTemp = decodeSelectValue(val);
@@ -2783,19 +3150,41 @@ function fillFields(savedFields, opts = {}) {
   collectElements(selectors).forEach(el => {
     const type = (el.type || '').toLowerCase();
     if (type === 'radio') return;
+    if (!isVisibleElement(el)) return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
-    if (!key) return;
-    elements.push({ el, key, type });
+    if (!key || isErrorLabelText(key)) return;
+    elements.push({ el, key, type, visible: isVisibleElement(el) });
   });
+  elements.sort((a, b) => Number(b.visible) - Number(a.visible));
   const keyCounts = {};
   elements.forEach(({ key }) => { keyCounts[key] = (keyCounts[key] || 0) + 1; });
+  const indexedKeys = {};
+  Object.keys(savedFields || {}).forEach(k => {
+    const m = /^(.+)\[\d+\]$/.exec(k);
+    if (m && m[1]) indexedKeys[m[1]] = true;
+  });
+  const bestByKey = {};
+  elements.forEach(({ el, key }) => {
+    const rect = el.getBoundingClientRect?.() || { width: 0, height: 0 };
+    const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+    const interactable = isElementInteractable(el);
+    const visible = isVisibleElement(el);
+    const score = (interactable ? 10000000 : 0) + (visible ? 1000000 : 0) + area;
+    if (!bestByKey[key] || score > bestByKey[key].score) {
+      bestByKey[key] = { el, score };
+    }
+  });
   const keyIndex = {};
   elements.forEach(({ el, key, type }) => {
     stats.detected += 1;
     const isDuplicate = keyCounts[key] > 1;
     keyIndex[key] = (keyIndex[key] || 0);
     const fieldKey = isDuplicate ? `${key}[${keyIndex[key]++}]` : key;
+    if (isDuplicate && !indexedKeys[key]) {
+      const best = bestByKey[key]?.el;
+      if (best && best !== el) return;
+    }
     const role = el.getAttribute?.('role') || '';
     const hasPopupListbox = el.getAttribute?.('aria-haspopup') === 'listbox';
     let val = savedFields[fieldKey];
@@ -2805,6 +3194,14 @@ function fillFields(savedFields, opts = {}) {
       globalMeta = getGlobalMatchMeta(fieldKey);
       val = globalMeta?.value;
       source = 'global';
+    }
+    if (val === undefined) {
+      const inferredKey = resolveProfileKeyFromField(el, fieldKey);
+      if (inferredKey && currentGlobalProfile && currentGlobalProfile[inferredKey] !== undefined) {
+        val = currentGlobalProfile[inferredKey];
+        source = 'global';
+        globalMeta = { value: val, key: inferredKey, score: 0.85, inferred: true };
+      }
     }
     if (val !== undefined && val !== null) {
       const decodedTemp = decodeSelectValue(val);
@@ -2853,6 +3250,11 @@ function fillFields(savedFields, opts = {}) {
       return;
     }
 
+    if (alreadyMatches(el, fieldKey, primaryVal)) {
+      stats.filled += 1;
+      return;
+    }
+
     if (el.tagName === 'SELECT') {
       const filledSelect = fillSelectSafely(el, decoded, fieldKey, unresolvedDropdowns);
       if (filledSelect) {
@@ -2872,10 +3274,23 @@ function fillFields(savedFields, opts = {}) {
     if (DEBUG_AUTOFILL) {
       console.log(`  → filled=${filled}`);
     }
+    logEvent({
+      type: 'fill_attempt',
+      hostname,
+      field: fieldKey,
+      tag: el.tagName + (el.type ? `[${el.type}]` : ''),
+      source,
+      confidence,
+      canFill,
+      filled,
+      visible: isVisibleElement(el),
+      interactable: isElementInteractable(el)
+    });
     if (filled) {
       stats.filled += 1;
       // Attach correction tracker so AI can learn from user edits
       attachCorrectionTracker(el, fieldKey, valueCandidates[0]);
+      ensureValueSticks(el, fieldKey, valueCandidates[0], altVal);
     }
   });
 
@@ -2888,7 +3303,7 @@ function fillFields(savedFields, opts = {}) {
     collectElements('[role="combobox"], [aria-haspopup="listbox"]').forEach(el => {
       const mapped = resolveMappedKey(el);
       const key = mapped.key || getFieldKey(el);
-      if (!key) return;
+      if (!key || isErrorLabelText(key)) return;
       comboboxEls.push({ el, key });
     });
     const comboKeyCounts = {};
@@ -2980,7 +3395,7 @@ function fillFields(savedFields, opts = {}) {
     stats.detected += 1;
     const mapped = resolveMappedKey(listbox);
     const key = mapped.key || getFieldKey(listbox);
-    if (!key) return;
+    if (!key || isErrorLabelText(key)) return;
     let val = savedFields[key];
     let source = 'site';
     let globalMeta = null;
@@ -3067,7 +3482,7 @@ function reportSiteMetrics(stats) {
   if (!stats) return;
   if (isSiteDisabled()) return;
   if (getSiteFlag('neverPrompt')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   const detected = Number(stats.detected || 0);
   if (detected < 3) return;
   chrome.runtime.sendMessage({ type: 'SITE_METRICS_UPDATE', hostname, stats }).catch(() => { });
@@ -3077,7 +3492,7 @@ function reportUsageMetrics(stats) {
   if (!stats) return;
   if (isSiteDisabled()) return;
   if (getSiteFlag('neverPrompt')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   const detected = Number(stats.detected || 0);
   const filled = Number(stats.filled || 0);
   if (detected <= 0 && filled <= 0) return;
@@ -3188,7 +3603,7 @@ function attachLiveCapture() {
   window._jaLiveCaptureAttached = true;
   const handler = (e) => {
     if (isSiteDisabled()) return;
-    if (!isJobContextPage()) return;
+    if (!isJobFlowEligible()) return;
     let el = e.target;
     if (!el) return;
 
@@ -3219,6 +3634,7 @@ function attachLiveCapture() {
       if (/^[-\s]*(select|choose|pick)/i.test(raw)) return;
     }
     queueCapture({ [key]: value });
+    maybeAutoLearnProfile(el, key, value);
   };
   document.addEventListener('input', handler, true);
   document.addEventListener('change', handler, true);
@@ -3246,9 +3662,61 @@ function cleanupEssayButtons() {
 function isVisibleElement(el) {
   if (!el) return false;
   const style = window.getComputedStyle(el);
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  const opacity = parseFloat(style.opacity || '1');
+  if (!Number.isNaN(opacity) && opacity <= 0.05) return false;
+  if (style.pointerEvents === 'none') return false;
   const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
+  if (rect.width <= 1 || rect.height <= 1) return false;
+  // Detect off-screen hidden inputs (e.g., left:-9999px)
+  if (rect.right < -5000 || rect.bottom < -5000 || rect.left > 100000 || rect.top > 100000) return false;
+  return true;
+}
+
+function isElementInteractable(el) {
+  if (!el) return false;
+  if (!isVisibleElement(el)) return false;
+  const rect = el.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  // If center is off viewport, treat as not interactable
+  if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return false;
+  const top = document.elementFromPoint(cx, cy);
+  if (!top) return false;
+  return top === el || el.contains(top) || top.contains(el);
+}
+
+function findProxyInput(el) {
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const top = document.elementFromPoint(cx, cy);
+  const candidates = [];
+  const consider = (node) => {
+    if (!node) return;
+    if (isUsableTextTarget(node) && isVisibleElement(node)) {
+      candidates.push(node);
+      return;
+    }
+    if (node.querySelector) {
+      node.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]').forEach(child => {
+        if (isUsableTextTarget(child) && isVisibleElement(child)) candidates.push(child);
+      });
+    }
+  };
+  consider(top);
+  // Also consider nearest container to the original element
+  const container = el.closest?.('.form-field,.field,.input-group,.field-wrapper,.form-group,[role="group"]') || el.parentElement;
+  consider(container);
+  if (!candidates.length) return null;
+  // Prefer interactable candidates
+  const scored = candidates.map(c => ({
+    el: c,
+    score: (isElementInteractable(c) ? 1000000 : 0) + (c.getBoundingClientRect()?.width || 0) * (c.getBoundingClientRect()?.height || 0)
+  }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.el || null;
 }
 
 function findFileInputFromTarget(target) {
@@ -4366,7 +4834,7 @@ function showDropdownResolver(unresolved) {
   if (!unresolved || unresolved.length === 0) return;
   if (!shouldShowUi()) return;
   if (getSiteFlag('neverPrompt')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   if (dropdownResolverOpen) return;
   if (document.getElementById('ja-dropdown-resolver')) return;
   dropdownResolverOpen = true;
@@ -4523,7 +4991,7 @@ function getFormCompletionStats() {
 function showReviewPanel() {
   if (document.getElementById('ja-review-panel')) return;
   if (!shouldShowUi()) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   const stats = getFormCompletionStats();
   if (stats.total < 4) return;
 
@@ -4550,7 +5018,6 @@ function showReviewPanel() {
       #ja-review-panel button {
         border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer;
       }
-      #ja-review-teach { background: #0ea5e9; color: #fff; }
       #ja-review-dismiss { background: rgba(255,255,255,0.08); color: #cbd5f5; }
       #ja-review-panel .ja-review-good { color:#86efac; }
     </style>
@@ -4558,16 +5025,11 @@ function showReviewPanel() {
     <div class="ja-review-sub">Filled ${stats.filled} of ${stats.total} fields.</div>
     ${missingList}
     <div class="ja-review-actions">
-      <button id="ja-review-teach">Teach Missing</button>
       <button id="ja-review-dismiss">Dismiss</button>
     </div>
   `;
   document.body.appendChild(panel);
 
-  panel.querySelector('#ja-review-teach')?.addEventListener('click', () => {
-    panel.remove();
-    startTeachMode();
-  });
   panel.querySelector('#ja-review-dismiss')?.addEventListener('click', () => {
     panel.remove();
   });
@@ -4575,10 +5037,11 @@ function showReviewPanel() {
 }
 
 function showConfidenceOverlay(savedFields) {
+  if (!CONFIDENCE_OVERLAY_ENABLED) return;
   if (document.getElementById('ja-confidence-layer')) return;
   if (!shouldShowUi()) return;
   if (getSessionFlag('confidenceDismissed')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   if (getSiteFlag('neverPrompt')) return;
 
   const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]';
@@ -4722,7 +5185,6 @@ function showCoverageBanner(stats) {
         border: none; border-radius: 8px; padding: 6px 10px;
         font-size: 12px; font-weight: 600; cursor: pointer;
       }
-      #ja-coverage-teach { background: #0ea5e9; color: #f8fafc; }
       #ja-coverage-dismiss { background: rgba(255,255,255,0.08); color: #cbd5f5; }
     </style>
     <div class="row">
@@ -4731,17 +5193,11 @@ function showCoverageBanner(stats) {
     </div>
     <div style="margin-top:4px; color:#94a3b8">Filled / Matched / Detected fields</div>
     <div class="actions">
-      <button id="ja-coverage-teach">Teach Missing</button>
       <button id="ja-coverage-dismiss">Dismiss</button>
     </div>
   `;
   document.body.appendChild(banner);
 
-  document.getElementById('ja-coverage-teach').onclick = () => {
-    setSessionFlag('coverageDismissed', true);
-    banner.remove();
-    startTeachMode();
-  };
   document.getElementById('ja-coverage-dismiss').onclick = () => {
     setSessionFlag('coverageDismissed', true);
     banner.remove();
@@ -4819,7 +5275,7 @@ function showAutofillBanner(savedFields) {
   if (document.getElementById('ja-banner')) return;
   if (!shouldShowUi()) return;
   if (getSiteFlag('neverPrompt')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
   if (!hasFillableFields()) return;
   // Don't show if user already skipped or accepted during this session
   if (getSessionFlag('autofillDismissed')) {
@@ -4909,7 +5365,7 @@ function showSaveDataBanner(fields) {
   if (!shouldShowUi()) return;
   if (getSessionFlag('promptSkipped')) return;
   if (getSiteFlag('neverPrompt')) return;
-  if (!isJobContextPage()) return;
+  if (!isJobFlowEligible()) return;
 
   const banner = document.createElement('div');
   banner.id = 'ja-save-banner';
@@ -5005,7 +5461,7 @@ function attachRecorder() {
       console.log('[FormPilot] Site disabled. Skipping auto-capture.');
       return;
     }
-    if (!isJobContextPage()) {
+    if (!isJobFlowEligible()) {
       console.log('[FormPilot] Non-job context detected. Skipping auto-capture.');
       return;
     }
@@ -5113,8 +5569,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Site disabled' });
         return true;
       }
-      if (!isJobContextPage()) {
-        sendResponse({ ok: false, error: 'Not a job form' });
+      if (isLikelyLoginForm()) {
+        sendResponse({ ok: false, error: 'Login form detected' });
         return true;
       }
       const fields = getFormFields();
@@ -5151,11 +5607,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: 'Site disabled' });
           return;
         }
-        if (!isJobContextPage()) {
-          sendResponse({ ok: false, error: 'Not a job form' });
-          return;
-        }
-        const merged = { ...(site.fields || {}), ...(sessionResp?.fields || {}) };
+        const merged = normalizeStoredFieldKeys({ ...(site.fields || {}), ...(sessionResp?.fields || {}) });
 
         console.group('[FormPilot DEBUG] MANUAL_AUTOFILL triggered');
         console.log('  hostname:', hostname);
@@ -5166,6 +5618,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         console.log('  merged fields count:', Object.keys(merged).length);
         console.log('  mappings count:', currentSiteMappings.length);
         console.groupEnd();
+        logEvent({
+          type: 'manual_autofill',
+          hostname,
+          counts: {
+            siteFields: Object.keys(site.fields || {}).length,
+            sessionFields: Object.keys(sessionResp?.fields || {}).length,
+            global: Object.keys(currentGlobalProfile || {}).length,
+            merged: Object.keys(merged || {}).length
+          }
+        });
 
         if (Object.keys(merged).length > 0 || Object.keys(currentGlobalProfile || {}).length > 0) {
           setSessionFlag('autofillActive', true);
@@ -5186,10 +5648,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'TEACH_MODE_START') {
     if (isSiteDisabled()) {
       sendResponse({ ok: false, error: 'Site disabled' });
-      return true;
-    }
-    if (!isJobContextPage()) {
-      sendResponse({ ok: false, error: 'Not a job form' });
       return true;
     }
     startTeachMode();
@@ -5334,6 +5792,7 @@ async function init() {
   initRunning = true;
 
   try {
+    try { chrome.runtime.sendMessage({ type: 'FRAME_HELLO' }); } catch (_) {}
     console.log(`[FormPilot] Initializing on ${location.href}`);
     ensureBrandFont();
 
@@ -5359,13 +5818,14 @@ async function init() {
     }
 
     const jobContextOk = isJobContextPage();
-    const allowAuto = !getSiteFlag('neverPrompt') && jobContextOk;
-    if (!jobContextOk) {
+    const jobFlowEligible = isJobFlowEligible();
+    const allowAuto = !getSiteFlag('neverPrompt') && jobFlowEligible;
+    if (!allowAuto) {
       removeUiOverlays();
       setTimeout(() => {
         if (!isExtensionValid()) return;
         if (!currentSiteActive) return;
-        if (isJobContextPage()) return;
+        if (isJobFlowEligible()) return;
         showJobContextPrompt();
       }, 1200);
     }
@@ -5377,7 +5837,7 @@ async function init() {
 
     currentGlobalProfile = profileResp?.profile || {};
     const sessionFields = sessionResp?.fields || {};
-    const mergedFields = { ...(site?.fields || {}), ...(sessionFields || {}) };
+    const mergedFields = normalizeStoredFieldKeys({ ...(site?.fields || {}), ...(sessionFields || {}) });
 
     const savedCount = Object.keys(mergedFields || {}).length;
     const globalCount = Object.keys(currentGlobalProfile || {}).length;
@@ -5420,6 +5880,25 @@ async function init() {
       console.warn('  ⚠️ OR upload your resume in Dashboard to populate global profile.');
     }
     console.groupEnd();
+    logEvent({
+      type: 'init_summary',
+      hostname,
+      allowAuto,
+      jobContextOk,
+      currentSiteActive,
+      counts: {
+        siteFields: siteFieldCount,
+        sessionFields: sessionFieldCount,
+        global: globalCount,
+        merged: savedCount
+      },
+      jobContext: {
+        status: jobContextState?.status || 'unknown',
+        jobScore: jobContextState?.jobScore || 0,
+        formScore: jobContextState?.formScore || 0,
+        loginScore: jobContextState?.loginScore || 0
+      }
+    });
     // ─────────────────────────────────────────────────────────────
 
     if (allowAuto && (savedCount > 0 || globalCount > 0)) {
@@ -5454,7 +5933,7 @@ async function init() {
         if (!isExtensionValid()) return;
         if (getSiteFlag('neverPrompt')) return;
         if (!currentSiteActive) return;
-        if (!isJobContextPage()) return;
+        if (!isJobFlowEligible()) return;
 
         attachRecorder();
         attachLiveCapture();

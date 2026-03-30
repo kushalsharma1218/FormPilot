@@ -283,6 +283,7 @@ async function loadAllData() {
         renderDisabledSites();
         renderAiSettings();
         loadResumeVault();
+        renderDebugLogs();
     } catch (err) {
         console.error('[Dashboard] Render error:', err);
     }
@@ -1764,6 +1765,62 @@ bindEvent('btn-nuke','click', () => {
         showToast('✓ All data deleted', 'success');
         await loadAllData();
     });
+});
+
+// ── Diagnostics Logs ───────────────────────────────────────────
+async function renderDebugLogs() {
+    const output = document.getElementById('debug-log-output');
+    if (!output) return;
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'LOG_GET' });
+        const logs = resp?.logs || [];
+        if (!logs.length) {
+            output.textContent = 'No logs yet.';
+            return;
+        }
+        const lines = logs.map(l => {
+            const ts = l.ts || '';
+            const type = l.type || l.kind || 'log';
+            const field = l.field ? ` field="${l.field}"` : '';
+            const tag = l.tag ? ` tag=${l.tag}` : '';
+            const src = l.source ? ` src=${l.source}` : '';
+            const filled = typeof l.filled === 'boolean' ? ` filled=${l.filled}` : '';
+            const match = typeof l.match === 'boolean' ? ` match=${l.match}` : '';
+            const visible = typeof l.visible === 'boolean' ? ` visible=${l.visible}` : '';
+            const interactable = typeof l.interactable === 'boolean' ? ` interactable=${l.interactable}` : '';
+            const frame = l.frameType ? ` frame=${l.frameType}` : '';
+            const url = l.url ? ` url=${l.url}` : '';
+            const confidence = l.confidence ? ` conf=${l.confidence}` : '';
+            const canFill = typeof l.canFill === 'boolean' ? ` canFill=${l.canFill}` : '';
+            return `[${ts}] ${type}${field}${tag}${src}${confidence}${canFill}${filled}${match}${visible}${interactable}${frame}${url}`;
+        });
+        output.textContent = lines.join('\n');
+    } catch (err) {
+        output.textContent = `Failed to load logs: ${err?.message || err}`;
+    }
+}
+
+bindEvent('btn-debug-refresh','click', async () => {
+    await renderDebugLogs();
+    showToast('Logs refreshed', 'info');
+});
+
+bindEvent('btn-debug-copy','click', async () => {
+    const output = document.getElementById('debug-log-output');
+    if (!output) return;
+    const text = output.textContent || '';
+    try {
+        await navigator.clipboard.writeText(text);
+        showToast('✓ Logs copied', 'success');
+    } catch (_) {
+        showToast('Failed to copy logs', 'error');
+    }
+});
+
+bindEvent('btn-debug-clear','click', async () => {
+    await chrome.runtime.sendMessage({ type: 'LOG_CLEAR' });
+    await renderDebugLogs();
+    showToast('✓ Logs cleared', 'success');
 });
 
 // ── Cloud Sync ─────────────────────────────────────────────────
