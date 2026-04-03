@@ -11,7 +11,7 @@ function readHtml(name) {
   return fs.readFileSync(path.join(__dirname, '..', 'dev', name), 'utf8');
 }
 
-function setupDom(html, url, profile) {
+function setupDom(html, url, profile, opts = {}) {
   const dom = new JSDOM(html, {
     url,
     pretendToBeVisual: true,
@@ -35,15 +35,18 @@ function setupDom(html, url, profile) {
   }
 
   win.InputEvent = win.InputEvent || class InputEvent extends win.Event {
-    constructor(type, opts) {
-      super(type, opts);
-      this.data = opts?.data;
+    constructor(type, evtOpts) {
+      super(type, evtOpts);
+      this.data = evtOpts?.data;
     }
   };
   win.PointerEvent = win.PointerEvent || win.Event;
   win.CSS = win.CSS || { escape: s => s };
   doc.execCommand = () => false;
-  win.HTMLElement.prototype.scrollIntoView = () => {};
+  win.HTMLElement.prototype.scrollIntoView = () => { };
+
+  const siteEnabled = opts.siteEnabled !== undefined ? opts.siteEnabled : true;
+  const siteExcluded = opts.siteExcluded || false;
 
   // Stub chrome APIs
   const chromeStub = {
@@ -52,21 +55,32 @@ function setupDom(html, url, profile) {
       sendMessage: async (msg) => {
         switch (msg.type) {
           case 'GET_SITE_DATA':
-            return { site: { enabled: true, fields: {}, mappings: [], flags: {} }, siteKey: msg.hostname || 'file' };
+            return {
+              site: {
+                enabled: siteEnabled,
+                disabled: !siteEnabled,
+                fields: {},
+                mappings: [],
+                flags: {}
+              },
+              siteKey: msg.hostname || 'file'
+            };
           case 'GET_GLOBAL_PROFILE':
             return { profile };
           case 'SESSION_GET':
             return { ok: true, fields: {}, flags: {} };
+          case 'IS_SITE_EXCLUDED':
+            return { excluded: siteExcluded };
           default:
             return { ok: true };
         }
       },
-      onMessage: { addListener: () => {} },
+      onMessage: { addListener: () => { } },
       getURL: (p) => `chrome-extension://test/${p}`,
-      openOptionsPage: () => {},
+      openOptionsPage: () => { },
     },
     tabs: {},
-    storage: { local: { get: async () => ({}), set: async () => {} } },
+    storage: { local: { get: async () => ({}), set: async () => { } } },
   };
 
   // Expose globals expected by content.js
@@ -251,5 +265,64 @@ test('ARIA job form fills combobox, listbox, and contenteditable', async () => {
   assert.equal(countryOption?.getAttribute('aria-selected'), 'true');
 
   assert.equal(doc.getElementById('summary-box').innerText.trim(), profile.summary);
+  dom.window.close();
+});
+
+// ── New tests for disabled and excluded sites ──────────────────
+
+test('disabled site should not autofill and should not inject UI', async () => {
+  const profile = {
+    firstName: 'Kushal',
+    lastName: 'Sharma',
+    email: 'kushal@example.com',
+    phone: '555-111-2222',
+  };
+  const dom = setupDom(
+    readHtml('test-job-form.html'),
+    'https://example.com/jobs/apply?ja_debug=1',
+    profile,
+    { siteEnabled: false }
+  );
+  loadContentScript();
+  await wait(200);
+
+  const doc = dom.window.document;
+  // Fields should NOT be filled
+  assert.equal(doc.getElementById('firstName').value, '');
+  assert.equal(doc.getElementById('lastName').value, '');
+  assert.equal(doc.getElementById('email').value, '');
+  assert.equal(doc.getElementById('phone').value, '');
+
+  // No FormPilot UI elements should exist
+  assert.equal(doc.getElementById('ja-banner'), null);
+  assert.equal(doc.getElementById('ja-ai-panel'), null);
+  assert.equal(doc.getElementById('ja-job-context-prompt'), null);
+  assert.equal(doc.getElementById('ja-save-banner'), null);
+  assert.equal(doc.getElementById('ja-coverage-banner'), null);
+  dom.window.close();
+});
+
+test('excluded site should not autofill and should not inject UI', async () => {
+  const profile = {
+    firstName: 'Kushal',
+    lastName: 'Sharma',
+    email: 'kushal@example.com',
+    phone: '555-111-2222',
+  };
+  const dom = setupDom(
+    readHtml('test-job-form.html'),
+    'https://example.com/jobs/apply?ja_debug=1',
+    profile,
+    { siteExcluded: true }
+  );
+  loadContentScript();
+  await wait(200);
+
+  const doc = dom.window.document;
+  // Fields should NOT be filled — the site is excluded
+  assert.equal(doc.getElementById('firstName').value, '');
+  assert.equal(doc.getElementById('lastName').value, '');
+  assert.equal(doc.getElementById('email').value, '');
+  assert.equal(doc.getElementById('phone').value, '');
   dom.window.close();
 });

@@ -132,6 +132,15 @@
                     </svg>
                     <span>Application Tracker</span>
                 </button>
+                <button class="nav-item" data-tab="tasks">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                        <path d="M8 11h8" />
+                        <path d="M8 16h6" />
+                        <path d="M7 7h.01" />
+                    </svg>
+                    <span>Task Tracker</span>
+                </button>
                 <button class="nav-item" data-tab="interview">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -689,6 +698,105 @@
                 </div>
             </section>
 
+            <!-- ═══ TASK TRACKER TAB ═══ -->
+            <section class="tab-content" id="tab-tasks">
+                <div class="page-header">
+                    <h1>Task Tracker</h1>
+                    <p class="page-subtitle">Jira-style board for planning follow-ups, prep, and job tasks</p>
+                </div>
+
+                <div class="task-summary">
+                    <div class="card task-summary-card">
+                        <div class="card-header">
+                            <h2>Task Summary</h2>
+                        </div>
+                        <div class="task-summary-grid">
+                            <div class="task-summary-item" data-task-summary="all">
+                                <span>Total</span>
+                                <strong id="task-summary-total">0</strong>
+                            </div>
+                            <div class="task-summary-item" data-task-summary="new">
+                                <span>New</span>
+                                <strong id="task-summary-new">0</strong>
+                            </div>
+                            <div class="task-summary-item" data-task-summary="backlog">
+                                <span>Backlog</span>
+                                <strong id="task-summary-backlog">0</strong>
+                            </div>
+                            <div class="task-summary-item" data-task-summary="in_progress">
+                                <span>In Progress</span>
+                                <strong id="task-summary-progress">0</strong>
+                            </div>
+                            <div class="task-summary-item" data-task-summary="blocked">
+                                <span>Blocked</span>
+                                <strong id="task-summary-blocked">0</strong>
+                            </div>
+                            <div class="task-summary-item" data-task-summary="done">
+                                <span>Completed</span>
+                                <strong id="task-summary-done">0</strong>
+                            </div>
+                            <div class="task-summary-item task-summary-overdue" data-task-summary="overdue">
+                                <span>Overdue</span>
+                                <strong id="task-summary-overdue">0</strong>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card task-about-card">
+                        <div class="card-header">
+                            <h2>Tips</h2>
+                        </div>
+                        <p class="card-hint">Use due dates and priorities so the board highlights what’s urgent.</p>
+                        <div class="tracker-about-list">
+                            <div>• Drag cards to move status.</div>
+                            <div>• Overdue tasks turn red automatically.</div>
+                            <div>• Keep follow-ups and prep in one place.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="task-actions">
+                    <form id="task-add-form" class="task-add-form">
+                        <div class="task-form-row">
+                            <input type="text" id="task-title" placeholder="Task title" required />
+                            <input type="date" id="task-due" />
+                            <select id="task-priority">
+                                <option value="low">Low</option>
+                                <option value="medium" selected>Medium</option>
+                                <option value="high">High</option>
+                            </select>
+                            <select id="task-status">
+                                <option value="new" selected>New</option>
+                                <option value="backlog">Backlog</option>
+                                <option value="in_progress">In Progress</option>
+                                <option value="blocked">Blocked</option>
+                                <option value="done">Completed</option>
+                            </select>
+                            <button class="btn btn-primary" type="submit">Add Task</button>
+                        </div>
+                        <div class="task-form-row secondary">
+                            <select id="task-type">
+                                <option value="task" selected>Task</option>
+                                <option value="epic">Epic</option>
+                            </select>
+                            <select id="task-parent">
+                                <option value="">No Epic</option>
+                            </select>
+                        </div>
+                        <textarea id="task-desc" placeholder="Notes (optional)"></textarea>
+                    </form>
+                    <div class="task-view-toggle">
+                        <button class="task-view-btn active" data-task-view="board">Board</button>
+                        <button class="task-view-btn" data-task-view="list">List</button>
+                    </div>
+                    <div class="task-stats">
+                        <span id="task-count">0 tasks</span>
+                    </div>
+                </div>
+
+                <div id="tasks-board" class="tasks-board"></div>
+                <div id="tasks-list" class="tasks-list" hidden></div>
+            </section>
+
             <!-- ═══ INTERVIEW PREP TAB ═══ -->
             <section class="tab-content" id="tab-interview">
                 <div class="page-header">
@@ -901,6 +1009,63 @@
             <div class="modal-actions">
                 <button class="btn btn-secondary" id="add-app-cancel">Cancel</button>
                 <button class="btn btn-primary" id="add-app-save">Save Application</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Task Modal -->
+    <div class="modal-overlay" id="task-modal" hidden>
+        <div class="modal modal-wide">
+            <h3 id="task-modal-title">Task Details</h3>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="task-modal-name">Title</label>
+                    <input type="text" id="task-modal-name" />
+                </div>
+                <div class="form-group">
+                    <label for="task-modal-type">Type</label>
+                    <select id="task-modal-type">
+                        <option value="task">Task</option>
+                        <option value="epic">Epic</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="task-modal-parent">Epic</label>
+                    <select id="task-modal-parent">
+                        <option value="">No Epic</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="task-modal-due">Due Date</label>
+                    <input type="date" id="task-modal-due" />
+                </div>
+                <div class="form-group">
+                    <label for="task-modal-priority">Priority</label>
+                    <select id="task-modal-priority">
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="task-modal-status">Status</label>
+                    <select id="task-modal-status">
+                        <option value="new">New</option>
+                        <option value="backlog">Backlog</option>
+                        <option value="in_progress">In Progress</option>
+                        <option value="blocked">Blocked</option>
+                        <option value="done">Completed</option>
+                    </select>
+                </div>
+                <div class="form-group" style="grid-column: 1 / -1;">
+                    <label for="task-modal-desc">Notes</label>
+                    <textarea id="task-modal-desc" rows="4" placeholder="Add details or follow-up notes..."></textarea>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="task-modal-cancel">Cancel</button>
+                <button class="btn btn-danger" id="task-modal-delete">Delete</button>
+                <button class="btn btn-primary" id="task-modal-save">Save Changes</button>
             </div>
         </div>
     </div>

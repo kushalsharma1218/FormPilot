@@ -463,50 +463,57 @@ async function pushAllToCloud(prefs = {}) {
   const syncProfile = prefs.syncProfile !== false;
   const syncAutofill = !!prefs.syncAutofill;
   const syncApplications = !!prefs.syncApplications;
+  const syncTasks = prefs.syncTasks !== false;
   const syncAiSettings = !!prefs.syncAiSettings;
   const syncResumes = prefs.syncResumes !== false;
   const syncMetrics = prefs.syncMetrics !== false;
 
   // Gather all local data using partitioned keys
-  const tasks = [];
-  let autofillData, profile, aiSettings, applications, resumes, metrics;
+  const fetchTasks = [];
+  let autofillData, profile, aiSettings, applications, taskList, resumes, metrics;
   if (syncAutofill) {
-    tasks.push(
+    fetchTasks.push(
       chrome.storage.local.get(await getUserKey('autofill_data'))
         .then(r => { autofillData = r[Object.keys(r)[0]] || { sites: {}, hostnameMappings: {} }; })
     );
   }
   if (syncProfile) {
-    tasks.push(
+    fetchTasks.push(
       chrome.storage.local.get(await getUserKey('global_profile_data'))
         .then(r => { profile = r[Object.keys(r)[0]] || {}; })
     );
   }
   if (syncAiSettings) {
-    tasks.push(
+    fetchTasks.push(
       chrome.storage.local.get(await getUserKey('ai_settings'))
         .then(r => { aiSettings = r[Object.keys(r)[0]] || {}; })
     );
   }
   if (syncApplications) {
-    tasks.push(
+    fetchTasks.push(
       chrome.storage.local.get(await getUserKey('applications_data'))
         .then(r => { applications = r[Object.keys(r)[0]] || []; })
     );
   }
+  if (syncTasks) {
+    fetchTasks.push(
+      chrome.storage.local.get(await getUserKey('tasks_data'))
+        .then(r => { taskList = r[Object.keys(r)[0]] || []; })
+    );
+  }
   if (syncResumes) {
-    tasks.push(
+    fetchTasks.push(
       chrome.storage.local.get(await getUserKey('resumes_data'))
         .then(r => { resumes = r[Object.keys(r)[0]] || { items: [], defaultId: null }; })
     );
   }
   if (syncMetrics) {
-    tasks.push(
+    fetchTasks.push(
       chrome.storage.local.get(await getUserKey('usage_metrics'))
         .then(r => { metrics = r[Object.keys(r)[0]] || {}; })
     );
   }
-  await Promise.all(tasks);
+  await Promise.all(fetchTasks);
 
   // Push each section in parallel
   const pushTasks = [];
@@ -516,6 +523,7 @@ async function pushAllToCloud(prefs = {}) {
     pushTasks.push(pushDataToCloud('ai_settings', aiSettings || {}));
   }
   if (syncApplications) pushTasks.push(pushDataToCloud('applications', { list: applications }));
+  if (syncTasks) pushTasks.push(pushDataToCloud('tasks', { list: taskList }));
   if (syncResumes) pushTasks.push(pushDataToCloud('resumes', resumes));
   if (syncMetrics) pushTasks.push(pushDataToCloud('metrics', metrics || {}));
   if (pushTasks.length) await Promise.all(pushTasks);
@@ -539,16 +547,18 @@ async function pullAllFromCloud(prefs = {}) {
   const syncProfile = prefs.syncProfile !== false;
   const syncAutofill = !!prefs.syncAutofill;
   const syncApplications = !!prefs.syncApplications;
+  const syncTasks = prefs.syncTasks !== false;
   const syncAiSettings = !!prefs.syncAiSettings;
   const syncResumes = prefs.syncResumes !== false;
   const syncMetrics = prefs.syncMetrics !== false;
 
   const pullTasks = [];
-  let autofillData, profile, aiSettings, appData, resumeData, metricsData;
+  let autofillData, profile, aiSettings, appData, taskData, resumeData, metricsData;
   if (syncAutofill) pullTasks.push(pullDataFromCloud('autofill').then(r => { autofillData = r; }));
   if (syncProfile) pullTasks.push(pullDataFromCloud('profile').then(r => { profile = r; }));
   if (syncAiSettings) pullTasks.push(pullDataFromCloud('ai_settings').then(r => { aiSettings = r; }));
   if (syncApplications) pullTasks.push(pullDataFromCloud('applications').then(r => { appData = r; }));
+  if (syncTasks) pullTasks.push(pullDataFromCloud('tasks').then(r => { taskData = r; }));
   if (syncResumes) pullTasks.push(pullDataFromCloud('resumes').then(r => { resumeData = r; }));
   if (syncMetrics) pullTasks.push(pullDataFromCloud('metrics').then(r => { metricsData = r; }));
   if (pullTasks.length) await Promise.all(pullTasks);
@@ -559,6 +569,7 @@ async function pullAllFromCloud(prefs = {}) {
     getUserKey('global_profile_data'),
     getUserKey('ai_settings'),
     getUserKey('applications_data'),
+    getUserKey('tasks_data'),
     getUserKey('resumes_data'),
     getUserKey('usage_metrics')
   ]);
@@ -615,8 +626,22 @@ async function pullAllFromCloud(prefs = {}) {
     updates[storageKeys[3]] = mergedApps;
   }
 
+  if (syncTasks && taskData?.list) {
+    const localTasks = localResult[storageKeys[4]] || [];
+    const mergedTasks = [...localTasks];
+    for (const cloudTask of taskData.list) {
+      const idx = mergedTasks.findIndex(t => t.id === cloudTask.id);
+      if (idx >= 0) {
+        mergedTasks[idx] = cloudTask;
+      } else {
+        mergedTasks.push(cloudTask);
+      }
+    }
+    updates[storageKeys[4]] = mergedTasks;
+  }
+
   if (syncResumes && resumeData?.items) {
-    const localResumes = localResult[storageKeys[4]] || { items: [], defaultId: null };
+    const localResumes = localResult[storageKeys[5]] || { items: [], defaultId: null };
     const mergedById = new Map();
     (localResumes.items || []).forEach(item => {
       if (item?.id) mergedById.set(item.id, item);
@@ -625,19 +650,19 @@ async function pullAllFromCloud(prefs = {}) {
       if (item?.id) mergedById.set(item.id, { ...(mergedById.get(item.id) || {}), ...item });
     });
     const mergedItems = Array.from(mergedById.values());
-    updates[storageKeys[4]] = {
+    updates[storageKeys[5]] = {
       items: mergedItems,
       defaultId: resumeData.defaultId || localResumes.defaultId || mergedItems[0]?.id || null,
     };
   }
 
   if (syncMetrics && metricsData) {
-    const localMetrics = localResult[storageKeys[5]] || {};
+    const localMetrics = localResult[storageKeys[6]] || {};
     // Prefer higher totals to avoid double counting across devices
     const merged = (typeof mergeUsageMetrics === 'function')
       ? mergeUsageMetrics(localMetrics, metricsData)
       : { ...localMetrics, ...metricsData };
-    updates[storageKeys[5]] = merged;
+    updates[storageKeys[6]] = merged;
   }
 
   if (Object.keys(updates).length > 0) {

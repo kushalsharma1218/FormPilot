@@ -4,6 +4,50 @@
 
 const AI_SETTINGS_KEY = 'ai_settings';
 const APPLICATIONS_KEY = 'applications_data';
+const TASKS_KEY = 'tasks_data';
+const TASK_STATUSES = ['new', 'backlog', 'in_progress', 'blocked', 'done'];
+const TASK_STATUS_SET = new Set(TASK_STATUSES);
+const TASK_STATUS_ALIASES = {
+  completed: 'done',
+  complete: 'done',
+  finished: 'done',
+  done: 'done',
+  inprogress: 'in_progress',
+  in_progress: 'in_progress',
+  inprogresss: 'in_progress',
+  progress: 'in_progress',
+  doing: 'in_progress',
+  todo: 'backlog',
+  to_do: 'backlog',
+  backlog: 'backlog',
+  new: 'new',
+  blocked: 'blocked',
+  onhold: 'blocked',
+  on_hold: 'blocked',
+};
+
+function normalizeTaskStatus(status) {
+  if (!status) return 'new';
+  const raw = String(status).trim().toLowerCase();
+  if (!raw) return 'new';
+  const normalized = raw.replace(/[\s-]+/g, '_');
+  if (TASK_STATUS_SET.has(normalized)) return normalized;
+  if (TASK_STATUS_ALIASES[normalized]) return TASK_STATUS_ALIASES[normalized];
+  return 'backlog';
+}
+
+function normalizeTaskList(tasks) {
+  let changed = false;
+  const next = tasks.map(task => {
+    const normalized = normalizeTaskStatus(task?.status);
+    if (normalized !== task?.status) {
+      changed = true;
+      return { ...task, status: normalized };
+    }
+    return task;
+  });
+  return { next, changed };
+}
 
 const AIAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
   getUserKey: async (baseKey) => baseKey,
@@ -697,4 +741,115 @@ async function deleteApplication(id) {
   apps = apps.filter(a => a.id !== id);
   await saveApplications(apps);
   return apps;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TASK TRACKER
+// ═══════════════════════════════════════════════════════════════
+async function getTasks() {
+  const key = await AuthStore.getUserKey(TASKS_KEY);
+  const result = await chrome.storage.local.get(key);
+  const list = result[key] || [];
+  const { next, changed } = normalizeTaskList(list);
+  if (changed) await saveTasks(next);
+  return next;
+}
+
+async function saveTasks(tasks) {
+  const key = await AuthStore.getUserKey(TASKS_KEY);
+  await chrome.storage.local.set({ [key]: tasks });
+}
+
+function recomputeEpics(tasks) {
+  const epics = tasks.filter(t => t.type === 'epic');
+  for (const epic of epics) {
+    const children = tasks.filter(t => t.parentId === epic.id && t.type !== 'epic');
+    if (children.length === 0) continue;
+    const allDone = children.every(c => c.status === 'done');
+    const anyActive = children.some(c => c.status === 'in_progress' || c.status === 'blocked');
+    const anyDone = children.some(c => c.status === 'done');
+    const anyBacklog = children.some(c => c.status === 'backlog');
+    const anyNew = children.some(c => c.status === 'new');
+    let nextStatus = 'new';
+    if (allDone) nextStatus = 'done';
+    else if (anyActive || anyDone) nextStatus = 'in_progress';
+    else if (anyBacklog) nextStatus = 'backlog';
+    else if (anyNew) nextStatus = 'new';
+    if (epic.status !== nextStatus) {
+      epic.status = nextStatus;
+      epic.updatedAt = new Date().toISOString();
+    }
+  }
+  return tasks;
+}
+
+async function addTask(task) {
+  const tasks = await getTasks();
+  const now = new Date().toISOString();
+  const isEpic = task.type === 'epic' || task.isEpic === true;
+  const parentCandidate = isEpic ? '' : (task.parentId || '');
+  const parentId = parentCandidate && parentCandidate !== task.id ? parentCandidate : '';
+  const entryId = task.id && !tasks.some(t => t.id === task.id)
+    ? task.id
+    : (Date.now().toString(36) + Math.random().toString(36).substr(2, 5));
+  const entry = {
+    id: entryId,
+    title: task.title || 'Untitled Task',
+    description: task.description || '',
+    status: normalizeTaskStatus(task.status || (isEpic ? 'new' : 'new')),
+    priority: task.priority || 'medium',
+    dueDate: task.dueDate || '',
+    createdAt: now,
+    updatedAt: now,
+    tags: Array.isArray(task.tags) ? task.tags : [],
+    type: isEpic ? 'epic' : 'task',
+    parentId,
+  };
+  tasks.unshift(entry);
+  const next = recomputeEpics(tasks);
+  await saveTasks(next);
+  return next;
+}
+
+async function updateTask(id, updates) {
+  const tasks = await getTasks();
+  const task = tasks.find(t => t.id === id);
+  if (task) {
+    const nextUpdates = { ...(updates || {}) };
+    if (nextUpdates.status !== undefined) {
+      nextUpdates.status = normalizeTaskStatus(nextUpdates.status);
+    }
+    if (nextUpdates.type === 'epic') {
+      nextUpdates.parentId = '';
+    }
+    if (task.type === 'epic' && nextUpdates.parentId !== undefined) {
+      delete nextUpdates.parentId;
+    }
+    if (nextUpdates.parentId && nextUpdates.parentId === id) {
+      nextUpdates.parentId = '';
+    }
+    Object.assign(task, nextUpdates, { updatedAt: new Date().toISOString() });
+    const next = recomputeEpics(tasks);
+    await saveTasks(next);
+    return next;
+  }
+  return tasks;
+}
+
+async function deleteTask(id) {
+  let tasks = await getTasks();
+  const removed = tasks.find(t => t.id === id);
+  tasks = tasks.filter(t => t.id !== id);
+  if (removed?.type === 'epic') {
+    const now = new Date().toISOString();
+    tasks.forEach(t => {
+      if (t.parentId === id) {
+        t.parentId = '';
+        t.updatedAt = now;
+      }
+    });
+  }
+  const next = recomputeEpics(tasks);
+  await saveTasks(next);
+  return next;
 }

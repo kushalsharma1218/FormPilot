@@ -45,6 +45,7 @@ let currentGlobalProfile = {};
 let siteData = { enabled: true, fields: {}, mappings: [], flags: {} };
 let currentSiteKey = '';
 let currentSiteActive = true;
+let siteExcluded = false;
 let currentSiteMappings = [];
 let siteFlags = {};
 let sessionFlags = {};
@@ -69,6 +70,9 @@ let aiLastQuestion = '';
 let aiFocusTrackingAttached = false;
 let essayObserver = null;
 let essayButtons = new Set();
+
+// Performance mode: minimize UI + heavy observers to keep pages smooth
+const PERFORMANCE_MODE = true;
 let jobContextState = { status: 'unknown', signature: '', jobScore: 0, formScore: 0, loginScore: 0, ts: 0 };
 let debugInfo = {};
 let debugOverlayEnabled = false;
@@ -136,6 +140,54 @@ function shouldShowUi() {
   if (!isTopFrame()) return false;
   if (!isJobFlowEligible()) return false;
   return true;
+}
+
+function makeDraggable(el, handleSelector) {
+  if (!el || el.__jaDraggable) return;
+  const handle = handleSelector ? el.querySelector(handleSelector) : el;
+  if (!handle) return;
+  el.__jaDraggable = true;
+  handle.style.cursor = 'move';
+  handle.style.touchAction = 'none';
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  let originX = 0;
+  let originY = 0;
+
+  const onPointerDown = (e) => {
+    if (e.button !== 0) return;
+    if (e.target?.closest?.('button, input, select, textarea, a')) return;
+    const rect = el.getBoundingClientRect();
+    originX = rect.left;
+    originY = rect.top;
+    startX = e.clientX;
+    startY = e.clientY;
+    dragging = true;
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+    el.style.left = `${originX}px`;
+    el.style.top = `${originY}px`;
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp, { once: true });
+  };
+
+  const onPointerMove = (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    const left = Math.max(4, originX + dx);
+    const top = Math.max(4, originY + dy);
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  };
+
+  const onPointerUp = () => {
+    dragging = false;
+    document.removeEventListener('pointermove', onPointerMove);
+  };
+
+  handle.addEventListener('pointerdown', onPointerDown);
 }
 
 function isDebugOverlayEnabled() {
@@ -263,7 +315,7 @@ function showJobContextPrompt() {
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
-      #ja-job-context-prompt .title { font-weight: 600; }
+      #ja-job-context-prompt .title { font-weight: 600; cursor: move; }
       #ja-job-context-prompt .actions { display:flex; gap:8px; margin-top: 8px; }
       #ja-job-yes { background: #0ea5e9; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
       #ja-job-no { background: rgba(255,255,255,0.08); color: #cbd5f5; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
@@ -278,6 +330,7 @@ function showJobContextPrompt() {
     </div>
   `;
   document.body.appendChild(wrap);
+  makeDraggable(wrap, '.title');
 
   wrap.querySelector('#ja-job-yes')?.addEventListener('click', () => {
     setFormPreference(sig, true);
@@ -297,6 +350,7 @@ function showJobContextPrompt() {
 
 function isSiteDisabled() {
   return !!(
+    siteExcluded ||
     !currentSiteActive ||
     siteData?.disabled ||
     siteData?.enabled === false ||
@@ -319,6 +373,9 @@ function removeUiOverlays() {
     'ja-review-panel',
     'ja-debug-overlay',
     'ja-ai-panel',
+    'ja-resume-attach',
+    'ja-resume-toast',
+    'ja-teach-toast',
   ];
   ids.forEach(id => {
     const el = document.getElementById(id);
@@ -339,11 +396,15 @@ function suppressSiteUi() {
   essayObserver = null;
   cleanupEssayButtons();
   dropdownResolverOpen = false;
+  pendingDropdownResolve = null;
+  window._jaResumeAttachInit = false;
   approvalQueue = [];
   pendingCapture = {};
   if (teachMode) {
     try { stopTeachMode(); } catch (_) { }
   }
+  // Disconnect SPA navigation observer to stop re-init cycles
+  try { if (typeof navObserver !== 'undefined' && navObserver) navObserver.disconnect(); } catch (_) { }
 }
 
 function cleanLabelText(text) {
@@ -830,11 +891,12 @@ function showApprovalBanner() {
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
+      #ja-approval-banner .ja-drag { cursor: move; }
       #ja-approval-banner .actions { display:flex; gap:8px; margin-top: 8px; }
       #ja-approval-fill { background: #0ea5e9; color: #fff; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
       #ja-approval-skip { background: rgba(255,255,255,0.08); color: #cbd5f5; border: none; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
     </style>
-    <div><strong>Approve ${approvalQueue.length} suggestions?</strong></div>
+    <div class="ja-drag"><strong>Approve ${approvalQueue.length} suggestions?</strong></div>
     <div style="color:#94a3b8; margin-top:4px;">We’ll only fill medium‑confidence fields if you approve.</div>
     <div class="actions">
       <button id="ja-approval-fill">Fill Now</button>
@@ -842,6 +904,10 @@ function showApprovalBanner() {
     </div>
   `;
   document.body.appendChild(banner);
+  makeDraggable(banner, '.row');
+  makeDraggable(banner, '.ja-text');
+  makeDraggable(banner, '.ja-text');
+  makeDraggable(banner, '.ja-drag');
 
   banner.querySelector('#ja-approval-fill')?.addEventListener('click', () => {
     approvalQueue.forEach(item => {
@@ -1249,10 +1315,16 @@ function setSiteFlag(flag, value) {
   }
 }
 
-function getPageTextSample() {
+let _pageTextCache = { ts: 0, text: '' };
+function getPageTextSample(force = false) {
   try {
-    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-    return text.substring(0, 4000);
+    const now = Date.now();
+    if (!force && _pageTextCache.text && (now - _pageTextCache.ts) < 12000) {
+      return _pageTextCache.text;
+    }
+    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 4000);
+    _pageTextCache = { ts: now, text };
+    return text;
   } catch (_) {
     return '';
   }
@@ -3519,6 +3591,7 @@ function attachCorrectionTracker(el, fieldKey, autoFilledVal) {
 }
 
 function maybeInjectEssayButtons() {
+  if (PERFORMANCE_MODE) return;
   if (isSiteDisabled() || !shouldShowUi()) return;
   collectElements('textarea').forEach(el => {
     if (el.__jaEssayBtn) return;
@@ -3586,6 +3659,7 @@ function maybeInjectEssayButtons() {
 }
 
 function ensureEssayObserver() {
+  if (PERFORMANCE_MODE) return;
   if (essayObserver) return;
   setTimeout(maybeInjectEssayButtons, 1500);
   essayObserver = new MutationObserver(() => {
@@ -3764,6 +3838,8 @@ function findAnchorForInput(input) {
 }
 
 function ensureResumeAttachUI() {
+  if (isSiteDisabled()) return;
+  if (!shouldShowUi()) return;
   if (document.getElementById('ja-resume-attach')) return;
   const wrap = document.createElement('div');
   wrap.id = 'ja-resume-attach';
@@ -4071,6 +4147,8 @@ async function attachResumeToInput(resumeId, inputEl) {
 }
 
 async function openResumeMenu() {
+  if (isSiteDisabled()) return;
+  if (!shouldShowUi()) return;
   ensureResumeAttachUI();
   const wrap = document.getElementById('ja-resume-attach');
   const menu = wrap.querySelector('.ja-resume-menu');
@@ -4139,6 +4217,7 @@ function hideResumeAttach() {
 
 function initResumeAttach() {
   if (window._jaResumeAttachInit) return;
+  if (!shouldShowUi()) return;
   window._jaResumeAttachInit = true;
 
   ensureResumeAttachUI();
@@ -4176,6 +4255,10 @@ function initResumeAttach() {
   });
   obs.observe(document.documentElement || document.body, { childList: true, subtree: true });
 
+  if (isSiteDisabled()) {
+    hideResumeAttach();
+    return;
+  }
   const initial = getFirstFileInput();
   if (initial) {
     lastFileInput = initial;
@@ -4202,6 +4285,7 @@ function isTeachTarget(el) {
 }
 
 function attachAiFocusTracking() {
+  if (PERFORMANCE_MODE) return;
   if (aiFocusTrackingAttached) return;
   aiFocusTrackingAttached = true;
   const handler = (e) => {
@@ -4254,6 +4338,7 @@ function insertAiAnswerIntoField(answer) {
 
 function ensureAiAssistPanel() {
   if (!shouldShowUi()) return;
+  if (PERFORMANCE_MODE) return;
   if (document.getElementById('ja-ai-panel')) return;
 
   const root = document.createElement('div');
@@ -4286,7 +4371,7 @@ function ensureAiAssistPanel() {
         color: #e2e8f0;
       }
       #ja-ai-panel .ja-ai-header {
-        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: move;
       }
       #ja-ai-panel .ja-ai-title { font-weight: 700; font-size: 14px; color: #e2e8f0; }
       #ja-ai-panel .ja-ai-close {
@@ -4366,6 +4451,7 @@ function ensureAiAssistPanel() {
   `;
 
   document.body.appendChild(root);
+  makeDraggable(root, '.ja-ai-header');
 
   const toggleBtn = root.querySelector('#ja-ai-toggle');
   const closeBtn = root.querySelector('#ja-ai-close');
@@ -4657,12 +4743,14 @@ function showTeachBanner() {
         border-radius: 10px; border: 1px solid rgba(99,102,241,0.4);
         font-size: 12px; font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+        cursor: move;
       }
       #ja-teach-banner strong { color: #a5b4fc; }
     </style>
     <div><strong>Teach Mode</strong>: click fields to map them. Press Esc to exit.</div>
   `;
   document.body.appendChild(banner);
+  makeDraggable(banner);
 }
 
 function removeTeachBanner() {
@@ -4703,7 +4791,7 @@ function showTeachOverlay({ el, label, signature, type, value }) {
         padding: 14px; min-width: 280px; max-width: 360px;
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; box-shadow: 0 12px 30px rgba(0,0,0,0.45);
       }
-      #ja-teach-overlay h4 { margin: 0 0 6px; font-size: 13px; color: #a5b4fc; }
+      #ja-teach-overlay h4 { margin: 0 0 6px; font-size: 13px; color: #a5b4fc; cursor: move; }
       #ja-teach-overlay .label { font-size: 12px; margin-bottom: 10px; color: #cbd5f5; }
       #ja-teach-overlay select, #ja-teach-overlay input {
         width: 100%; padding: 8px 10px; border-radius: 8px;
@@ -4729,6 +4817,7 @@ function showTeachOverlay({ el, label, signature, type, value }) {
   `;
 
   document.body.appendChild(overlay);
+  makeDraggable(overlay, 'h4');
   const select = overlay.querySelector('#ja-teach-select');
   const customInput = overlay.querySelector('#ja-teach-custom');
   select.addEventListener('change', () => {
@@ -4832,6 +4921,7 @@ function attachDropdownResolveListener() {
 
 function showDropdownResolver(unresolved) {
   if (!unresolved || unresolved.length === 0) return;
+  if (isSiteDisabled()) return;
   if (!shouldShowUi()) return;
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobFlowEligible()) return;
@@ -4879,7 +4969,7 @@ function showDropdownResolver(unresolved) {
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
-      #ja-dropdown-resolver h4 { margin: 0 0 8px 0; font-size: 13px; color: #93c5fd; }
+      #ja-dropdown-resolver h4 { margin: 0 0 8px 0; font-size: 13px; color: #93c5fd; cursor: move; }
       #ja-dropdown-resolver .ja-dd-row { display:flex; gap:8px; align-items:center; margin-bottom: 8px; }
       #ja-dropdown-resolver .ja-dd-label { flex:1; color:#e2e8f0; }
       #ja-dropdown-resolver .ja-dd-select {
@@ -4903,6 +4993,7 @@ function showDropdownResolver(unresolved) {
     </div>
   `;
   document.body.appendChild(panel);
+  makeDraggable(panel, 'h4');
 
   const cleanupResolver = () => {
     if (!panel.querySelector('.ja-dd-row')) {
@@ -5011,7 +5102,7 @@ function showReviewPanel() {
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         font-size: 12px;
       }
-      #ja-review-panel h4 { margin: 0 0 6px 0; font-size: 13px; color: #93c5fd; }
+      #ja-review-panel h4 { margin: 0 0 6px 0; font-size: 13px; color: #93c5fd; cursor: move; }
       #ja-review-panel .ja-review-sub { color:#94a3b8; margin-bottom: 8px; }
       #ja-review-panel ul { margin: 6px 0 0 16px; padding: 0; color: #fbbf24; }
       #ja-review-panel .ja-review-actions { display:flex; gap:8px; margin-top: 10px; }
@@ -5029,6 +5120,7 @@ function showReviewPanel() {
     </div>
   `;
   document.body.appendChild(panel);
+  makeDraggable(panel, 'h4');
 
   panel.querySelector('#ja-review-dismiss')?.addEventListener('click', () => {
     panel.remove();
@@ -5038,6 +5130,7 @@ function showReviewPanel() {
 
 function showConfidenceOverlay(savedFields) {
   if (!CONFIDENCE_OVERLAY_ENABLED) return;
+  if (PERFORMANCE_MODE) return;
   if (document.getElementById('ja-confidence-layer')) return;
   if (!shouldShowUi()) return;
   if (getSessionFlag('confidenceDismissed')) return;
@@ -5178,7 +5271,7 @@ function showCoverageBanner(stats) {
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; color: #e2e8f0; font-size: 12px;
         max-width: 320px;
       }
-      #ja-coverage-banner .row { display:flex; gap:10px; align-items:center; justify-content: space-between; }
+      #ja-coverage-banner .row { display:flex; gap:10px; align-items:center; justify-content: space-between; cursor: move; }
       #ja-coverage-banner .stats { color: #93c5fd; font-weight: 600; }
       #ja-coverage-banner .actions { display:flex; gap:8px; margin-top: 8px; }
       #ja-coverage-banner button {
@@ -5304,7 +5397,7 @@ function showAutofillBanner(savedFields) {
         to   { opacity:1; transform: translateY(0) scale(1); }
       }
       #ja-banner .ja-icon { font-size: 22px; flex-shrink:0; }
-      #ja-banner .ja-text { flex:1; line-height:1.4; }
+      #ja-banner .ja-text { flex:1; line-height:1.4; cursor: move; }
       #ja-banner .ja-text strong { color: #93c5fd; display:block; margin-bottom:2px; }
       #ja-banner .ja-btns { display:flex; gap:8px; flex-shrink:0; }
       #ja-banner button {
@@ -5384,7 +5477,7 @@ function showSaveDataBanner(fields) {
         max-width: 360px;
       }
       #ja-save-banner .ja-icon { font-size: 22px; flex-shrink:0; }
-      #ja-save-banner .ja-text { flex:1; line-height:1.4; }
+      #ja-save-banner .ja-text { flex:1; line-height:1.4; cursor: move; }
       #ja-save-banner .ja-text strong { color: #6ee7b7; display:block; margin-bottom:2px; }
       #ja-save-banner .ja-btns { display:flex; gap:8px; flex-shrink:0; }
       #ja-save-banner button {
@@ -5692,6 +5785,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'SITE_EXCLUDED_UPDATE') {
+    siteExcluded = !!msg.excluded;
+    if (siteExcluded) {
+      currentSiteActive = false;
+      suppressSiteUi();
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (msg.type === 'EXTRACT_PAGE_TEXT') {
     try {
       let container = document.querySelector('main, [role="main"], article, .job-description, #job-description, .posting-content, .job-details');
@@ -5722,6 +5825,7 @@ function isExtensionValid() {
 let isAiMappingRunning = false;
 async function triggerAiMapping(elementsToMap) {
   if (isAiMappingRunning) return;
+  if (PERFORMANCE_MODE) return;
   if (isSiteDisabled()) return;
   const unmappedLabels = [];
   const elMap = new Map();
@@ -5797,6 +5901,20 @@ async function init() {
 
   try {
     try { chrome.runtime.sendMessage({ type: 'FRAME_HELLO' }); } catch (_) {}
+
+    // Check if site is excluded (not a job portal) — bail immediately
+    try {
+      const excludeResp = await chrome.runtime.sendMessage({ type: 'IS_SITE_EXCLUDED', hostname });
+      if (excludeResp?.excluded) {
+        siteExcluded = true;
+        currentSiteActive = false;
+        console.log(`[FormPilot] Site excluded (not a job portal): ${hostname}`);
+        suppressSiteUi();
+        return;
+      }
+      siteExcluded = false;
+    } catch (_) { siteExcluded = false; }
+
     console.log(`[FormPilot] Initializing on ${location.href}`);
     ensureBrandFont();
 
@@ -5828,7 +5946,7 @@ async function init() {
       removeUiOverlays();
       setTimeout(() => {
         if (!isExtensionValid()) return;
-        if (!currentSiteActive) return;
+        if (isSiteDisabled()) return;
         if (isJobFlowEligible()) return;
         showJobContextPrompt();
       }, 1200);
@@ -5935,8 +6053,7 @@ async function init() {
     if (!allowAuto) {
       setTimeout(() => {
         if (!isExtensionValid()) return;
-        if (getSiteFlag('neverPrompt')) return;
-        if (!currentSiteActive) return;
+        if (isSiteDisabled()) return;
         if (!isJobFlowEligible()) return;
 
         attachRecorder();
@@ -5968,9 +6085,11 @@ async function init() {
 // ── Debounced init for SPA navigation ──────────────────────────
 let reinitTimer = null;
 function debouncedInit() {
+  // Don't re-init if site is disabled or excluded
+  if (siteExcluded || isSiteDisabled()) return;
   if (reinitTimer) clearTimeout(reinitTimer);
   reinitTimer = setTimeout(() => {
-    if (isExtensionValid()) init();
+    if (isExtensionValid() && !siteExcluded) init();
   }, 300);
 }
 
@@ -5985,7 +6104,7 @@ window.addEventListener('hashchange', () => {
 
 // Watch for path changes in SPAs
 let lastPath = location.pathname + location.search + location.hash;
-const navObserver = new MutationObserver(() => {
+var navObserver = new MutationObserver(() => {
   const currentPath = location.pathname + location.search + location.hash;
   if (currentPath !== lastPath) {
     lastPath = currentPath;

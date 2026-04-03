@@ -4,9 +4,10 @@
 let allData = { sites: {}, hostnameMappings: {} };
 let globalProfile = {};
 let applications = [];
+let tasks = [];
 let aiSettings = {};
 let resumeVault = { items: [], defaultId: null };
-let cloudPrefs = { enabled: false, syncProfile: true, syncAutofill: false, syncApplications: false, syncAiSettings: false };
+let cloudPrefs = { enabled: false, syncProfile: true, syncAutofill: false, syncApplications: false, syncTasks: false, syncAiSettings: false };
 let usageMetrics = {};
 let cloudStatus = { configured: false, loggedIn: false, user: null, lastSync: null };
 const THEME_KEY = 'ui_theme';
@@ -257,17 +258,19 @@ async function loadAllData() {
         document.getElementById('dashboard-auth-shield').style.display = 'none';
         document.getElementById('main-dashboard-app').style.display = 'flex';
 
-        const [dataResp, profileResp, aiResp, appsResp, metricsResp] = await Promise.all([
+        const [dataResp, profileResp, aiResp, appsResp, tasksResp, metricsResp] = await Promise.all([
             chrome.runtime.sendMessage({ type: 'GET_ALL_DATA' }),
             chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }),
             chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }),
             chrome.runtime.sendMessage({ type: 'APP_GET_ALL' }),
+            chrome.runtime.sendMessage({ type: 'TASK_GET_ALL' }),
             chrome.runtime.sendMessage({ type: 'GET_USAGE_METRICS' }),
         ]);
         allData = dataResp?.data || { sites: {}, hostnameMappings: {} };
         globalProfile = profileResp?.profile || {};
         aiSettings = aiResp?.settings || {};
         applications = appsResp?.apps || [];
+        tasks = tasksResp?.tasks || [];
         usageMetrics = metricsResp?.metrics || {};
     } catch (err) {
         console.error('[Dashboard] Load error:', err);
@@ -279,6 +282,7 @@ async function loadAllData() {
         renderSites();
         renderProfile();
         renderTracker();
+        renderTasks();
         renderInterviewAppSelect();
         renderDisabledSites();
         renderAiSettings();
@@ -1407,6 +1411,522 @@ document.querySelectorAll('.view-btn').forEach(btn => {
     });
 });
 
+// ── TASK TRACKER TAB ───────────────────────────────────────────
+let currentTaskView = 'board';
+let currentTaskFilter = 'all';
+let dragTaskId = null;
+
+const TASK_STATUSES = ['new', 'backlog', 'in_progress', 'blocked', 'done'];
+
+function getEpicTasks() {
+    return tasks.filter(t => t.type === 'epic');
+}
+
+function getEpicById(id) {
+    return tasks.find(t => t.id === id && t.type === 'epic');
+}
+
+function renderEpicOptions(selectEl, currentValue = '', excludeId = '') {
+    if (!selectEl) return;
+    const epics = getEpicTasks().filter(e => e.id !== excludeId);
+    const options = ['<option value="">No Epic</option>']
+        .concat(epics.map(e => `<option value="${e.id}">${escHtml(e.title)}</option>`));
+    selectEl.innerHTML = options.join('');
+    if (currentValue && epics.some(e => e.id === currentValue)) {
+        selectEl.value = currentValue;
+    } else {
+        selectEl.value = '';
+    }
+}
+
+function refreshEpicSelectors() {
+    const addSel = document.getElementById('task-parent');
+    const modalSel = document.getElementById('task-modal-parent');
+    const addVal = addSel?.value || '';
+    const modalVal = modalSel?.value || '';
+    renderEpicOptions(addSel, addVal);
+    renderEpicOptions(modalSel, modalVal, activeTaskId || '');
+}
+
+function taskStatusLabel(status) {
+    switch (status) {
+        case 'new': return 'New';
+        case 'backlog': return 'Backlog';
+        case 'in_progress': return 'In Progress';
+        case 'blocked': return 'Blocked';
+        case 'done': return 'Completed';
+        default: return 'Backlog';
+    }
+}
+
+async function refreshTasksFromStorage(showError = false) {
+    const resp = await chrome.runtime.sendMessage({ type: 'TASK_GET_ALL' }).catch(err => ({
+        error: err?.message || 'Failed to refresh tasks'
+    }));
+    if (resp?.tasks) {
+        tasks = resp.tasks;
+        renderTasks();
+        return true;
+    }
+    if (showError) showToast(resp?.error || 'Failed to refresh tasks', 'error');
+    return false;
+}
+
+async function updateTaskAndRender(id, updates, successMsg = '') {
+    const resp = await chrome.runtime.sendMessage({ type: 'TASK_UPDATE', id, updates }).catch(err => ({
+        ok: false,
+        error: err?.message || 'Failed to update task'
+    }));
+    if (resp?.ok) {
+        tasks = resp.tasks || tasks;
+        renderTasks();
+        if (successMsg) showToast(successMsg, 'success');
+        return true;
+    }
+    await refreshTasksFromStorage();
+    showToast(resp?.error || 'Failed to update task', 'error');
+    return false;
+}
+
+async function deleteTaskAndRender(id) {
+    const resp = await chrome.runtime.sendMessage({ type: 'TASK_DELETE', id }).catch(err => ({
+        ok: false,
+        error: err?.message || 'Failed to delete task'
+    }));
+    if (resp?.ok) {
+        tasks = resp.tasks || tasks;
+        renderTasks();
+        return true;
+    }
+    await refreshTasksFromStorage();
+    showToast(resp?.error || 'Failed to delete task', 'error');
+    return false;
+}
+
+function isTaskOverdue(task) {
+    if (!task?.dueDate) return false;
+    if (task.status === 'done') return false;
+    const due = new Date(task.dueDate);
+    if (Number.isNaN(due.getTime())) return false;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return due.getTime() < today.getTime();
+}
+
+function taskDueBadge(task) {
+    if (!task?.dueDate) return '';
+    const due = new Date(task.dueDate);
+    if (Number.isNaN(due.getTime())) return '';
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const diffDays = Math.floor((due.getTime() - today.getTime()) / 86400000);
+    if (diffDays < 0) return 'Overdue';
+    if (diffDays === 0) return 'Due Today';
+    if (diffDays === 1) return 'Due Tomorrow';
+    return `Due ${formatDate(task.dueDate)}`;
+}
+
+function getFilteredTasks() {
+    if (currentTaskFilter === 'all') return tasks;
+    if (currentTaskFilter === 'overdue') return tasks.filter(t => isTaskOverdue(t));
+    return tasks.filter(t => t.status === currentTaskFilter);
+}
+
+function renderTaskSummary() {
+    const counts = TASK_STATUSES.reduce((acc, status) => {
+        acc[status] = tasks.filter(t => t.status === status).length;
+        return acc;
+    }, {});
+    const total = tasks.length;
+    const overdue = tasks.filter(t => isTaskOverdue(t)).length;
+    const mapping = {
+        total: 'task-summary-total',
+        new: 'task-summary-new',
+        backlog: 'task-summary-backlog',
+        in_progress: 'task-summary-progress',
+        blocked: 'task-summary-blocked',
+        done: 'task-summary-done',
+        overdue: 'task-summary-overdue',
+    };
+    if (document.getElementById(mapping.total)) document.getElementById(mapping.total).textContent = total;
+    if (document.getElementById(mapping.new)) document.getElementById(mapping.new).textContent = counts.new || 0;
+    if (document.getElementById(mapping.backlog)) document.getElementById(mapping.backlog).textContent = counts.backlog || 0;
+    if (document.getElementById(mapping.in_progress)) document.getElementById(mapping.in_progress).textContent = counts.in_progress || 0;
+    if (document.getElementById(mapping.blocked)) document.getElementById(mapping.blocked).textContent = counts.blocked || 0;
+    if (document.getElementById(mapping.done)) document.getElementById(mapping.done).textContent = counts.done || 0;
+    if (document.getElementById(mapping.overdue)) document.getElementById(mapping.overdue).textContent = overdue;
+    document.querySelectorAll('.task-summary-item').forEach(item => {
+        const status = item.dataset.taskSummary || 'all';
+        item.classList.toggle('active', status === currentTaskFilter);
+    });
+}
+
+function renderTasks() {
+    const board = document.getElementById('tasks-board');
+    const list = document.getElementById('tasks-list');
+    if (!board || !list) return;
+    refreshEpicSelectors();
+    renderTaskSummary();
+    const filtered = getFilteredTasks();
+    document.getElementById('task-count').textContent = `${filtered.length} task${filtered.length !== 1 ? 's' : ''}`;
+
+    if (currentTaskView === 'list') {
+        board.hidden = true;
+        list.hidden = false;
+        renderTaskList(filtered);
+    } else {
+        list.hidden = true;
+        board.hidden = false;
+        renderTaskBoard(filtered);
+    }
+}
+
+function renderTaskBoard(filtered) {
+    const board = document.getElementById('tasks-board');
+    if (!board) return;
+    if (!filtered.length) {
+        board.innerHTML = '<div class="empty-state">No tasks yet. Add one above to get started.</div>';
+        return;
+    }
+
+    const statuses = currentTaskFilter === 'all' || currentTaskFilter === 'overdue'
+        ? TASK_STATUSES
+        : [currentTaskFilter];
+
+    const grouped = {};
+    statuses.forEach(s => { grouped[s] = []; });
+    filtered.forEach(task => {
+        if (grouped[task.status]) grouped[task.status].push(task);
+    });
+
+    const columns = statuses.map(status => {
+        const items = grouped[status] || [];
+        const cards = items.map(task => {
+            const overdue = isTaskOverdue(task);
+            const dueLabel = taskDueBadge(task);
+            const priority = task.priority || 'medium';
+            const isEpic = task.type === 'epic';
+            const parentEpic = task.parentId ? getEpicById(task.parentId) : null;
+            const children = isEpic ? tasks.filter(t => t.parentId === task.id && t.type !== 'epic') : [];
+            const doneCount = isEpic ? children.filter(c => c.status === 'done').length : 0;
+            const dueBadge = dueLabel
+                ? `<span class="task-badge ${overdue ? 'overdue' : priority}">${escHtml(dueLabel)}</span>`
+                : '';
+            const epicBadge = isEpic
+                ? `<span class="task-epic-pill">Epic</span>`
+                : (parentEpic ? `<span class="task-epic-pill">${escHtml(parentEpic.title)}</span>` : '');
+            const progressBadge = isEpic && children.length
+                ? `<span class="task-badge ${doneCount === children.length ? 'low' : 'medium'}">${doneCount}/${children.length} done</span>`
+                : '';
+            const dragHandle = isEpic ? '' : `<span class="kanban-drag" draggable="true" data-task-id="${task.id}" title="Drag to move">⋮⋮</span>`;
+            const descText = task.description ? task.description.slice(0, 140) : '';
+            const descLine = descText ? `<div class="task-desc">${escHtml(descText)}${task.description.length > 140 ? '…' : ''}</div>` : '';
+            return `
+              <div class="task-card ${overdue ? 'overdue' : ''}" data-task-id="${task.id}">
+                <div class="task-card-header">
+                  <div class="task-title">${escHtml(task.title)}</div>
+                  ${dragHandle}
+                </div>
+                <div class="task-meta">
+                  ${epicBadge}
+                  <span class="task-badge ${priority}">${priority}</span>
+                  ${progressBadge}
+                  ${dueBadge}
+                </div>
+                ${descLine}
+              </div>
+            `;
+        }).join('');
+        return `
+          <div class="task-column" data-task-status="${status}">
+            <div class="task-column-header">
+              <span>${taskStatusLabel(status)}</span>
+              <span class="kanban-count">${items.length}</span>
+            </div>
+            <div class="kanban-list">
+              ${cards || '<div class="empty-state" style="padding:6px 8px;">No items</div>'}
+            </div>
+          </div>
+        `;
+    }).join('');
+
+    board.innerHTML = `<div class="tasks-kanban">${columns}</div>`;
+    attachTaskBoardListeners();
+}
+
+function renderTaskList(filtered) {
+    const list = document.getElementById('tasks-list');
+    if (!list) return;
+    if (!filtered.length) {
+        list.innerHTML = '<div class="empty-state">No tasks yet. Add one above to get started.</div>';
+        return;
+    }
+    list.innerHTML = filtered.map(task => {
+        const overdue = isTaskOverdue(task);
+        const isEpic = task.type === 'epic';
+        const parentEpic = task.parentId ? getEpicById(task.parentId) : null;
+        const children = isEpic ? tasks.filter(t => t.parentId === task.id && t.type !== 'epic') : [];
+        const doneCount = isEpic ? children.filter(c => c.status === 'done').length : 0;
+        const epicLine = isEpic
+            ? `<div class="task-desc">Epic · ${doneCount}/${children.length} done</div>`
+            : (parentEpic ? `<div class="task-desc">Epic: ${escHtml(parentEpic.title)}</div>` : '');
+        return `
+          <div class="task-list-row ${overdue ? 'overdue' : ''}" data-task-id="${task.id}">
+            <div>
+              <strong>${escHtml(task.title)}</strong>
+              <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">${escHtml(task.description || '—')}</div>
+              ${epicLine}
+            </div>
+            <input type="date" data-task-due="${task.id}" value="${task.dueDate || ''}" />
+            <select data-task-priority="${task.id}">
+              <option value="low" ${task.priority === 'low' ? 'selected' : ''}>Low</option>
+              <option value="medium" ${task.priority === 'medium' ? 'selected' : ''}>Medium</option>
+              <option value="high" ${task.priority === 'high' ? 'selected' : ''}>High</option>
+            </select>
+            <select data-task-status="${task.id}">
+              ${TASK_STATUSES.map(s => `<option value="${s}" ${s === task.status ? 'selected' : ''}>${taskStatusLabel(s)}</option>`).join('')}
+            </select>
+            <button class="btn btn-secondary btn-sm" data-task-edit="${task.id}">Edit</button>
+          </div>
+        `;
+    }).join('');
+    attachTaskListListeners();
+}
+
+function attachTaskBoardListeners() {
+    document.querySelectorAll('.task-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+            if (e.target?.closest('.kanban-drag')) return;
+            const id = card.dataset.taskId;
+            openTaskModal(id);
+        });
+    });
+    document.querySelectorAll('.kanban-drag[data-task-id]').forEach(handle => {
+        handle.addEventListener('dragstart', (e) => {
+            const id = handle.dataset.taskId;
+            dragTaskId = id;
+            e.dataTransfer.setData('text/plain', id);
+            e.dataTransfer.effectAllowed = 'move';
+        });
+        handle.addEventListener('dragend', () => {
+            dragTaskId = null;
+            document.querySelectorAll('.task-column').forEach(col => col.classList.remove('drag-over'));
+        });
+    });
+    document.querySelectorAll('.task-column').forEach(col => {
+        col.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            col.classList.add('drag-over');
+        });
+        col.addEventListener('dragleave', () => col.classList.remove('drag-over'));
+        col.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            col.classList.remove('drag-over');
+            const id = e.dataTransfer.getData('text/plain') || dragTaskId;
+            const status = col.dataset.taskStatus;
+            if (!id || !status) return;
+            const task = tasks.find(t => t.id === id);
+            if (!task || task.type === 'epic') return;
+            if (task.status === status) return;
+            await updateTaskAndRender(id, { status }, `✓ Moved to ${taskStatusLabel(status)}`);
+        });
+    });
+    document.querySelectorAll('.task-column .kanban-list').forEach(list => {
+        list.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            const col = list.closest('.task-column');
+            if (col) col.classList.add('drag-over');
+        });
+        list.addEventListener('dragleave', () => {
+            const col = list.closest('.task-column');
+            if (col) col.classList.remove('drag-over');
+        });
+        list.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            const col = list.closest('.task-column');
+            if (col) col.classList.remove('drag-over');
+            const id = e.dataTransfer.getData('text/plain') || dragTaskId;
+            const status = col?.dataset?.taskStatus;
+            if (!id || !status) return;
+            const task = tasks.find(t => t.id === id);
+            if (!task || task.type === 'epic') return;
+            if (task.status === status) return;
+            await updateTaskAndRender(id, { status }, `✓ Moved to ${taskStatusLabel(status)}`);
+        });
+    });
+}
+
+function attachTaskListListeners() {
+    document.querySelectorAll('[data-task-edit]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            openTaskModal(btn.dataset.taskEdit);
+        });
+    });
+    document.querySelectorAll('[data-task-due]').forEach(input => {
+        input.addEventListener('change', async () => {
+            const id = input.dataset.taskDue;
+            await updateTaskAndRender(id, { dueDate: input.value });
+        });
+    });
+    document.querySelectorAll('[data-task-priority]').forEach(sel => {
+        sel.addEventListener('change', async () => {
+            const id = sel.dataset.taskPriority;
+            await updateTaskAndRender(id, { priority: sel.value });
+        });
+    });
+    document.querySelectorAll('[data-task-status]').forEach(sel => {
+        sel.addEventListener('change', async () => {
+            const id = sel.dataset.taskStatus;
+            await updateTaskAndRender(id, { status: sel.value });
+        });
+    });
+    document.querySelectorAll('.task-list-row').forEach(row => {
+        const id = row.dataset.taskId;
+        const task = tasks.find(t => t.id === id);
+        if (task?.type === 'epic') {
+            const statusSel = row.querySelector('[data-task-status]');
+            if (statusSel) statusSel.disabled = true;
+        }
+    });
+}
+
+function bindTaskControls() {
+    if (window._taskControlsBound) return;
+    window._taskControlsBound = true;
+
+    const form = document.getElementById('task-add-form');
+    if (form) {
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const title = document.getElementById('task-title').value.trim();
+            if (!title) return;
+            const task = {
+                title,
+                dueDate: document.getElementById('task-due').value,
+                priority: document.getElementById('task-priority').value,
+                status: document.getElementById('task-status').value,
+                description: document.getElementById('task-desc').value.trim(),
+                type: document.getElementById('task-type').value,
+                parentId: document.getElementById('task-parent').value,
+            };
+            const resp = await chrome.runtime.sendMessage({ type: 'TASK_ADD', task });
+            if (resp.ok) {
+                tasks = resp.tasks;
+                form.reset();
+                document.getElementById('task-priority').value = 'medium';
+                document.getElementById('task-status').value = 'new';
+                document.getElementById('task-type').value = 'task';
+                document.getElementById('task-parent').value = '';
+                renderTasks();
+                showToast('✓ Task added', 'success');
+            }
+        });
+    }
+
+    const typeSelect = document.getElementById('task-type');
+    const parentSelect = document.getElementById('task-parent');
+    if (typeSelect && parentSelect) {
+        const syncType = () => {
+            const isEpic = typeSelect.value === 'epic';
+            parentSelect.disabled = isEpic;
+            if (isEpic) parentSelect.value = '';
+        };
+        typeSelect.addEventListener('change', syncType);
+        syncType();
+    }
+
+    document.querySelectorAll('.task-view-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.task-view-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentTaskView = btn.dataset.taskView || 'board';
+            renderTasks();
+        });
+    });
+
+    document.querySelectorAll('.task-summary-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const filter = item.dataset.taskSummary || 'all';
+            currentTaskFilter = filter;
+            renderTasks();
+        });
+    });
+}
+
+let activeTaskId = null;
+function openTaskModal(taskId) {
+    const modal = document.getElementById('task-modal');
+    const task = tasks.find(t => t.id === taskId);
+    if (!modal || !task) return;
+    activeTaskId = taskId;
+    document.getElementById('task-modal-name').value = task.title || '';
+    document.getElementById('task-modal-type').value = task.type || 'task';
+    renderEpicOptions(document.getElementById('task-modal-parent'), task.parentId || '', taskId);
+    document.getElementById('task-modal-parent').value = task.parentId || '';
+    document.getElementById('task-modal-due').value = task.dueDate || '';
+    document.getElementById('task-modal-priority').value = task.priority || 'medium';
+    document.getElementById('task-modal-status').value = task.status || 'new';
+    document.getElementById('task-modal-desc').value = task.description || '';
+    const isEpic = (task.type || 'task') === 'epic';
+    document.getElementById('task-modal-parent').disabled = isEpic;
+    document.getElementById('task-modal-status').disabled = isEpic;
+    modal.hidden = false;
+}
+
+function closeTaskModal() {
+    const modal = document.getElementById('task-modal');
+    if (modal) modal.hidden = true;
+    activeTaskId = null;
+}
+
+function bindTaskModal() {
+    if (window._taskModalBound) return;
+    window._taskModalBound = true;
+    const modal = document.getElementById('task-modal');
+    if (!modal) return;
+    document.getElementById('task-modal-cancel').addEventListener('click', () => closeTaskModal());
+    const modalType = document.getElementById('task-modal-type');
+    const modalParent = document.getElementById('task-modal-parent');
+    const modalStatus = document.getElementById('task-modal-status');
+    if (modalType && modalParent && modalStatus) {
+        const syncModalType = () => {
+            const isEpic = modalType.value === 'epic';
+            modalParent.disabled = isEpic;
+            modalStatus.disabled = isEpic;
+            if (isEpic) modalParent.value = '';
+        };
+        modalType.addEventListener('change', syncModalType);
+        syncModalType();
+    }
+    document.getElementById('task-modal-save').addEventListener('click', async () => {
+        if (!activeTaskId) return;
+        const updates = {
+            title: document.getElementById('task-modal-name').value.trim(),
+            dueDate: document.getElementById('task-modal-due').value,
+            priority: document.getElementById('task-modal-priority').value,
+            status: document.getElementById('task-modal-status').value,
+            description: document.getElementById('task-modal-desc').value.trim(),
+            type: document.getElementById('task-modal-type').value,
+            parentId: document.getElementById('task-modal-parent').value,
+        };
+        const ok = await updateTaskAndRender(activeTaskId, updates, '✓ Task updated');
+        if (ok) closeTaskModal();
+    });
+    document.getElementById('task-modal-delete').addEventListener('click', async () => {
+        if (!activeTaskId) return;
+        showConfirmModal('Delete Task', 'Are you sure you want to delete this task? This cannot be undone.', async () => {
+            const ok = await deleteTaskAndRender(activeTaskId);
+            if (ok) {
+                closeTaskModal();
+                showToast('✓ Task deleted', 'success');
+            }
+        });
+    });
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeTaskModal();
+    });
+}
+
 // Add Application Modal
 bindEvent('btn-add-application','click', () => {
     document.getElementById('add-app-modal').hidden = false;
@@ -1698,6 +2218,7 @@ bindEvent('btn-export','click', async () => {
         autofill_data: allData,
         global_profile: globalProfile,
         applications: applications,
+        tasks: tasks,
     };
     const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -1747,6 +2268,11 @@ bindEvent('import-file','change', async (e) => {
             if (imported.applications) {
                 for (const app of imported.applications) {
                     await chrome.runtime.sendMessage({ type: 'APP_ADD', application: app });
+                }
+            }
+            if (imported.tasks) {
+                for (const task of imported.tasks) {
+                    await chrome.runtime.sendMessage({ type: 'TASK_ADD', task });
                 }
             }
             showToast('✓ Data imported successfully', 'success');
@@ -2213,6 +2739,8 @@ function setupDashAuth() {
 initTheme();
 setupDashAuth();
 loadAllData().then(() => {
+    bindTaskControls();
+    bindTaskModal();
     // Handle hash-based tab navigation (e.g. #tab-profile from popup)
     const hash = window.location.hash;
     if (hash && hash.startsWith('#tab-')) {

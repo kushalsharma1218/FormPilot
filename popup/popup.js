@@ -4,6 +4,7 @@ let currentHostname = '';
 let siteData = { enabled: true, fields: {} };
 let aiEnabled = false;
 let teachActive = false;
+let siteExcluded = false;
 let initInFlight = false;
 let initAttempts = 0;
 const THEME_KEY = 'ui_theme';
@@ -76,7 +77,7 @@ async function initTheme() {
 async function cycleTheme() {
   const next = themePreference === 'system' ? 'light' : themePreference === 'light' ? 'dark' : 'system';
   applyTheme(next);
-  try { await chrome.storage.local.set({ [THEME_KEY]: next }); } catch (_) {}
+  try { await chrome.storage.local.set({ [THEME_KEY]: next }); } catch (_) { }
 }
 
 function showToast(msg, type = 'info') {
@@ -153,8 +154,33 @@ function updateStatusUI() {
   const btnSave = document.getElementById('btn-save');
   const btnFill = document.getElementById('btn-autofill');
   const btnTeach = document.getElementById('btn-teach');
+  const btnExclude = document.getElementById('btn-exclude');
+  const excludedBanner = document.getElementById('excluded-banner');
 
   const disabled = isSiteDisabledLocal();
+
+  // Handle excluded state
+  if (siteExcluded) {
+    document.body.classList.add('site-excluded');
+    tog.checked = false;
+    tog.disabled = true;
+    sub.innerHTML = '<span style="color:var(--danger)">Site excluded (not a job portal)</span>';
+    st.textContent = 'Excluded';
+    st.className = 'stat-value inactive';
+    document.getElementById('field-count').textContent = '—';
+    btnSave.disabled = true;
+    btnFill.disabled = true;
+    if (btnTeach) btnTeach.disabled = true;
+    if (btnExclude) btnExclude.style.display = 'none';
+    if (excludedBanner) excludedBanner.style.display = 'flex';
+    renderFields({});
+    return;
+  }
+
+  document.body.classList.remove('site-excluded');
+  tog.disabled = false;
+  if (btnExclude) btnExclude.style.display = '';
+  if (excludedBanner) excludedBanner.style.display = 'none';
 
   if (disabled) {
     tog.checked = false;
@@ -207,7 +233,7 @@ async function initPopupDrag() {
       popupDragOffset = { x: saved.x, y: saved.y };
       shell.style.transform = `translate(${popupDragOffset.x}px, ${popupDragOffset.y}px)`;
     }
-  } catch (_) {}
+  } catch (_) { }
 
   let dragging = false;
   let startX = 0;
@@ -243,7 +269,7 @@ async function initPopupDrag() {
     if (!dragging) return;
     dragging = false;
     handle.classList.remove('dragging');
-    try { await chrome.storage.local.set({ popup_offset: popupDragOffset }); } catch (_) {}
+    try { await chrome.storage.local.set({ popup_offset: popupDragOffset }); } catch (_) { }
   });
 }
 
@@ -258,7 +284,7 @@ async function sendToTab(tabId, message) {
   try {
     const resp = await chrome.runtime.sendMessage({ type: 'BROADCAST_TO_FRAMES', tabId, payload: message });
     if (resp && typeof resp.ok !== 'undefined') return resp;
-  } catch (_) {}
+  } catch (_) { }
   try {
     return await chrome.tabs.sendMessage(tabId, message);
   } catch {
@@ -319,6 +345,10 @@ async function init() {
     ]);
 
     siteData = siteResp?.site || { enabled: true, fields: {} };
+
+    // Check if site is excluded (not a job portal)
+    const excludeResp = await chrome.runtime.sendMessage({ type: 'IS_SITE_EXCLUDED', hostname: currentHostname });
+    siteExcluded = !!excludeResp?.excluded;
 
     const siteKey = keyResp?.siteKey || currentHostname;
     document.getElementById('site-key-input').value = siteKey;
@@ -442,7 +472,40 @@ document.getElementById('btn-clear').addEventListener('click', async () => {
 });
 
 document.getElementById('btn-settings').addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => { });
+});
+
+// ── Exclude / Unexclude Site ───────────────────────────────
+document.getElementById('btn-exclude').addEventListener('click', async () => {
+  try {
+    await chrome.runtime.sendMessage({ type: 'EXCLUDE_SITE', hostname: currentHostname });
+    siteExcluded = true;
+    siteData.enabled = false;
+    siteData.disabled = true;
+    updateStatusUI();
+    showToast('🚫 ' + currentHostname + ' excluded permanently', 'success');
+  } catch (err) {
+    showToast('⚠ Failed to exclude site', 'error');
+  }
+});
+
+document.getElementById('btn-unexclude').addEventListener('click', async () => {
+  try {
+    await chrome.runtime.sendMessage({ type: 'UNEXCLUDE_SITE', hostname: currentHostname });
+    siteExcluded = false;
+    siteData.enabled = true;
+    siteData.disabled = false;
+    updateStatusUI();
+    renderFields(siteData.fields || {});
+    showToast('✓ ' + currentHostname + ' re-enabled', 'success');
+    // Reload the page so content script re-initializes
+    const tab = await getActiveTab();
+    if (tab?.id) {
+      chrome.tabs.reload(tab.id).catch(() => { });
+    }
+  } catch (err) {
+    showToast('⚠ Failed to re-enable site', 'error');
+  }
 });
 
 // Rename logic
@@ -512,7 +575,7 @@ document.getElementById('btn-ai-copy').addEventListener('click', async () => {
 
 document.getElementById('btn-ai-upload').addEventListener('click', () => {
   // Open dashboard at the profile/resume tab
-  chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', hash: '#tab-profile' }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', hash: '#tab-profile' }).catch(() => { });
   showToast('Opening Dashboard → Profile tab to upload resume', 'info');
 });
 
@@ -614,7 +677,7 @@ function setupAuthListeners() {
 
   document.getElementById('auth-link-setup').addEventListener('click', (e) => {
     e.preventDefault();
-    chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => {});
+    chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD' }).catch(() => { });
   });
 
   btnEmail.addEventListener('click', async () => {
@@ -624,7 +687,7 @@ function setupAuthListeners() {
       msg.textContent = 'Email and password required.';
       return;
     }
-    
+
     msg.textContent = '';
     btnEmail.disabled = true;
     btnEmail.textContent = 'Signing in...';
@@ -656,7 +719,7 @@ function setupAuthListeners() {
     btnGoogle.addEventListener('click', async () => {
       msg.textContent = '';
       btnGoogle.disabled = true;
-      
+
       try {
         if (!chrome.identity || !chrome.identity.getAuthToken) {
           msg.textContent = 'Google Sign-in unavailable. Check identity permission.';
@@ -683,7 +746,7 @@ function setupAuthListeners() {
               // If Firebase rejects the token, it might be expired or cached wrong.
               // We'll clear the cache so the next click forces a fresh one.
               if (chrome.identity.removeCachedAuthToken) {
-                chrome.identity.removeCachedAuthToken({ token: token }, () => {});
+                chrome.identity.removeCachedAuthToken({ token: token }, () => { });
               }
               msg.textContent = resp.error;
               btnGoogle.disabled = false;

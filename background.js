@@ -18,6 +18,7 @@ const METRICS_KEY = 'usage_metrics';
 const SESSION_KEY = 'autofill_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CLOUD_PREFS_KEY = 'cloud_sync_prefs';
+const EXCLUDED_SITES_KEY = 'excluded_sites';
 const METRIC_TIME_PER_FIELD_SEC = 8;
 const DEBUG_LOG_KEY = 'fp_debug_logs';
 const DEBUG_LOG_MAX = 500;
@@ -98,7 +99,7 @@ async function getData() {
     const key = await AuthStore.getUserKey(STORAGE_KEY);
     const result = await chrome.storage.local.get([key, STORAGE_KEY]);
     let data = result[key] || {};
-    
+
     // ── MIGRATION: Copy anonymous site data to logged-in user if empty ──
     if (key !== STORAGE_KEY && Object.keys(data.sites || {}).length === 0) {
       const anonData = result[STORAGE_KEY];
@@ -111,6 +112,7 @@ async function getData() {
     // Ensure structure exists
     if (!data.sites) data.sites = {};
     if (!data.hostnameMappings) data.hostnameMappings = {};
+    if (!Array.isArray(data.excludedSites)) data.excludedSites = [];
     // Normalize site entries
     Object.values(data.sites).forEach(site => {
       if (!site.fields) site.fields = {};
@@ -123,7 +125,7 @@ async function getData() {
     return data;
   } catch (err) {
     console.error('[Background] getData error:', err);
-    return { sites: {}, hostnameMappings: {} };
+    return { sites: {}, hostnameMappings: {}, excludedSites: [] };
   }
 }
 
@@ -137,7 +139,7 @@ async function getGlobalProfile() {
     const key = await AuthStore.getUserKey(GLOBAL_STORAGE_KEY);
     const result = await chrome.storage.local.get([key, GLOBAL_STORAGE_KEY]);
     let profile = result[key] || {};
-    
+
     // ── MIGRATION: Copy anonymous profile to logged-in user if empty ──
     if (key !== GLOBAL_STORAGE_KEY && Object.keys(profile).length === 0) {
       const anonProfile = result[GLOBAL_STORAGE_KEY];
@@ -310,6 +312,7 @@ async function getCloudPrefs() {
     syncProfile: true, // always on when enabled
     syncAutofill: true,
     syncApplications: true,
+    syncTasks: true,
     syncAiSettings: true,
     syncResumes: true,
     syncMetrics: true,
@@ -321,6 +324,7 @@ async function getCloudPrefs() {
     prefs.syncProfile = true;
     prefs.syncAutofill = true;
     prefs.syncApplications = true;
+    prefs.syncTasks = true;
     prefs.syncAiSettings = true;
     prefs.syncResumes = true;
     prefs.syncMetrics = true;
@@ -335,6 +339,7 @@ async function saveCloudPrefs(next) {
     merged.syncProfile = true;
     merged.syncAutofill = true;
     merged.syncApplications = true;
+    merged.syncTasks = true;
     merged.syncAiSettings = true;
     merged.syncResumes = true;
     merged.syncMetrics = true;
@@ -592,7 +597,7 @@ async function handleMessage(msg, sender) {
       await saveData(data);
       queueCloudSync();
       if (sender?.tab?.id !== undefined) {
-        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: data.sites[siteKey].enabled }).catch(() => {});
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: data.sites[siteKey].enabled }).catch(() => { });
       }
       return { ok: true };
     }
@@ -720,7 +725,7 @@ async function handleMessage(msg, sender) {
       await saveData(data);
       queueCloudSync();
       if (sender?.tab?.id !== undefined) {
-        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', flags: data.sites[siteKey].flags }).catch(() => {});
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', flags: data.sites[siteKey].flags }).catch(() => { });
       }
       return { ok: true, flags: data.sites[siteKey].flags };
     }
@@ -764,6 +769,59 @@ async function handleMessage(msg, sender) {
       await saveData(data);
       queueCloudSync();
       return { ok: true };
+    }
+
+    // ── Excluded Sites (Not a Job Portal) ──────────────────────────
+    case 'EXCLUDE_SITE': {
+      const data = await getData();
+      const host = (msg.hostname || '').toLowerCase().replace(/^www\./, '');
+      if (!host) return { ok: false, error: 'No hostname provided' };
+      if (!data.excludedSites.includes(host)) {
+        data.excludedSites.push(host);
+      }
+      // Also disable the site
+      const siteKey = resolveSiteKey(data, host);
+      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {}, flags: {}, metrics: {}, sandbox: {} };
+      data.sites[siteKey].disabled = true;
+      data.sites[siteKey].enabled = false;
+      await saveData(data);
+      queueCloudSync();
+      // Broadcast to content scripts in the current tab
+      if (sender?.tab?.id !== undefined) {
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_EXCLUDED_UPDATE', excluded: true }).catch(() => { });
+      }
+      return { ok: true };
+    }
+
+    case 'UNEXCLUDE_SITE': {
+      const data = await getData();
+      const host = (msg.hostname || '').toLowerCase().replace(/^www\./, '');
+      if (!host) return { ok: false, error: 'No hostname provided' };
+      data.excludedSites = data.excludedSites.filter(h => h !== host);
+      // Re-enable the site
+      const siteKey = resolveSiteKey(data, host);
+      if (data.sites[siteKey]) {
+        data.sites[siteKey].disabled = false;
+        data.sites[siteKey].enabled = true;
+      }
+      await saveData(data);
+      queueCloudSync();
+      if (sender?.tab?.id !== undefined) {
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_EXCLUDED_UPDATE', excluded: false }).catch(() => { });
+        broadcastToTabFrames(sender.tab.id, { type: 'SITE_SETTINGS_UPDATE', enabled: true }).catch(() => { });
+      }
+      return { ok: true };
+    }
+
+    case 'IS_SITE_EXCLUDED': {
+      const data = await getData();
+      const host = (msg.hostname || '').toLowerCase().replace(/^www\./, '');
+      return { excluded: data.excludedSites.includes(host) };
+    }
+
+    case 'GET_EXCLUDED_SITES': {
+      const data = await getData();
+      return { ok: true, excludedSites: data.excludedSites || [] };
     }
 
     case 'CLEAR_SITE': {
@@ -942,6 +1000,33 @@ async function handleMessage(msg, sender) {
       const apps = await deleteApplication(msg.id);
       queueCloudSync();
       return { ok: true, apps };
+    }
+
+    // ── Task Tracker ────────────────────────────────────────────
+    case 'TASK_GET_ALL': {
+      const tasks = await getTasks();
+      return { tasks };
+    }
+
+    case 'TASK_ADD': {
+      if (!msg.task?.title) return { ok: false, error: 'Task title is required' };
+      const tasks = await addTask(msg.task);
+      queueCloudSync();
+      return { ok: true, tasks };
+    }
+
+    case 'TASK_UPDATE': {
+      if (!msg.id) return { ok: false, error: 'Task ID is required' };
+      const tasks = await updateTask(msg.id, msg.updates || {});
+      queueCloudSync();
+      return { ok: true, tasks };
+    }
+
+    case 'TASK_DELETE': {
+      if (!msg.id) return { ok: false, error: 'Task ID is required' };
+      const tasks = await deleteTask(msg.id);
+      queueCloudSync();
+      return { ok: true, tasks };
     }
 
     // ── Resume Vault (Local Only) ─────────────────────────────────

@@ -1042,3 +1042,33 @@ body.site-disabled .fields-section {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ─── Excluded Site Banner ───────────────────────────────── */
+.excluded-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--red);
+  font-weight: 500;
+}
+
+.excluded-banner .btn {
+  flex: none;
+  padding: 6px 12px;
+  font-size: 11px;
+}
+
+body.site-excluded .data-actions,
+body.site-excluded .ai-section,
+body.site-excluded .fields-section,
+body.site-excluded .multipage-note,
+body.site-excluded #btn-clear,
+body.site-excluded #btn-exclude {
+  display: none !important;
+}
