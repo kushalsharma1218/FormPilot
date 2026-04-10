@@ -22,6 +22,7 @@ const EXCLUDED_SITES_KEY = 'excluded_sites';
 const METRIC_TIME_PER_FIELD_SEC = 8;
 const DEBUG_LOG_KEY = 'fp_debug_logs';
 const DEBUG_LOG_MAX = 500;
+const GLOBAL_ALIAS_PROMOTE_MAX = 20;
 
 // ── Frame Registry (for iframe-aware messaging) ────────────────
 const FRAME_REGISTRY = new Map(); // tabId -> Set(frameId)
@@ -112,6 +113,7 @@ async function getData() {
     // Ensure structure exists
     if (!data.sites) data.sites = {};
     if (!data.hostnameMappings) data.hostnameMappings = {};
+    if (!data.globalAliases || typeof data.globalAliases !== 'object') data.globalAliases = {};
     if (!Array.isArray(data.excludedSites)) data.excludedSites = [];
     // Normalize site entries
     Object.values(data.sites).forEach(site => {
@@ -125,7 +127,7 @@ async function getData() {
     return data;
   } catch (err) {
     console.error('[Background] getData error:', err);
-    return { sites: {}, hostnameMappings: {}, excludedSites: [] };
+    return { sites: {}, hostnameMappings: {}, globalAliases: {}, excludedSites: [] };
   }
 }
 
@@ -234,6 +236,16 @@ function mergeUsageMetrics(local, remote) {
   });
   merged.perSite = perSite;
   return merged;
+}
+
+function normalizeAliasLabel(label) {
+  return (label || '')
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, ' ')
+    .replace(/[^\w\s]/g, '')
+    .trim();
 }
 
 async function recordUsageMetrics(hostname, stats = {}) {
@@ -588,6 +600,32 @@ async function handleMessage(msg, sender) {
       return { site, siteKey };
     }
 
+    case 'GLOBAL_ALIAS_GET': {
+      const data = await getData();
+      return { ok: true, aliases: data.globalAliases || {} };
+    }
+
+    case 'GLOBAL_ALIAS_MERGE': {
+      const label = normalizeAliasLabel(msg.label);
+      const key = (msg.key || '').toString().trim();
+      if (!label || !key) return { ok: false, error: 'Missing label or key' };
+      const data = await getData();
+      const aliases = { ...(data.globalAliases || {}) };
+      const current = aliases[label];
+      const nextCount = current?.key === key
+        ? Math.min(Number(current.count || 0) + 1, GLOBAL_ALIAS_PROMOTE_MAX)
+        : 1;
+      aliases[label] = {
+        key,
+        count: nextCount,
+        updatedAt: new Date().toISOString(),
+      };
+      data.globalAliases = aliases;
+      await saveData(data);
+      queueCloudSync();
+      return { ok: true, aliases };
+    }
+
     case 'SET_ENABLED': {
       const data = await getData();
       const siteKey = resolveSiteKey(data, msg.hostname);
@@ -714,6 +752,7 @@ async function handleMessage(msg, sender) {
       }
       data.sites[siteKey].mappings = mappings;
       await saveData(data);
+      queueCloudSync();
       return { ok: true, mappings };
     }
 

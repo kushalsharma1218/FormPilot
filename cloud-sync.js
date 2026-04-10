@@ -121,6 +121,49 @@ function mergeUsageMetrics(local = {}, remote = {}) {
   return merged;
 }
 
+function mergeAliasMaps(local = {}, remote = {}) {
+  const merged = { ...(local || {}) };
+  Object.entries(remote || {}).forEach(([label, entry]) => {
+    if (!entry?.key) return;
+    const current = merged[label];
+    if (!current) {
+      merged[label] = entry;
+      return;
+    }
+    if (current.key === entry.key) {
+      merged[label] = {
+        ...current,
+        ...entry,
+        count: Math.max(Number(current.count || 0), Number(entry.count || 0)),
+        updatedAt: current.updatedAt && entry.updatedAt
+          ? (current.updatedAt > entry.updatedAt ? current.updatedAt : entry.updatedAt)
+          : (current.updatedAt || entry.updatedAt || null),
+      };
+      return;
+    }
+    const currentTs = current.updatedAt || '';
+    const entryTs = entry.updatedAt || '';
+    merged[label] = entryTs >= currentTs ? entry : current;
+  });
+  return merged;
+}
+
+function mergeSiteMappings(local = [], remote = []) {
+  const merged = new Map();
+  [...(local || []), ...(remote || [])].forEach((mapping) => {
+    if (!mapping?.signature) return;
+    const existing = merged.get(mapping.signature);
+    if (!existing) {
+      merged.set(mapping.signature, mapping);
+      return;
+    }
+    const existingTs = existing.updatedAt || '';
+    const mappingTs = mapping.updatedAt || '';
+    merged.set(mapping.signature, mappingTs >= existingTs ? { ...existing, ...mapping } : { ...mapping, ...existing });
+  });
+  return Array.from(merged.values());
+}
+
 function setFirebaseConfig(config) {
   FIREBASE_CONFIG.apiKey = (config?.apiKey || '').trim();
   FIREBASE_CONFIG.projectId = (config?.projectId || '').trim();
@@ -578,16 +621,18 @@ async function pullAllFromCloud(prefs = {}) {
   const updates = {};
 
   if (syncAutofill && autofillData) {
-    const localAutofill = localResult[storageKeys[0]] || { sites: {}, hostnameMappings: {} };
-    // Deep merge: cloud sites + local sites (cloud wins for site props, fields merged)
+    const localAutofill = localResult[storageKeys[0]] || { sites: {}, hostnameMappings: {}, globalAliases: {}, excludedSites: [] };
     const mergedSites = { ...localAutofill.sites };
     for (const [hostname, site] of Object.entries(autofillData.sites || {})) {
       if (mergedSites[hostname]) {
         mergedSites[hostname] = {
           ...mergedSites[hostname],
           ...site,
-          // Merge fields (cloud wins on key conflicts)
           fields: { ...mergedSites[hostname].fields, ...(site.fields || {}) },
+          mappings: mergeSiteMappings(mergedSites[hostname].mappings || [], site.mappings || []),
+          flags: { ...(mergedSites[hostname].flags || {}), ...(site.flags || {}) },
+          metrics: { ...(mergedSites[hostname].metrics || {}), ...(site.metrics || {}) },
+          sandbox: { ...(mergedSites[hostname].sandbox || {}), ...(site.sandbox || {}) },
         };
       } else {
         mergedSites[hostname] = site;
@@ -599,6 +644,11 @@ async function pullAllFromCloud(prefs = {}) {
         ...(localAutofill.hostnameMappings || {}),
         ...(autofillData.hostnameMappings || {}),
       },
+      globalAliases: mergeAliasMaps(localAutofill.globalAliases || {}, autofillData.globalAliases || {}),
+      excludedSites: Array.from(new Set([
+        ...((localAutofill.excludedSites || []).filter(Boolean)),
+        ...(((autofillData.excludedSites || []).filter(Boolean)))
+      ])),
     };
   }
 

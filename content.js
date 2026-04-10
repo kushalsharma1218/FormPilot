@@ -18,6 +18,13 @@ try {
   }
 }
 
+const CONTENT_INSTANCE_ID = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+globalThis.__JA_CONTENT_INSTANCE_ID = CONTENT_INSTANCE_ID;
+
+function isCurrentContentInstance() {
+  return globalThis.__JA_CONTENT_INSTANCE_ID === CONTENT_INSTANCE_ID;
+}
+
 console.log(`[FormPilot] Content script loaded on: ${location.hostname} (stored under: ${hostname})`);
 
 const BRAND_FONT_ID = 'ja-font-face';
@@ -70,6 +77,15 @@ let aiLastQuestion = '';
 let aiFocusTrackingAttached = false;
 let essayObserver = null;
 let essayButtons = new Set();
+let globalAliases = {};
+let autofillInProgress = false;
+let autofillGuardTimer = null;
+let coverageBannerTimer = null;
+let fieldKeyCache = new WeakMap();
+let fieldSignatureCache = new WeakMap();
+let elementCache = new Map();
+let stepReapplyObserver = null;
+let stepReapplyTimer = null;
 
 // Performance mode: minimize UI + heavy observers to keep pages smooth
 const PERFORMANCE_MODE = true;
@@ -81,6 +97,10 @@ const ACCURACY_MODE = false;
 const DEBUG_AUTOFILL = true; // ← set false to silence debug logs
 const CONFIDENCE_OVERLAY_ENABLED = false;
 const LOG_CAPTURE_ENABLED = true;
+const GLOBAL_ALIAS_PROMOTE_COUNT = 3;
+const FIELD_CACHE_TTL_MS = 800;
+const VERIFY_DELAY_MS = 120;
+const VERIFY_RETRY_MS = 360;
 // Low/mid confidence fields are filled immediately; user can correct them after
 const APPROVAL_REQUIRED_LEVEL = 'none';
 const FieldUtils = (globalThis.JobAutofill && JobAutofill.FieldUtils) || null;
@@ -136,10 +156,21 @@ function isTopFrame() {
 }
 
 function shouldShowUi() {
+  if (!isCurrentContentInstance()) return false;
   if (isSiteDisabled()) return false;
   if (!isTopFrame()) return false;
   if (!isJobFlowEligible()) return false;
   return true;
+}
+
+function resetFieldCaches() {
+  fieldKeyCache = new WeakMap();
+  fieldSignatureCache = new WeakMap();
+  elementCache.clear();
+}
+
+function clearElementCache() {
+  elementCache.clear();
 }
 
 function makeDraggable(el, handleSelector) {
@@ -394,17 +425,72 @@ function suppressSiteUi() {
   window._jaObserver = null;
   try { essayObserver?.disconnect?.(); } catch (_) { }
   essayObserver = null;
+  try { stepReapplyObserver?.disconnect?.(); } catch (_) { }
+  stepReapplyObserver = null;
+  if (stepReapplyTimer) {
+    clearTimeout(stepReapplyTimer);
+    stepReapplyTimer = null;
+  }
   cleanupEssayButtons();
   dropdownResolverOpen = false;
   pendingDropdownResolve = null;
   window._jaResumeAttachInit = false;
   approvalQueue = [];
   pendingCapture = {};
+  if (coverageBannerTimer) {
+    clearTimeout(coverageBannerTimer);
+    coverageBannerTimer = null;
+  }
+  autofillInProgress = false;
+  resetFieldCaches();
   if (teachMode) {
     try { stopTeachMode(); } catch (_) { }
   }
   // Disconnect SPA navigation observer to stop re-init cycles
   try { if (typeof navObserver !== 'undefined' && navObserver) navObserver.disconnect(); } catch (_) { }
+}
+
+function stopStepReapplyObserver() {
+  try { stepReapplyObserver?.disconnect?.(); } catch (_) { }
+  stepReapplyObserver = null;
+  if (stepReapplyTimer) {
+    clearTimeout(stepReapplyTimer);
+    stepReapplyTimer = null;
+  }
+}
+
+function startStepReapplyObserver(savedFields) {
+  if (!isCurrentContentInstance()) return;
+  if (isSiteDisabled()) return;
+  if (!shouldShowUi()) return;
+  if (!getSessionFlag('autofillActive')) return;
+  if (stepReapplyObserver) return;
+
+  let mutationCount = 0;
+  stepReapplyObserver = new MutationObserver(() => {
+    if (isSiteDisabled()) {
+      stopStepReapplyObserver();
+      return;
+    }
+    mutationCount += 1;
+    resetFieldCaches();
+    if (stepReapplyTimer) clearTimeout(stepReapplyTimer);
+    stepReapplyTimer = setTimeout(() => {
+      stepReapplyTimer = null;
+      if (mutationCount === 0) return;
+      mutationCount = 0;
+      fillFields(savedFields || {}, { skipObserver: true, source: 'step-reapply' });
+    }, 450);
+  });
+
+  try {
+    stepReapplyObserver.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => {
+      stopStepReapplyObserver();
+    }, 30000);
+  } catch (_) {
+    stopStepReapplyObserver();
+  }
 }
 
 function cleanLabelText(text) {
@@ -420,18 +506,22 @@ function cleanLabelText(text) {
   t = t.replace(/\bcan(?:not)?\s+be\s+left\s+blank\.?/ig, '').trim();
   t = t.replace(/\bis\s+required\.?/ig, '').trim();
   t = t.replace(/\bis\s+invalid\.?/ig, '').trim();
+  t = t.replace(/\bplease\s+enter\b/ig, '').trim();
+  t = t.replace(/\bthis\s+field\s+is\s+required\b/ig, '').trim();
   t = t.replace(/\s+/g, ' ').trim();
   return t;
 }
 
 function isErrorLabelText(text) {
   if (!text) return false;
-  const t = String(text).toLowerCase().replace(/\s+/g, ' ').trim();
-  return t.startsWith('error:')
-    || t.includes('cannot be left blank')
-    || t.includes('can not be left blank')
-    || t.includes('is required')
-    || t.includes('is invalid');
+  const raw = String(text).toLowerCase().replace(/\s+/g, ' ').trim();
+  const cleaned = cleanLabelText(text);
+  const hasErrorWords = /error|invalid|required|cannot be left blank|can not be left blank|must be|please enter/i.test(raw);
+  if (!cleaned) return hasErrorWords;
+  // If the text is mostly error messaging with no meaningful label, treat as error
+  if (hasErrorWords && cleaned.length <= 2) return true;
+  if (hasErrorWords && /^[^a-z0-9]+$/i.test(cleaned)) return true;
+  return false;
 }
 
 function isErrorElement(el) {
@@ -443,6 +533,20 @@ function isErrorElement(el) {
   if (/error|invalid|alert|validation/i.test(cls)) return true;
   const text = el.innerText || el.textContent || '';
   return isErrorLabelText(text);
+}
+
+function isLikelyLabelText(text) {
+  if (!text) return false;
+  const cleaned = cleanLabelText(text);
+  if (!cleaned) return false;
+  if (isErrorLabelText(text) || isErrorLabelText(cleaned)) return false;
+  if (cleaned.length > 140) return false;
+  // Avoid pure placeholder-like labels
+  if (/^select|^choose|^pick/i.test(cleaned)) return false;
+  // Avoid long helper sentences
+  const wordCount = cleaned.split(/\s+/).length;
+  if (wordCount > 10 && cleaned.length > 60) return false;
+  return true;
 }
 
 function logEvent(event) {
@@ -462,9 +566,10 @@ function normalizeStoredFieldKeys(fields) {
   const out = {};
   Object.entries(fields).forEach(([key, val]) => {
     const clean = cleanLabelText(key);
-    const isErrorKey = isErrorLabelText(key) || /error:|cannot be left blank|is required|is invalid/i.test(key);
-    if (!isErrorKey && key) out[key] = val;
+    const isErrorKey = isErrorLabelText(key) || /error:|cannot be left blank|is required|is invalid/i.test(key || '');
+    if (isErrorKey) return;
     if (clean && !isErrorLabelText(clean) && out[clean] === undefined) out[clean] = val;
+    if (key && out[key] === undefined) out[key] = val;
   });
   return out;
 }
@@ -835,6 +940,9 @@ function queueProfileUpdate(profileKey, value) {
 
 function maybeAutoLearnProfile(el, fieldKey, value) {
   if (!el || !fieldKey) return;
+  if (autofillInProgress) return;
+  const lastAuto = Number(el.dataset?.jaAutofillTs || 0);
+  if (lastAuto && (Date.now() - lastAuto) < 900) return;
   const profileKey = resolveProfileKeyFromField(el, fieldKey);
   if (!profileKey) return;
   const normalized = normalizeLearnedValue(el, value);
@@ -956,6 +1064,7 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
     // Prefer clicking the element (works for both native + Radix)
     const wantChecked = primaryVal === 'true' || primaryVal === true || primaryVal === '1';
     if (el.checked !== wantChecked) el.click();
+    markAutofilledElement(el);
     return true;
   }
 
@@ -964,6 +1073,7 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
     const vals = String(primaryVal).split(',');
     Array.from(el.options).forEach(opt => { opt.selected = vals.includes(opt.value) || vals.includes(opt.text.trim()); });
     triggerEvents(el);
+    markAutofilledElement(el);
     return true;
   }
 
@@ -979,6 +1089,7 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
       if (computeOptionMatchScore(c.text, c.value, targets) >= 1) {
         el.selectedIndex = c.index;
         triggerEvents(el);
+        markAutofilledElement(el);
         return true;
       }
     }
@@ -986,31 +1097,47 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
     if (best.candidate && best.score >= 0.92) {
       el.selectedIndex = best.candidate.index;
       triggerEvents(el);
+      markAutofilledElement(el);
       return true;
     }
     return false;
   }
 
   // ── Contenteditable ─────────────────────────────────────────────
-  if (setEditableValue(el, primaryVal)) return true;
+  if (setEditableValue(el, primaryVal)) {
+    markAutofilledElement(el);
+    return true;
+  }
 
   // ── Text / email / tel / textarea ───────────────────────────────
   // Use the universal fill (execCommand → native setter fallback)
   universalFillText(el, primaryVal);
-  if (alreadyMatches(el, fieldKey, primaryVal)) return true;
+  if (alreadyMatches(el, fieldKey, primaryVal)) {
+    markAutofilledElement(el);
+    return true;
+  }
   if (altVal && altVal !== primaryVal) {
     universalFillText(el, altVal);
-    if (alreadyMatches(el, fieldKey, altVal)) return true;
+    if (alreadyMatches(el, fieldKey, altVal)) {
+      markAutofilledElement(el);
+      return true;
+    }
   }
 
   // Fallback: try a sibling/alternate input in the same container
   const altTarget = findBestFillTarget(el, fieldKey);
   if (altTarget && altTarget !== el) {
     universalFillText(altTarget, primaryVal);
-    if (alreadyMatches(altTarget, fieldKey, primaryVal)) return true;
+    if (alreadyMatches(altTarget, fieldKey, primaryVal)) {
+      markAutofilledElement(altTarget);
+      return true;
+    }
     if (altVal && altVal !== primaryVal) {
       universalFillText(altTarget, altVal);
-      if (alreadyMatches(altTarget, fieldKey, altVal)) return true;
+      if (alreadyMatches(altTarget, fieldKey, altVal)) {
+        markAutofilledElement(altTarget);
+        return true;
+      }
     }
   }
   return false;
@@ -1018,23 +1145,7 @@ function applyValueToElement(el, fieldKey, primaryVal, altVal) {
 
 function ensureValueSticks(el, fieldKey, primaryVal, altVal, attempts = 2) {
   if (!el || attempts <= 0) return;
-  const expected = String(primaryVal ?? '').trim();
-  if (!expected) return;
-  const check = () => {
-    const current = String(getFieldValue(el) || '').trim();
-    logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: current === expected });
-    if (current === expected) return;
-    // If React/Vue controlled input overwrote our value, re-apply once or twice
-    const applied = applyValueToElement(el, fieldKey, primaryVal, altVal);
-    if (!applied) {
-      const altTarget = findBestFillTarget(el, fieldKey);
-      if (altTarget && altTarget !== el) {
-        applyValueToElement(altTarget, fieldKey, primaryVal, altVal);
-      }
-    }
-    ensureValueSticks(el, fieldKey, primaryVal, altVal, attempts - 1);
-  };
-  setTimeout(check, 180);
+  scheduleVerifyFill(el, fieldKey, primaryVal, altVal);
 }
 
 function isPlaceholderText(text) {
@@ -1901,6 +2012,35 @@ const GLOBAL_HEURISTICS = [
   { pId: 'totalYearsExperience', regex: /years?.*experience|experience.*years|total.*experience/i }
 ];
 
+function normalizeLabelKey(label) {
+  return cleanLabelText(label || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function normalizeValueForCompare(value) {
+  if (value === undefined || value === null) return '';
+  const raw = String(value).trim();
+  if (!raw) return '';
+  // Normalize phone-like values to digits
+  if (/^\+?[\d\s().-]{6,}$/.test(raw)) {
+    return raw.replace(/[^\d]/g, '');
+  }
+  return raw.toLowerCase();
+}
+
+function inferProfileKeyFromValue(value) {
+  if (!currentGlobalProfile) return null;
+  const target = normalizeValueForCompare(value);
+  if (!target) return null;
+  const entries = Object.entries(currentGlobalProfile);
+  for (const [key, val] of entries) {
+    if (val === undefined || val === null) continue;
+    if (typeof val === 'object') continue;
+    const cand = normalizeValueForCompare(val);
+    if (cand && cand === target) return key;
+  }
+  return null;
+}
+
 function getGlobalMatch(fieldKey) {
   if (!fieldKey || !currentGlobalProfile) return null;
   // Strip any array index like [0] from the key for heuristic matching
@@ -1917,6 +2057,16 @@ function getGlobalMatchMeta(fieldKey) {
   if (!fieldKey || !currentGlobalProfile) return null;
   const cleanKey = fieldKey.replace(/\[\d+\]$/, '');
   
+  // 0. Alias map (promoted from confirmed learning)
+  const aliasKey = normalizeLabelKey(cleanKey);
+  const aliasEntry = globalAliases?.[aliasKey];
+  if (aliasEntry?.key && aliasEntry.count >= GLOBAL_ALIAS_PROMOTE_COUNT) {
+    const aliasValue = currentGlobalProfile[aliasEntry.key];
+    if (aliasValue !== undefined) {
+      return { value: aliasValue, key: aliasEntry.key, score: 0.96 };
+    }
+  }
+
   // 1. Direct profile key match (often happens when AI mapped it)
   // Ensure it's an actual property, not a prototype method like 'valueOf'
   if (Object.prototype.hasOwnProperty.call(currentGlobalProfile, cleanKey) && currentGlobalProfile[cleanKey] !== undefined) {
@@ -2001,6 +2151,9 @@ function getNodeTextById(root, id) {
   if (!el && root && root !== document) {
     el = queryInRoot(root, `#${safeId}`);
   }
+  if (el && (isErrorElement(el) || (typeof isVisibleElement === 'function' && !isVisibleElement(el)))) {
+    return '';
+  }
   return el?.innerText?.trim() || '';
 }
 
@@ -2014,6 +2167,34 @@ function getRadioOptionLabel(el) {
   if (parentLabel?.innerText?.trim()) return cleanLabelText(parentLabel.innerText);
   const nextText = el.nextElementSibling?.innerText?.trim();
   if (nextText) return cleanLabelText(nextText);
+  return '';
+}
+
+function getNearbyLabelText(el) {
+  if (!el || !el.parentElement) return '';
+  const parent = el.parentElement;
+  // 1) Previous sibling element
+  let prev = el.previousElementSibling;
+  if (prev && prev !== el) {
+    const prevText = prev.innerText?.trim() || prev.textContent?.trim();
+    if (isLikelyLabelText(prevText)) return cleanLabelText(prevText);
+  }
+  // 2) Nearby text nodes inside parent
+  for (const node of Array.from(parent.childNodes || [])) {
+    if (node === el) break;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = (node.textContent || '').trim();
+      if (isLikelyLabelText(text)) return cleanLabelText(text);
+    }
+  }
+  // 3) Look for a label-like element in the same parent
+  const labelEl = parent.querySelector?.('label, .label, .field-label, .input-label, .form-label, .question-label, [data-qa*="label"], [data-testid*="label"], [data-test*="label"]');
+  if (labelEl?.innerText?.trim() && isLikelyLabelText(labelEl.innerText)) {
+    return cleanLabelText(labelEl.innerText);
+  }
+  // 4) Parent's aria-label or data-label
+  const attrLabel = parent.getAttribute?.('aria-label') || parent.getAttribute?.('data-label') || parent.getAttribute?.('data-title') || '';
+  if (attrLabel && isLikelyLabelText(attrLabel)) return cleanLabelText(attrLabel);
   return '';
 }
 
@@ -2231,6 +2412,11 @@ function getSiteLabel(el) {
 }
 
 function collectElements(selector) {
+  const now = Date.now();
+  const cached = elementCache.get(selector);
+  if (cached && (now - cached.ts) < FIELD_CACHE_TTL_MS) {
+    return cached.elements;
+  }
   const results = [];
   const seen = new Set();
   const walk = (root) => {
@@ -2247,10 +2433,13 @@ function collectElements(selector) {
     });
   };
   walk(document);
+  elementCache.set(selector, { ts: now, elements: results });
   return results;
 }
 
 function getFieldKey(el) {
+  if (!el) return null;
+  if (fieldKeyCache.has(el)) return fieldKeyCache.get(el);
   const root = getRootNodeFor(el);
   // 1. aria-labelledby: resolve the label element's text
   const labelledBy = el.getAttribute('aria-labelledby');
@@ -2260,7 +2449,7 @@ function getFieldKey(el) {
       .map(id => getNodeTextById(root, id))
       .filter(Boolean).join(' ');
     labelledByText = cleanLabelText(labelledByText);
-    if (isErrorLabelText(labelledByText)) labelledByText = '';
+    if (!isLikelyLabelText(labelledByText)) labelledByText = '';
   }
 
   // 1b. aria-describedby (often error/help text) — only use if non-error
@@ -2278,7 +2467,7 @@ function getFieldKey(el) {
       texts.push(text);
     });
     describedByText = cleanLabelText(texts.join(' '));
-    if (isErrorLabelText(describedByText)) describedByText = '';
+    if (!isLikelyLabelText(describedByText)) describedByText = '';
   }
 
   // 2. label[for="ID"]
@@ -2287,14 +2476,14 @@ function getFieldKey(el) {
     const safeId = escapeForSelector(el.id);
     const label = queryInRoot(root, `label[for="${safeId}"]`) || document.querySelector(`label[for="${safeId}"]`);
     if (label && label.innerText.trim()) labelForText = cleanLabelText(label.innerText.trim());
-    if (isErrorLabelText(labelForText)) labelForText = '';
+    if (!isLikelyLabelText(labelForText)) labelForText = '';
   }
 
   // 3. Closest label parent
   let parentLabelText = '';
   const parentLabel = el.closest('label');
   if (parentLabel && parentLabel.innerText.trim()) parentLabelText = cleanLabelText(parentLabel.innerText.trim());
-  if (isErrorLabelText(parentLabelText)) parentLabelText = '';
+  if (!isLikelyLabelText(parentLabelText)) parentLabelText = '';
 
   // 4. Preceding sibling label (common in simple layouts)
   let prevLabelText = '';
@@ -2302,7 +2491,11 @@ function getFieldKey(el) {
   if (prev && (prev.tagName === 'LABEL' || prev.classList.contains('label'))) {
     if (prev.innerText.trim()) prevLabelText = cleanLabelText(prev.innerText.trim());
   }
-  if (isErrorLabelText(prevLabelText)) prevLabelText = '';
+  if (!isLikelyLabelText(prevLabelText)) prevLabelText = '';
+
+  // 4b. Nearby text nodes/labels
+  let nearbyLabelText = getNearbyLabelText(el);
+  if (!isLikelyLabelText(nearbyLabelText)) nearbyLabelText = '';
 
   // 5. Ancestor Text Fallback (New)
   // If no direct label found, check the closest container for heading text
@@ -2312,12 +2505,12 @@ function getFieldKey(el) {
     const heading = container.querySelector('h1, h2, h3, h4, .title, .heading');
     if (heading && heading.innerText.trim()) headingText = cleanLabelText(heading.innerText.trim());
   }
-  if (isErrorLabelText(headingText)) headingText = '';
+  if (!isLikelyLabelText(headingText)) headingText = '';
 
   let siteLabel = getSiteLabel(el);
   let ancestorLabelText = getAncestorLabelText(el);
-  if (isErrorLabelText(siteLabel)) siteLabel = '';
-  if (isErrorLabelText(ancestorLabelText)) ancestorLabelText = '';
+  if (!isLikelyLabelText(siteLabel)) siteLabel = '';
+  if (!isLikelyLabelText(ancestorLabelText)) ancestorLabelText = '';
   const dataAutomationLabel = el.getAttribute('data-automation-label')
     || el.getAttribute('data-qa-label')
     || el.getAttribute('data-field-label')
@@ -2344,6 +2537,7 @@ function getFieldKey(el) {
     labelForText,
     parentLabelText,
     prevLabelText,
+    nearbyLabelText,
     headingText,
     siteLabel,
     dataAutomationLabel: cleanLabelText(dataAutomationLabel),
@@ -2365,12 +2559,16 @@ function getFieldKey(el) {
   if (FieldUtils && FieldUtils.selectFieldKey) {
     const selected = FieldUtils.selectFieldKey(candidates);
     const cleaned = cleanLabelText(selected);
-    if (cleaned && !isErrorLabelText(selected) && !isErrorLabelText(cleaned)) return cleaned || selected;
+    if (cleaned && !isErrorLabelText(selected) && !isErrorLabelText(cleaned)) {
+      fieldKeyCache.set(el, cleaned || selected);
+      return cleaned || selected;
+    }
     // If FieldUtils picked an error label, try better fallbacks
     const altCandidates = [
       labelForText,
       parentLabelText,
       prevLabelText,
+      nearbyLabelText,
       siteLabel,
       ancestorLabelText,
       dataAutomationLabel,
@@ -2380,7 +2578,9 @@ function getFieldKey(el) {
     ].map(cleanLabelText).filter(Boolean);
     const alt = altCandidates.find(c => !isErrorLabelText(c));
     const finalKey = alt || cleaned || selected;
-    return isErrorLabelText(finalKey) ? null : finalKey;
+    const safeKey = isErrorLabelText(finalKey) ? null : finalKey;
+    fieldKeyCache.set(el, safeKey);
+    return safeKey;
   }
 
   // Fallback: simplified selection
@@ -2389,6 +2589,7 @@ function getFieldKey(el) {
     labelForText,
     parentLabelText,
     prevLabelText,
+    nearbyLabelText,
     headingText,
     siteLabel,
     dataAutomationLabel,
@@ -2411,13 +2612,23 @@ function getFieldKey(el) {
     if (!c || !String(c).trim()) continue;
     if (isUnstableId(c)) continue;
     const cleaned = cleanLabelText(c);
-    if (cleaned && !isErrorLabelText(c) && !isErrorLabelText(cleaned)) return cleaned;
-    if (!isErrorLabelText(c) && !isErrorLabelText(cleaned)) return String(c).trim();
+    if (cleaned && !isErrorLabelText(c) && !isErrorLabelText(cleaned)) {
+      fieldKeyCache.set(el, cleaned);
+      return cleaned;
+    }
+    if (!isErrorLabelText(c) && !isErrorLabelText(cleaned)) {
+      const val = String(c).trim();
+      fieldKeyCache.set(el, val);
+      return val;
+    }
   }
+  fieldKeyCache.set(el, null);
   return null;
 }
 
 function getFieldSignature(el) {
+  if (!el) return '';
+  if (fieldSignatureCache.has(el)) return fieldSignatureCache.get(el);
   const type = (el.type || '').toLowerCase();
   const role = el.getAttribute('role') || '';
   const label = getFieldKey(el) || '';
@@ -2444,7 +2655,9 @@ function getFieldSignature(el) {
   const raw = [
     label, siteLabel, name, id, aria, placeholder, dataField, dataLabel, dataAutomationId, dataTest, dataQa, heading, role, type, path
   ].map(s => (s || '').toString().trim().toLowerCase()).join('|');
-  return simpleHash(raw);
+  const sig = simpleHash(raw);
+  fieldSignatureCache.set(el, sig);
+  return sig;
 }
 
 function getDomPath(el) {
@@ -2622,6 +2835,48 @@ function queueCapture(fields) {
       console.warn('[FormPilot] Capture save failed:', err?.message || err);
     }
   }, 700);
+}
+
+async function maybeAutoLearnMapping(el, value) {
+  if (!el || value === undefined || value === null || value === '') return;
+  if (!currentSiteActive || isSiteDisabled()) return;
+  if (autofillInProgress) return;
+  if (!currentGlobalProfile || Object.keys(currentGlobalProfile).length === 0) return;
+  if (isSensitiveField(el)) return;
+
+  const signature = getFieldSignature(el);
+  if (!signature) return;
+  if (currentSiteMappings.some(m => m.signature === signature)) return;
+
+  const profileKey = inferProfileKeyFromValue(value);
+  if (!profileKey) return;
+
+  const rawLabel = getFieldKey(el) || getSiteLabel(el) || el.getAttribute?.('aria-label') || el.placeholder || '';
+  const cleanLabel = normalizeLabelKey(rawLabel);
+  if (!cleanLabel || isErrorLabelText(cleanLabel)) return;
+
+  const mapping = {
+    signature,
+    mappedKey: profileKey,
+    label: cleanLabel,
+    type: el.type || el.tagName?.toLowerCase() || 'text',
+    hints: buildElementHints(el),
+    confidence: 9,
+    source: 'auto'
+  };
+
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'SAVE_SITE_MAPPING', hostname, mapping });
+    if (resp?.mappings) {
+      currentSiteMappings = resp.mappings;
+      siteData.mappings = resp.mappings;
+    }
+  } catch (_) {}
+
+  try {
+    const aliasResp = await chrome.runtime.sendMessage({ type: 'GLOBAL_ALIAS_MERGE', label: cleanLabel, key: profileKey });
+    if (aliasResp?.aliases) globalAliases = aliasResp.aliases;
+  } catch (_) {}
 }
 
 // Returns true if a field likely holds sensitive personal data we should never store
@@ -3013,6 +3268,7 @@ async function fillRadixCombobox(triggerBtn, desiredValues, minScore = 0.9) {
       // Also dispatch pointer events some frameworks need
       picked.el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
       picked.el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      markAutofilledElement(triggerBtn);
       return true;
     }
     // If options appeared but no match, close and bail
@@ -3036,6 +3292,121 @@ function setEditableValue(el, val) {
     return true;
   }
   return false;
+}
+
+function getCurrentFieldValue(el) {
+  if (!el) return '';
+  const tag = el.tagName?.toUpperCase();
+  const role = el.getAttribute?.('role') || '';
+  if (tag === 'SELECT') {
+    const opt = el.options?.[el.selectedIndex];
+    return opt?.value || opt?.text || '';
+  }
+  if (role === 'listbox') {
+    const selected = el.querySelectorAll('[role="option"][aria-selected="true"]');
+    if (selected.length > 0) {
+      return Array.from(selected).map(opt => getOptionText(opt) || opt.textContent || '').filter(Boolean).join(',');
+    }
+  }
+  if (role === 'combobox' || el.getAttribute?.('aria-haspopup') === 'listbox') {
+    const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
+    if (inputChild) return inputChild.value || '';
+  }
+  if (el.isContentEditable || role === 'textbox') return el.innerText?.trim() || '';
+  if ('value' in el) return (el.value || '').toString();
+  return (el.textContent || '').trim();
+}
+
+function valuesRoughlyMatch(current, target) {
+  const a = normalizeValueForCompare(current);
+  const b = normalizeValueForCompare(target);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+function applyValueWithEvents(el, value) {
+  if (!el) return false;
+  const tag = el.tagName?.toUpperCase();
+  const role = el.getAttribute?.('role') || '';
+  if (tag === 'SELECT') {
+    setNativeValue(el, value);
+    triggerEvents(el);
+    return true;
+  }
+  if (el.isContentEditable || role === 'textbox') {
+    return setEditableValue(el, value);
+  }
+  if (tag === 'INPUT' || tag === 'TEXTAREA') {
+    return universalFillText(el, value);
+  }
+  return false;
+}
+
+function markAutofilledElement(el) {
+  if (!el) return;
+  const ts = String(Date.now());
+  try { el.dataset.jaAutofillTs = ts; } catch (_) { }
+  const inputChild = el.tagName === 'INPUT' ? el : el.querySelector?.('input, textarea');
+  if (inputChild && inputChild !== el) {
+    try { inputChild.dataset.jaAutofillTs = ts; } catch (_) { }
+  }
+}
+
+function scheduleVerifyFill(el, fieldKey, primaryVal, altVal) {
+  if (!el) return;
+  const expected = primaryVal ?? '';
+  const alt = altVal ?? '';
+  setTimeout(() => {
+    if (!isCurrentContentInstance()) return;
+    if (!el.isConnected) return;
+    const current = getCurrentFieldValue(el);
+    const matched = valuesRoughlyMatch(current, expected) || valuesRoughlyMatch(current, alt);
+    logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: matched });
+    if (matched) return;
+
+    const role = el.getAttribute?.('role') || '';
+    const hasPopupListbox = el.getAttribute?.('aria-haspopup') === 'listbox';
+    const tag = el.tagName?.toUpperCase();
+    let retried = false;
+
+    if (tag === 'SELECT') {
+      retried = fillSelectSafely(el, { text: expected, value: alt }, fieldKey);
+    } else if (role === 'listbox') {
+      retried = fillListboxSafely(el, { text: expected, value: alt }, fieldKey);
+    } else if (role === 'combobox' || hasPopupListbox) {
+      const inputChild = el.tagName === 'INPUT' ? el : el.querySelector?.('input');
+      if (inputChild && isUsableTextTarget(inputChild)) {
+        retried = universalFillText(inputChild, expected);
+      }
+      if (!retried) {
+        fillRadixCombobox(el, [expected, alt].filter(Boolean), 0.85).catch(() => {});
+      }
+    } else {
+      retried = applyValueWithEvents(el, expected);
+      if (!retried) {
+        const altTarget = findBestFillTarget(el, fieldKey);
+        if (altTarget && altTarget !== el) {
+          retried = applyValueWithEvents(altTarget, expected);
+        }
+      }
+    }
+
+    if (retried) markAutofilledElement(el);
+    setTimeout(() => {
+      if (!isCurrentContentInstance()) return;
+      if (!el.isConnected) return;
+      const current2 = getCurrentFieldValue(el);
+      const matchedRetry = valuesRoughlyMatch(current2, expected) || valuesRoughlyMatch(current2, alt);
+      logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: matchedRetry, stage: 'retry' });
+      if (!matchedRetry) {
+        // Final attempt: try alternative value if provided
+        if (alt && alt !== expected) {
+          applyValueWithEvents(el, alt);
+          markAutofilledElement(el);
+        }
+      }
+    }, VERIFY_RETRY_MS);
+  }, VERIFY_DELAY_MS);
 }
 
 function buildSelectCandidates(selectEl) {
@@ -3082,6 +3453,7 @@ function trySelectCandidate(selectEl, candidate) {
   if (!selectEl || !candidate) return false;
   selectEl.selectedIndex = candidate.index;
   triggerEvents(selectEl);
+  markAutofilledElement(selectEl);
   return true;
 }
 
@@ -3148,6 +3520,7 @@ function fillListboxSafely(listboxEl, decoded, fieldKey, unresolvedDropdowns) {
       if (best.candidate.el?.getAttribute('aria-selected') !== 'true') {
         best.candidate.el?.click?.();
       }
+      markAutofilledElement(listboxEl);
       matchedAny = true;
     }
   }
@@ -3159,7 +3532,10 @@ function fillListboxSafely(listboxEl, decoded, fieldKey, unresolvedDropdowns) {
 }
 
 function fillFields(savedFields, opts = {}) {
+  if (!isCurrentContentInstance()) return;
   if (isSiteDisabled()) return;
+  autofillInProgress = true;
+  if (autofillGuardTimer) clearTimeout(autofillGuardTimer);
   savedFields = normalizeStoredFieldKeys(savedFields || {});
   const skipObserver = !!opts.skipObserver;
   if (DEBUG_AUTOFILL && !skipObserver) {
@@ -3332,6 +3708,7 @@ function fillFields(savedFields, opts = {}) {
       if (filledSelect) {
         stats.filled += 1;
         attachCorrectionTracker(el, fieldKey, primaryVal);
+        ensureValueSticks(el, fieldKey, primaryVal, altVal);
       }
       return;
     }
@@ -3384,7 +3761,9 @@ function fillFields(savedFields, opts = {}) {
 
     // Process sequentially with small delay so portals don't stack
     (async () => {
+      if (!isCurrentContentInstance()) return;
       for (const { el, key } of comboboxEls) {
+        if (!isCurrentContentInstance()) return;
         stats.detected += 1;
         const isDuplicate = comboKeyCounts[key] > 1;
         comboKeyIndex[key] = (comboKeyIndex[key] || 0);
@@ -3440,7 +3819,11 @@ function fillFields(savedFields, opts = {}) {
           for (const r of optionSets) {
             if (selectBestOption([primaryVal, altVal], r, minScore)) { stats.filled += 1; found = true; break; }
           }
-          if (found) continue;
+          if (found) {
+            attachCorrectionTracker(inputChild, fieldKey, primaryVal);
+            ensureValueSticks(el, fieldKey, primaryVal, altVal);
+            continue;
+          }
           // Revert if we didn't pick a valid option
           setNativeValue(inputChild, originalVal);
           triggerEvents(inputChild);
@@ -3450,6 +3833,8 @@ function fillFields(savedFields, opts = {}) {
         const filled = await fillRadixCombobox(el, [primaryVal, altVal], minScore);
         if (filled) {
           stats.filled += 1;
+          attachCorrectionTracker(el, fieldKey, primaryVal);
+          ensureValueSticks(el, fieldKey, primaryVal, altVal);
         } else {
           unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'combobox' });
         }
@@ -3501,7 +3886,11 @@ function fillFields(savedFields, opts = {}) {
       return;
     }
     const matched = fillListboxSafely(listbox, decoded, key, unresolvedDropdowns);
-    if (matched) stats.filled += 1;
+    if (matched) {
+      stats.filled += 1;
+      attachCorrectionTracker(listbox, key, raw);
+      ensureValueSticks(listbox, key, raw, alt);
+    }
   });
 
   // ── MutationObserver: fill fields added dynamically (conditional logic, "+ Add job") ──
@@ -3511,6 +3900,7 @@ function fillFields(savedFields, opts = {}) {
     let observerTimer;
     window._jaObserver = new MutationObserver(() => {
       clearTimeout(observerTimer);
+      resetFieldCaches();
       // Debounce: wait for DOM to settle before re-filling
       observerTimer = setTimeout(() => {
         fillFields(savedFields, { skipObserver: true });
@@ -3548,6 +3938,11 @@ function fillFields(savedFields, opts = {}) {
       },
     });
   }
+
+  autofillGuardTimer = setTimeout(() => {
+    autofillInProgress = false;
+    autofillGuardTimer = null;
+  }, 1800);
 }
 
 function reportSiteMetrics(stats) {
@@ -3678,6 +4073,7 @@ function attachLiveCapture() {
   const handler = (e) => {
     if (isSiteDisabled()) return;
     if (!isJobFlowEligible()) return;
+    if (autofillInProgress) return;
     let el = e.target;
     if (!el) return;
 
@@ -3708,7 +4104,11 @@ function attachLiveCapture() {
       if (/^[-\s]*(select|choose|pick)/i.test(raw)) return;
     }
     queueCapture({ [key]: value });
-    maybeAutoLearnProfile(el, key, value);
+    // Only auto-learn on committed interactions (change/blur), not on every keystroke
+    if (e.type === 'change' || e.type === 'blur') {
+      maybeAutoLearnProfile(el, key, value);
+      maybeAutoLearnMapping(el, value);
+    }
   };
   document.addEventListener('input', handler, true);
   document.addEventListener('change', handler, true);
@@ -3750,6 +4150,7 @@ function isVisibleElement(el) {
 function isElementInteractable(el) {
   if (!el) return false;
   if (!isVisibleElement(el)) return false;
+  if (typeof document.elementFromPoint !== 'function') return true;
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
@@ -3762,6 +4163,7 @@ function isElementInteractable(el) {
 
 function findProxyInput(el) {
   if (!el) return null;
+  if (typeof document.elementFromPoint !== 'function') return null;
   const rect = el.getBoundingClientRect();
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
@@ -5079,6 +5481,39 @@ function getFormCompletionStats() {
   return { total, filled, missing };
 }
 
+function getAutofillPreview(savedFields, limit = 4) {
+  const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"], [role="listbox"]';
+  const seen = new Set();
+  const labels = [];
+  let count = 0;
+
+  collectElements(selectors).forEach(el => {
+    if (!isVisibleElement(el)) return;
+    const mapped = resolveMappedKey(el);
+    const key = mapped.key || getFieldKey(el);
+    if (!key || isErrorLabelText(key)) return;
+
+    let value = savedFields?.[key];
+    if (value === undefined) value = getGlobalMatch(key);
+    if (value === undefined) {
+      const inferredKey = resolveProfileKeyFromField(el, key);
+      if (inferredKey && currentGlobalProfile && currentGlobalProfile[inferredKey] !== undefined) {
+        value = currentGlobalProfile[inferredKey];
+      }
+    }
+    if (value === undefined || value === null || !String(value).trim()) return;
+
+    count += 1;
+    const cleanKey = cleanLabelText(key);
+    if (!cleanKey || seen.has(cleanKey)) return;
+    seen.add(cleanKey);
+    if (labels.length < limit) labels.push(cleanKey);
+  });
+
+  if (!count) count = Object.keys(savedFields || {}).length;
+  return { count, labels };
+}
+
 function showReviewPanel() {
   if (document.getElementById('ja-review-panel')) return;
   if (!shouldShowUi()) return;
@@ -5104,6 +5539,15 @@ function showReviewPanel() {
       }
       #ja-review-panel h4 { margin: 0 0 6px 0; font-size: 13px; color: #93c5fd; cursor: move; }
       #ja-review-panel .ja-review-sub { color:#94a3b8; margin-bottom: 8px; }
+      #ja-review-panel .ja-review-metric {
+        display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px;
+      }
+      #ja-review-panel .ja-review-card {
+        border-radius: 10px; padding: 8px; background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(148,163,184,0.14);
+      }
+      #ja-review-panel .ja-review-card strong { display:block; color:#e2e8f0; font-size: 14px; }
+      #ja-review-panel .ja-review-card span { color:#94a3b8; font-size: 11px; }
       #ja-review-panel ul { margin: 6px 0 0 16px; padding: 0; color: #fbbf24; }
       #ja-review-panel .ja-review-actions { display:flex; gap:8px; margin-top: 10px; }
       #ja-review-panel button {
@@ -5114,6 +5558,11 @@ function showReviewPanel() {
     </style>
     <h4>Pre‑Submit Review</h4>
     <div class="ja-review-sub">Filled ${stats.filled} of ${stats.total} fields.</div>
+    <div class="ja-review-metric">
+      <div class="ja-review-card"><strong>${stats.filled}</strong><span>Filled</span></div>
+      <div class="ja-review-card"><strong>${Math.max(stats.total - stats.filled, 0)}</strong><span>Pending</span></div>
+      <div class="ja-review-card"><strong>${stats.missing.length}</strong><span>Required Missing</span></div>
+    </div>
     ${missingList}
     <div class="ja-review-actions">
       <button id="ja-review-dismiss">Dismiss</button>
@@ -5257,44 +5706,62 @@ function showCoverageBanner(stats) {
   const matchRatio = detected ? matched / detected : 1;
   const fillRatio = matched ? filled / matched : 1;
   if (matchRatio >= 0.85 && fillRatio >= 0.85) return;
+  if (coverageBannerTimer) clearTimeout(coverageBannerTimer);
+  coverageBannerTimer = setTimeout(() => {
+    coverageBannerTimer = null;
+    if (!isCurrentContentInstance()) return;
+    if (document.getElementById('ja-coverage-banner')) return;
+    if (!shouldShowUi()) return;
+    const missingCount = Math.max(detected - filled, 0);
+    const banner = document.createElement('div');
+    banner.id = 'ja-coverage-banner';
+    banner.innerHTML = `
+      <style>
+        #ja-coverage-banner {
+          position: fixed; bottom: 18px; left: 18px; z-index: 2147483646;
+          background: linear-gradient(145deg, rgba(11,18,32,0.96), rgba(17,24,39,0.96));
+          border: 1px solid rgba(56,189,248,0.28);
+          border-radius: 14px; padding: 12px 14px;
+          box-shadow: 0 10px 28px rgba(0,0,0,0.42);
+          font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
+          color: #e2e8f0; font-size: 12px; max-width: 340px;
+          backdrop-filter: blur(12px);
+        }
+        #ja-coverage-banner .row { display:flex; gap:10px; align-items:center; justify-content: space-between; cursor: move; }
+        #ja-coverage-banner .stats {
+          color: #93c5fd; font-weight: 700; padding: 4px 8px; border-radius: 999px;
+          background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.18);
+        }
+        #ja-coverage-banner .sub { margin-top:4px; color:#94a3b8; line-height: 1.45; }
+        #ja-coverage-banner .actions { display:flex; gap:8px; margin-top: 10px; }
+        #ja-coverage-banner button {
+          border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+        }
+        #ja-coverage-review { background: rgba(14,165,233,0.12); color:#7dd3fc; }
+        #ja-coverage-dismiss { background: rgba(255,255,255,0.08); color: #cbd5f5; }
+      </style>
+      <div class="row">
+        <div><strong>Need a quick check</strong></div>
+        <div class="stats">${filled}/${detected}</div>
+      </div>
+      <div class="sub">${missingCount} field${missingCount === 1 ? '' : 's'} may still need attention. Open review to inspect required gaps.</div>
+      <div class="actions">
+        <button id="ja-coverage-review">Review</button>
+        <button id="ja-coverage-dismiss">Hide</button>
+      </div>
+    `;
+    document.body.appendChild(banner);
+    makeDraggable(banner, '.row');
 
-  const banner = document.createElement('div');
-  banner.id = 'ja-coverage-banner';
-  banner.innerHTML = `
-    <style>
-      #ja-coverage-banner {
-        position: fixed; bottom: 18px; left: 18px; z-index: 2147483646;
-        background: linear-gradient(135deg, #0b1220 0%, #111827 100%);
-        border: 1px solid rgba(56,189,248,0.35);
-        border-radius: 12px; padding: 12px 14px;
-        box-shadow: 0 8px 28px rgba(0,0,0,0.5);
-        font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif; color: #e2e8f0; font-size: 12px;
-        max-width: 320px;
-      }
-      #ja-coverage-banner .row { display:flex; gap:10px; align-items:center; justify-content: space-between; cursor: move; }
-      #ja-coverage-banner .stats { color: #93c5fd; font-weight: 600; }
-      #ja-coverage-banner .actions { display:flex; gap:8px; margin-top: 8px; }
-      #ja-coverage-banner button {
-        border: none; border-radius: 8px; padding: 6px 10px;
-        font-size: 12px; font-weight: 600; cursor: pointer;
-      }
-      #ja-coverage-dismiss { background: rgba(255,255,255,0.08); color: #cbd5f5; }
-    </style>
-    <div class="row">
-      <div><strong>Autofill Coverage</strong></div>
-      <div class="stats">${filled}/${matched}/${detected}</div>
-    </div>
-    <div style="margin-top:4px; color:#94a3b8">Filled / Matched / Detected fields</div>
-    <div class="actions">
-      <button id="ja-coverage-dismiss">Dismiss</button>
-    </div>
-  `;
-  document.body.appendChild(banner);
-
-  document.getElementById('ja-coverage-dismiss').onclick = () => {
-    setSessionFlag('coverageDismissed', true);
-    banner.remove();
-  };
+    document.getElementById('ja-coverage-review').onclick = () => {
+      showReviewPanel();
+      banner.remove();
+    };
+    document.getElementById('ja-coverage-dismiss').onclick = () => {
+      setSessionFlag('coverageDismissed', true);
+      banner.remove();
+    };
+  }, 900);
 }
 
 // Fills only standard (non-ARIA) fields — used by MutationObserver re-runs
@@ -5376,6 +5843,12 @@ function showAutofillBanner(savedFields) {
     return;
   }
 
+  const preview = getAutofillPreview(savedFields || {});
+  const previewCount = preview.count || 0;
+  const previewChips = preview.labels.length
+    ? `<div class="ja-preview">${preview.labels.map(label => `<span>${escapeHtml(label)}</span>`).join('')}</div>`
+    : '';
+
   const banner = document.createElement('div');
   banner.id = 'ja-banner';
   banner.innerHTML = `
@@ -5390,15 +5863,26 @@ function showAutofillBanner(savedFields) {
         font-family: 'FormPilot Sans', 'SF Pro Text', 'SF Pro Display', 'Avenir Next', 'Helvetica Neue', 'Segoe UI', sans-serif;
         color: #e2e8f0; font-size: 14px;
         animation: ja-slide-in 0.35s cubic-bezier(0.34,1.56,0.64,1);
-        max-width: 340px;
+        max-width: 380px;
+        backdrop-filter: blur(12px);
       }
       @keyframes ja-slide-in {
         from { opacity:0; transform: translateY(-20px) scale(0.95); }
         to   { opacity:1; transform: translateY(0) scale(1); }
       }
+      @media (prefers-reduced-motion: reduce) {
+        #ja-banner { animation: none; }
+      }
       #ja-banner .ja-icon { font-size: 22px; flex-shrink:0; }
       #ja-banner .ja-text { flex:1; line-height:1.4; cursor: move; }
       #ja-banner .ja-text strong { color: #93c5fd; display:block; margin-bottom:2px; }
+      #ja-banner .ja-sub { color:#94a3b8; font-size: 12px; margin-top: 4px; }
+      #ja-banner .ja-preview { display:flex; flex-wrap:wrap; gap:6px; margin-top: 10px; }
+      #ja-banner .ja-preview span {
+        display:inline-flex; align-items:center; padding: 4px 8px; border-radius: 999px;
+        background: rgba(255,255,255,0.06); border: 1px solid rgba(148,163,184,0.18);
+        color:#cbd5f5; font-size: 11px;
+      }
       #ja-banner .ja-btns { display:flex; gap:8px; flex-shrink:0; }
       #ja-banner button {
         border: none; border-radius: 8px; padding: 7px 14px;
@@ -5409,22 +5893,25 @@ function showAutofillBanner(savedFields) {
       #ja-yes:hover { background: #0b5cab; transform: scale(1.04); }
       #ja-no  { background: rgba(255,255,255,0.08); color: #94a3b8; }
       #ja-no:hover { background: rgba(255,255,255,0.15); }
-      #ja-never { background: rgba(239, 68, 68, 0.1); color: #ef4444; }
-      #ja-never:hover { background: rgba(239, 68, 68, 0.2); }
+      #ja-teach { background: rgba(14, 165, 233, 0.1); color: #7dd3fc; }
+      #ja-teach:hover { background: rgba(14, 165, 233, 0.18); }
     </style>
     <span class="ja-icon">⚡</span>
     <div class="ja-text">
       <strong>FormPilot AI</strong>
-      Fill your previous data for this site?
+      Ready to fill ${previewCount} field${previewCount === 1 ? '' : 's'} from your saved data.
+      <div class="ja-sub">Use autofill now or teach the form once and let it get better silently.</div>
+      ${previewChips}
     </div>
     <div class="ja-btns">
-      <button id="ja-yes">Yes</button>
-      <button id="ja-no">Skip</button>
-      <button id="ja-never">Never</button>
+      <button id="ja-yes">Autofill</button>
+      <button id="ja-teach">Teach</button>
+      <button id="ja-no">Hide</button>
     </div>
   `;
 
   document.body.appendChild(banner);
+  makeDraggable(banner, '.ja-text');
 
   document.getElementById('ja-yes').onclick = () => {
     setSessionFlag('autofillDismissed', true);
@@ -5432,13 +5919,13 @@ function showAutofillBanner(savedFields) {
     fillFields(savedFields);
     banner.remove();
   };
-  document.getElementById('ja-no').onclick = () => {
+  document.getElementById('ja-teach').onclick = () => {
     setSessionFlag('autofillDismissed', true);
+    startTeachMode();
     banner.remove();
   };
-  document.getElementById('ja-never').onclick = () => {
+  document.getElementById('ja-no').onclick = () => {
     setSessionFlag('autofillDismissed', true);
-    setSiteFlag('neverPrompt', true);
     banner.remove();
   };
 
@@ -5460,6 +5947,8 @@ function showSaveDataBanner(fields) {
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobFlowEligible()) return;
 
+  const fieldCount = Object.keys(fields || {}).length;
+  const previewLabels = Object.keys(fields || {}).filter(label => !isErrorLabelText(label)).slice(0, 3);
   const banner = document.createElement('div');
   banner.id = 'ja-save-banner';
   banner.innerHTML = `
@@ -5475,10 +5964,21 @@ function showSaveDataBanner(fields) {
         color: #e2e8f0; font-size: 14px;
         animation: ja-slide-in 0.35s cubic-bezier(0.34,1.56,0.64,1);
         max-width: 360px;
+        backdrop-filter: blur(12px);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #ja-save-banner { animation: none; }
       }
       #ja-save-banner .ja-icon { font-size: 22px; flex-shrink:0; }
       #ja-save-banner .ja-text { flex:1; line-height:1.4; cursor: move; }
       #ja-save-banner .ja-text strong { color: #6ee7b7; display:block; margin-bottom:2px; }
+      #ja-save-banner .ja-sub { color:#94a3b8; font-size: 12px; margin-top: 4px; }
+      #ja-save-banner .ja-preview { display:flex; flex-wrap:wrap; gap:6px; margin-top: 10px; }
+      #ja-save-banner .ja-preview span {
+        display:inline-flex; align-items:center; padding: 4px 8px; border-radius: 999px;
+        background: rgba(255,255,255,0.06); border: 1px solid rgba(148,163,184,0.18);
+        color:#d1fae5; font-size: 11px;
+      }
       #ja-save-banner .ja-btns { display:flex; gap:8px; flex-shrink:0; }
       #ja-save-banner button {
         border: none; border-radius: 8px; padding: 7px 14px;
@@ -5495,7 +5995,9 @@ function showSaveDataBanner(fields) {
     <span class="ja-icon">💾</span>
     <div class="ja-text">
       <strong>Save Data?</strong>
-      Do you want to save the entered data for next time?
+      Do you want to save ${fieldCount} learned field${fieldCount === 1 ? '' : 's'} for next time?
+      <div class="ja-sub">This helps future autofill on this site become more accurate.</div>
+      ${previewLabels.length ? `<div class="ja-preview">${previewLabels.map(label => `<span>${escapeHtml(label)}</span>`).join('')}</div>` : ''}
     </div>
     <div class="ja-btns">
       <button id="ja-save-yes">Save</button>
@@ -5505,6 +6007,7 @@ function showSaveDataBanner(fields) {
   `;
 
   document.body.appendChild(banner);
+  makeDraggable(banner, '.ja-text');
 
   document.getElementById('ja-save-yes').onmousedown = (e) => {
     e.preventDefault();
@@ -5571,6 +6074,7 @@ function attachRecorder() {
       // Multi-step flow: on "Next/Continue", enable session autofill but don't prompt to save
       if (effectiveStage === 'next') {
         setSessionFlag('autofillActive', true);
+        startStepReapplyObserver(normalizeStoredFieldKeys({ ...(siteData?.fields || {}), ...fields }));
         console.log('[FormPilot] Multi-step detected. Carrying data forward silently.');
         return;
       }
@@ -5686,6 +6190,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'MANUAL_AUTOFILL') {
+    if (!isTopFrame()) {
+      sendResponse({ ok: false, skipped: true });
+      return true;
+    }
     Promise.all([
       chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }),
       chrome.runtime.sendMessage({ type: 'SESSION_GET', hostname }).catch(() => ({ ok: false, fields: {} })),
@@ -5743,6 +6251,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'TEACH_MODE_START') {
+    if (!isTopFrame()) {
+      sendResponse({ ok: false, skipped: true });
+      return true;
+    }
     if (isSiteDisabled()) {
       sendResponse({ ok: false, error: 'Site disabled' });
       return true;
@@ -5900,6 +6412,8 @@ async function init() {
   initRunning = true;
 
   try {
+    resetFieldCaches();
+    stopStepReapplyObserver();
     try { chrome.runtime.sendMessage({ type: 'FRAME_HELLO' }); } catch (_) {}
 
     // Check if site is excluded (not a job portal) — bail immediately
@@ -5918,10 +6432,11 @@ async function init() {
     console.log(`[FormPilot] Initializing on ${location.href}`);
     ensureBrandFont();
 
-    const [resp, profileResp, sessionResp] = await Promise.all([
+    const [resp, profileResp, sessionResp, aliasResp] = await Promise.all([
       chrome.runtime.sendMessage({ type: 'GET_SITE_DATA', hostname }),
       chrome.runtime.sendMessage({ type: 'GET_GLOBAL_PROFILE' }),
-      chrome.runtime.sendMessage({ type: 'SESSION_GET', hostname }).catch(() => ({ ok: false, fields: {} }))
+      chrome.runtime.sendMessage({ type: 'SESSION_GET', hostname }).catch(() => ({ ok: false, fields: {} })),
+      chrome.runtime.sendMessage({ type: 'GLOBAL_ALIAS_GET' }).catch(() => ({ ok: false, aliases: {} }))
     ]);
     sessionFlags = sessionResp?.flags || {};
     hydrateSessionFlags(sessionFlags);
@@ -5930,6 +6445,7 @@ async function init() {
     siteFlags = siteData.flags || {};
     currentSiteKey = resp?.siteKey || hostname;
     currentSiteMappings = siteData.mappings || [];
+    globalAliases = aliasResp?.aliases || globalAliases || {};
     
     // 1. If explicitly blocked ("Never") OR toggled off in popup, stop completely
     currentSiteActive = !(site?.disabled || site?.enabled === false);
@@ -6039,6 +6555,10 @@ async function init() {
       console.warn('[FormPilot] Autofill skipped — no saved fields and no global profile data.');
     }
 
+    if (allowAuto && (savedCount > 0 || globalCount > 0) && getSessionFlag('autofillActive')) {
+      startStepReapplyObserver(mergedFields || {});
+    }
+
     if (allowAuto) {
       attachLiveCapture();
       initResumeAttach();
@@ -6068,6 +6588,9 @@ async function init() {
             showAutofillBanner(mergedFields || {});
           }
         }
+        if (getSessionFlag('autofillActive')) {
+          startStepReapplyObserver(mergedFields || {});
+        }
       }, 1200);
     }
   } catch (err) {
@@ -6089,6 +6612,7 @@ function debouncedInit() {
   if (siteExcluded || isSiteDisabled()) return;
   if (reinitTimer) clearTimeout(reinitTimer);
   reinitTimer = setTimeout(() => {
+    resetFieldCaches();
     if (isExtensionValid() && !siteExcluded) init();
   }, 300);
 }
