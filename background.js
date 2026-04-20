@@ -89,6 +89,25 @@ function queueDebugLog(entry) {
   }
 }
 
+async function clearGoogleIdentityTokenCache() {
+  if (!chrome.identity?.getAuthToken || !chrome.identity?.removeCachedAuthToken) {
+    return false;
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.identity.getAuthToken({ interactive: false }, (token) => {
+        if (chrome.runtime.lastError || !token) {
+          resolve(false);
+          return;
+        }
+        chrome.identity.removeCachedAuthToken({ token }, () => resolve(true));
+      });
+    } catch (_) {
+      resolve(false);
+    }
+  });
+}
+
 // ── Storage Helpers (Account Aware) ────────────────────────────
 const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
   getUserKey: async (baseKey) => baseKey,
@@ -1199,6 +1218,9 @@ async function handleMessage(msg, sender) {
     }
 
     case 'CLOUD_SIGN_OUT': {
+      try {
+        await clearGoogleIdentityTokenCache();
+      } catch (_) { /* ignore */ }
       await cloudSignOut();
       return { ok: true };
     }

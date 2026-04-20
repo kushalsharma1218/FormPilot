@@ -80,12 +80,24 @@ let essayButtons = new Set();
 let globalAliases = {};
 let autofillInProgress = false;
 let autofillGuardTimer = null;
+let lastFillTimestamp = 0;
+const FILL_COOLDOWN_MS = 500;
 let coverageBannerTimer = null;
 let fieldKeyCache = new WeakMap();
 let fieldSignatureCache = new WeakMap();
 let elementCache = new Map();
 let stepReapplyObserver = null;
 let stepReapplyTimer = null;
+let liveCaptureHandler = null;
+let recorderSubmitHandler = null;
+let recorderMouseDownHandler = null;
+let recorderDebounceTimer = null;
+let resumeFocusHandler = null;
+let resumeClickHandler = null;
+let resumeAttachObserver = null;
+let navObserver = null;
+let navWatchersAttached = false;
+let lastPath = location.pathname + location.search + location.hash;
 
 // Performance mode: minimize UI + heavy observers to keep pages smooth
 const PERFORMANCE_MODE = true;
@@ -467,8 +479,15 @@ function startStepReapplyObserver(savedFields) {
   if (stepReapplyObserver) return;
 
   let mutationCount = 0;
+  let reapplyCount = 0;
+  const MAX_REAPPLY = 3;
   stepReapplyObserver = new MutationObserver(() => {
     if (isSiteDisabled()) {
+      stopStepReapplyObserver();
+      return;
+    }
+    if (reapplyCount >= MAX_REAPPLY) {
+      console.log('[FormPilot] Max step-reapply count reached, stopping observer.');
       stopStepReapplyObserver();
       return;
     }
@@ -479,7 +498,8 @@ function startStepReapplyObserver(savedFields) {
       stepReapplyTimer = null;
       if (mutationCount === 0) return;
       mutationCount = 0;
-      fillFields(savedFields || {}, { skipObserver: true, source: 'step-reapply' });
+      reapplyCount++;
+      fillFields(savedFields || {}, { skipObserver: true, skipCooldown: true, source: 'step-reapply' });
     }, 450);
   });
 
@@ -496,7 +516,7 @@ function startStepReapplyObserver(savedFields) {
 function cleanLabelText(text) {
   let t = text;
   if (FieldUtils && FieldUtils.cleanLabelText) {
-    try { t = FieldUtils.cleanLabelText(t); } catch (_) {}
+    try { t = FieldUtils.cleanLabelText(t); } catch (_) { }
   }
   if (!t) return '';
   t = String(t).replace(/\*/g, '').replace(/:\s*$/, '').trim();
@@ -557,8 +577,8 @@ function logEvent(event) {
       frameType: (window === window.top) ? 'top' : 'child',
       ...event
     };
-    chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: payload }).catch(() => {});
-  } catch (_) {}
+    chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: payload }).catch(() => { });
+  } catch (_) { }
 }
 
 function normalizeStoredFieldKeys(fields) {
@@ -620,12 +640,12 @@ function normalizeValueForField(val, el, fieldKey) {
         return [...new Set([
           v, iso,
           `${mm}/${dd}/${yyyy}`, `${mm}-${dd}-${yyyy}`,
-          `${mm}/${yyyy}`,       `${mm}-${yyyy}`,
+          `${mm}/${yyyy}`, `${mm}-${yyyy}`,
           `${yyyy}-${mm}`,
           d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
         ].filter(Boolean))];
       }
-    } catch (_) {}
+    } catch (_) { }
   }
 
   // URL / LinkedIn / GitHub normalization
@@ -706,16 +726,16 @@ function findBestFillTarget(el, fieldKey) {
 // Boolean / Yes-No smart resolver for select/radio options
 function resolveBooleanOption(savedVal, optionText, optionValue) {
   const v = String(savedVal).toLowerCase().trim();
-  const trueTokens  = ['yes', 'true', '1', 'y', 'agree', 'authorized', 'citizen', 'eligible', 'will', 'can'];
+  const trueTokens = ['yes', 'true', '1', 'y', 'agree', 'authorized', 'citizen', 'eligible', 'will', 'can'];
   const falseTokens = ['no', 'false', '0', 'n', 'disagree', 'not authorized', 'not eligible', 'cannot'];
-  const isTrue  = trueTokens.some(t => v === t || v.startsWith(t));
+  const isTrue = trueTokens.some(t => v === t || v.startsWith(t));
   const isFalse = falseTokens.some(t => v === t || v.startsWith(t));
   if (!isTrue && !isFalse) return false;
 
   const optLow = (String(optionText || '') + ' ' + String(optionValue || '')).toLowerCase().trim();
-  const trueMatch  = ['yes', 'y', '1', 'true', 'si', 'oui', 'agree', 'authorize', 'eligible'];
+  const trueMatch = ['yes', 'y', '1', 'true', 'si', 'oui', 'agree', 'authorize', 'eligible'];
   const falseMatch = ['no', 'n', '0', 'false', 'non', 'disagree', 'not author', 'not eligible'];
-  if (isTrue  && trueMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
+  if (isTrue && trueMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
   if (isFalse && falseMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
   return false;
 }
@@ -779,7 +799,7 @@ function recordCorrection(fieldKey, originalVal, correctedVal) {
       ts: Date.now()
     });
     localStorage.setItem(CORRECTION_STORE_KEY, JSON.stringify(corrections));
-  } catch (_) {}
+  } catch (_) { }
 
   // If this maps to a known global profile field, update it
   const profileKey = inferProfileKeyFromLabel(fieldKey);
@@ -790,10 +810,10 @@ function recordCorrection(fieldKey, originalVal, correctedVal) {
       const profile = resp?.profile || {};
       if (profile[profileKey] !== correctedVal) {
         profile[profileKey] = correctedVal;
-        chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => { });
         console.log(`[FormPilot] AI Learning: profile.${profileKey} updated from correction`);
       }
-    }).catch(() => {});
+    }).catch(() => { });
   }
 }
 
@@ -932,7 +952,7 @@ function queueProfileUpdate(profileKey, value) {
       });
       if (changed) {
         currentGlobalProfile = { ...profile };
-        chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => {});
+        chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => { });
       }
     } catch (_) { }
   }, PROFILE_LEARN_DEBOUNCE_MS);
@@ -2056,7 +2076,7 @@ function getGlobalMatch(fieldKey) {
 function getGlobalMatchMeta(fieldKey) {
   if (!fieldKey || !currentGlobalProfile) return null;
   const cleanKey = fieldKey.replace(/\[\d+\]$/, '');
-  
+
   // 0. Alias map (promoted from confirmed learning)
   const aliasKey = normalizeLabelKey(cleanKey);
   const aliasEntry = globalAliases?.[aliasKey];
@@ -2078,7 +2098,7 @@ function getGlobalMatchMeta(fieldKey) {
   if (inferred && currentGlobalProfile[inferred] !== undefined) {
     return { value: currentGlobalProfile[inferred], key: inferred, score: 0.9 };
   }
-  
+
   // 2. Heuristic fallback
   for (const h of GLOBAL_HEURISTICS) {
     if (h.regex.test(cleanKey) && currentGlobalProfile[h.pId]) {
@@ -2277,7 +2297,7 @@ function isPinpointHQPage() {
 function isLinkedInEasyApplyPage() {
   return /linkedin\.com/i.test(location.hostname)
     && (document.querySelector('.jobs-easy-apply-modal, .jobs-easy-apply-content') ||
-        document.querySelector('[data-test-modal-id="easy-apply-modal"]'));
+      document.querySelector('[data-test-modal-id="easy-apply-modal"]'));
 }
 
 // ── NEW: Label extractors for new platforms ────────────────────
@@ -2871,12 +2891,12 @@ async function maybeAutoLearnMapping(el, value) {
       currentSiteMappings = resp.mappings;
       siteData.mappings = resp.mappings;
     }
-  } catch (_) {}
+  } catch (_) { }
 
   try {
     const aliasResp = await chrome.runtime.sendMessage({ type: 'GLOBAL_ALIAS_MERGE', label: cleanLabel, key: profileKey });
     if (aliasResp?.aliases) globalAliases = aliasResp.aliases;
-  } catch (_) {}
+  } catch (_) { }
 }
 
 // Returns true if a field likely holds sensitive personal data we should never store
@@ -3207,7 +3227,7 @@ function universalFillText(el, value) {
     // Select all so we replace existing content, but avoid throwing on email/number types
     const noSelectTypes = ['email', 'number', 'tel', 'date', 'month', 'week', 'time', 'datetime-local'];
     const type = (el.type || '').toLowerCase();
-    
+
     if (noSelectTypes.includes(type)) {
       // Direct replace for types that don't support selection
       // We still use execCommand if possible to fire proper events
@@ -3216,7 +3236,7 @@ function universalFillText(el, value) {
       if (typeof el.select === 'function') el.select();
       else el.setSelectionRange?.(0, el.value?.length || 0);
     }
-    
+
     // execCommand fires the correct browser events that React/Vue listen to
     document.execCommand('insertText', false, String(value));
   } catch (_) { }
@@ -3225,8 +3245,8 @@ function universalFillText(el, value) {
   const prev = el.value;
   if (setter) setter.call(el, value);
   else el.value = value;
-  try { el.defaultValue = String(value); } catch (_) {}
-  try { el.setAttribute?.('value', String(value)); } catch (_) {}
+  try { el.defaultValue = String(value); } catch (_) { }
+  try { el.setAttribute?.('value', String(value)); } catch (_) { }
   const tracker = el._valueTracker;
   if (tracker && typeof tracker.setValue === 'function') {
     tracker.setValue(prev);
@@ -3258,7 +3278,7 @@ async function fillRadixCombobox(triggerBtn, desiredValues, minScore = 0.9) {
     let picked = { el: null, score: 0 };
     for (const opt of options) {
       const text = opt.textContent || '';
-      const val  = opt.dataset.value || opt.getAttribute('value') || '';
+      const val = opt.dataset.value || opt.getAttribute('value') || '';
       if (isPlaceholderText(text) && !val) continue;
       const score = computeOptionMatchScore(text, val, targets);
       if (score > picked.score) picked = { el: opt, score };
@@ -3379,7 +3399,7 @@ function scheduleVerifyFill(el, fieldKey, primaryVal, altVal) {
         retried = universalFillText(inputChild, expected);
       }
       if (!retried) {
-        fillRadixCombobox(el, [expected, alt].filter(Boolean), 0.85).catch(() => {});
+        fillRadixCombobox(el, [expected, alt].filter(Boolean), 0.85).catch(() => { });
       }
     } else {
       retried = applyValueWithEvents(el, expected);
@@ -3534,7 +3554,14 @@ function fillListboxSafely(listboxEl, decoded, fieldKey, unresolvedDropdowns) {
 function fillFields(savedFields, opts = {}) {
   if (!isCurrentContentInstance()) return;
   if (isSiteDisabled()) return;
+  // Cooldown guard: prevent duplicate fills from rapid external calls (e.g., double-init)
+  // Note: autofillInProgress is a signal for OTHER functions, not a guard here.
+  if (!opts.skipCooldown && Date.now() - lastFillTimestamp < FILL_COOLDOWN_MS) {
+    console.log('[FormPilot] Fill cooldown active, skipping.');
+    return;
+  }
   autofillInProgress = true;
+  lastFillTimestamp = Date.now();
   if (autofillGuardTimer) clearTimeout(autofillGuardTimer);
   savedFields = normalizeStoredFieldKeys(savedFields || {});
   const skipObserver = !!opts.skipObserver;
@@ -3667,7 +3694,7 @@ function fillFields(savedFields, opts = {}) {
     if (DEBUG_AUTOFILL) {
       const tag = el.tagName + (el.type ? `[${el.type}]` : '');
       console.log(
-        `[FP DEBUG] field="${fieldKey}" tag=${tag} src=${source} val=${val === undefined ? 'MISS' : JSON.stringify(String(val).slice(0,60))}`
+        `[FP DEBUG] field="${fieldKey}" tag=${tag} src=${source} val=${val === undefined ? 'MISS' : JSON.stringify(String(val).slice(0, 60))}`
       );
     }
 
@@ -3681,7 +3708,7 @@ function fillFields(savedFields, opts = {}) {
     const canFill = shouldFillValue(el, fieldKey, primaryVal);
 
     if (DEBUG_AUTOFILL) {
-      console.log(`  → confidence=${confidence} canFill=${canFill} primaryVal=${JSON.stringify(String(primaryVal).slice(0,60))}`);
+      console.log(`  → confidence=${confidence} canFill=${canFill} primaryVal=${JSON.stringify(String(primaryVal).slice(0, 60))}`);
     }
 
     if (!canFill) return;
@@ -4008,11 +4035,11 @@ function maybeInjectEssayButtons() {
       'opacity:0.9', 'transition:opacity .15s',
     ].join(';');
     btn.onmouseover = () => { btn.style.opacity = '1'; };
-    btn.onmouseout  = () => { btn.style.opacity = '0.9'; };
+    btn.onmouseout = () => { btn.style.opacity = '0.9'; };
 
     const positionBtn = () => {
       const rect = el.getBoundingClientRect();
-      btn.style.top  = (rect.top  + window.scrollY + 4) + 'px';
+      btn.style.top = (rect.top + window.scrollY + 4) + 'px';
       btn.style.left = (rect.right + window.scrollX - 110) + 'px';
     };
     positionBtn();
@@ -4061,7 +4088,7 @@ function ensureEssayObserver() {
     clearTimeout(essayObserver._t);
     essayObserver._t = setTimeout(maybeInjectEssayButtons, 600);
   });
-  try { essayObserver.observe(document.body, { childList: true, subtree: true }); } catch (_) {}
+  try { essayObserver.observe(document.body, { childList: true, subtree: true }); } catch (_) { }
 }
 
 function attachLiveCapture() {
@@ -4397,20 +4424,20 @@ function positionResumeAttach(anchor) {
     if (top < 8) top = rect.bottom + 6; // flip down
     top = Math.max(8, Math.min(top, vh - btnHeight - 8));
 
-    wrap.style.top    = `${top}px`;
-    wrap.style.left   = `${left}px`;
+    wrap.style.top = `${top}px`;
+    wrap.style.left = `${left}px`;
     wrap.style.bottom = '';
-    wrap.style.right  = '';
+    wrap.style.right = '';
 
     // Tell the menu which direction to open
     const spaceBelow = vh - (top + btnHeight);
     wrap.dataset.openUp = spaceBelow < 180 ? 'true' : 'false';
   } else {
     // Fallback: always-visible corner
-    wrap.style.top    = '';
-    wrap.style.left   = '';
+    wrap.style.top = '';
+    wrap.style.left = '';
     wrap.style.bottom = '20px';
-    wrap.style.right  = '20px';
+    wrap.style.right = '20px';
     wrap.dataset.openUp = 'true'; // open upward from bottom corner
   }
 }
@@ -4568,7 +4595,7 @@ async function openResumeMenu() {
       </div>`;
     menu.querySelector('#ja-resume-open-dash')?.addEventListener('click', (e) => {
       e.preventDefault();
-      chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', hash: '#tab-profile' }).catch(() => {});
+      chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', hash: '#tab-profile' }).catch(() => { });
       closeResumeMenu();
     });
   } else {
@@ -5107,7 +5134,7 @@ function stopTeachMode() {
     document.removeEventListener('keydown', handleTeachKeydown, true);
     teachHandlerAttached = false;
   }
-  chrome.runtime.sendMessage({ type: 'TEACH_MODE_DONE' }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'TEACH_MODE_DONE' }).catch(() => { });
 }
 
 function handleTeachKeydown(e) {
@@ -5836,6 +5863,8 @@ function showAutofillBanner(savedFields) {
   if (!shouldShowUi()) return;
   if (getSiteFlag('neverPrompt')) return;
   if (!isJobFlowEligible()) return;
+  // Don't show banner if autofill is already active for this session
+  if (getSessionFlag('autofillActive')) return;
   if (!hasFillableFields()) return;
   // Don't show if user already skipped or accepted during this session
   if (getSessionFlag('autofillDismissed')) {
@@ -6070,7 +6099,7 @@ function attachRecorder() {
     console.log(`[FormPilot] Captured fields:`, fields);
 
     if (Object.keys(fields).length > 0) {
-      chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields }).catch(() => {});
+      chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields }).catch(() => { });
       // Multi-step flow: on "Next/Continue", enable session autofill but don't prompt to save
       if (effectiveStage === 'next') {
         setSessionFlag('autofillActive', true);
@@ -6345,13 +6374,13 @@ async function triggerAiMapping(elementsToMap) {
     const type = (el.type || '').toLowerCase();
     if (type === 'radio' && el.checked === false) return; // Only map selected radios or just typical text/select
     if (isSensitiveField(el) || type === 'password') return;
-    
+
     const mapped = resolveMappedKey(el);
     if (!mapped.key) {
       const label = getFieldKey(el) || getSiteLabel(el) || el.name;
       if (label) {
-         unmappedLabels.push(label);
-         if (!elMap.has(label)) elMap.set(label, el);
+        unmappedLabels.push(label);
+        if (!elMap.has(label)) elMap.set(label, el);
       }
     }
   });
@@ -6361,46 +6390,43 @@ async function triggerAiMapping(elementsToMap) {
 
   isAiMappingRunning = true;
   try {
-     const aiSettings = await chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }).then(r=>r.settings).catch(()=>null);
-     if (!aiSettings?.enabled || !aiSettings?.apiKey) return;
-     
-     console.log(`[FormPilot] Triggering AI mapping for ${uniqueLabels.length} unknown fields...`);
-     const resp = await chrome.runtime.sendMessage({ type: 'AI_MATCH_FIELDS', fieldLabels: uniqueLabels }).catch(()=>null);
-     if (resp?.ok && resp.mapping) {
-        let added = 0;
-        const newMappings = [];
-        for (const [label, matchedKey] of Object.entries(resp.mapping)) {
-           if (matchedKey && String(matchedKey).trim() && String(matchedKey).trim() !== 'null') { 
-              const el = elMap.get(label);
-              if (el) {
-                 const signature = getFieldSignature(el);
-                 const hints = buildElementHints(el);
-                 const mapping = { signature, mappedKey: matchedKey, label, type: el.type||'text', hints, confidence: 8 };
-                 newMappings.push(mapping);
-                 added++;
-              }
-           }
+    const aiSettings = await chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }).then(r => r.settings).catch(() => null);
+    if (!aiSettings?.enabled || !aiSettings?.apiKey) return;
+
+    console.log(`[FormPilot] Triggering AI mapping for ${uniqueLabels.length} unknown fields...`);
+    const resp = await chrome.runtime.sendMessage({ type: 'AI_MATCH_FIELDS', fieldLabels: uniqueLabels }).catch(() => null);
+    if (resp?.ok && resp.mapping) {
+      let added = 0;
+      const newMappings = [];
+      for (const [label, matchedKey] of Object.entries(resp.mapping)) {
+        if (matchedKey && String(matchedKey).trim() && String(matchedKey).trim() !== 'null') {
+          const el = elMap.get(label);
+          if (el) {
+            const signature = getFieldSignature(el);
+            const hints = buildElementHints(el);
+            const mapping = { signature, mappedKey: matchedKey, label, type: el.type || 'text', hints, confidence: 8 };
+            newMappings.push(mapping);
+            added++;
+          }
         }
-        if (added > 0) {
-           for (const m of newMappings) {
-              await chrome.runtime.sendMessage({ type: 'SAVE_SITE_MAPPING', hostname, mapping: m }).catch(()=>null);
-              const idx = currentSiteMappings.findIndex(map => map.signature === m.signature);
-              if (idx >= 0) currentSiteMappings[idx] = m;
-              else currentSiteMappings.push(m);
-           }
-           siteData.mappings = currentSiteMappings;
-           console.log(`[FormPilot] AI mapping complete. Learned ${added} new fields. Re-running autofill.`);
-           // Trigger fill again silently if active
-           if (getSessionFlag('autofillActive')) {
-              const mergedFields = { ...(siteData?.fields || {}), ...(sessionFlags?.fields || {}) };
-              fillFields(mergedFields, { skipObserver: true });
-           }
+      }
+      if (added > 0) {
+        for (const m of newMappings) {
+          await chrome.runtime.sendMessage({ type: 'SAVE_SITE_MAPPING', hostname, mapping: m }).catch(() => null);
+          const idx = currentSiteMappings.findIndex(map => map.signature === m.signature);
+          if (idx >= 0) currentSiteMappings[idx] = m;
+          else currentSiteMappings.push(m);
         }
-     }
-  } catch(e) {
-     console.error('[FormPilot] AI mapping failed:', e);
+        siteData.mappings = currentSiteMappings;
+        // Don't re-trigger fill here — mappings will be used on next user-initiated fill.
+        // This prevents cascading fill loops from AI mapping → fillFields → observer → re-fill.
+        console.log(`[FormPilot] AI mapping complete. Learned ${added} new fields. Will be used on next autofill.`);
+      }
+    }
+  } catch (e) {
+    console.error('[FormPilot] AI mapping failed:', e);
   } finally {
-     isAiMappingRunning = false;
+    isAiMappingRunning = false;
   }
 }
 
@@ -6414,7 +6440,7 @@ async function init() {
   try {
     resetFieldCaches();
     stopStepReapplyObserver();
-    try { chrome.runtime.sendMessage({ type: 'FRAME_HELLO' }); } catch (_) {}
+    try { chrome.runtime.sendMessage({ type: 'FRAME_HELLO' }); } catch (_) { }
 
     // Check if site is excluded (not a job portal) — bail immediately
     try {
@@ -6446,7 +6472,7 @@ async function init() {
     currentSiteKey = resp?.siteKey || hostname;
     currentSiteMappings = siteData.mappings || [];
     globalAliases = aliasResp?.aliases || globalAliases || {};
-    
+
     // 1. If explicitly blocked ("Never") OR toggled off in popup, stop completely
     currentSiteActive = !(site?.disabled || site?.enabled === false);
     if (!currentSiteActive) {
@@ -6563,7 +6589,7 @@ async function init() {
       attachLiveCapture();
       initResumeAttach();
       initAiAssistPanel();
-      
+
       const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
       const elementsToMap = collectElements(selectors);
       triggerAiMapping(elementsToMap);
@@ -6614,7 +6640,7 @@ function debouncedInit() {
   reinitTimer = setTimeout(() => {
     resetFieldCaches();
     if (isExtensionValid() && !siteExcluded) init();
-  }, 300);
+  }, 600); // 600ms to handle fast SPA transitions without double-init
 }
 
 // Initial run
@@ -6627,8 +6653,8 @@ window.addEventListener('hashchange', () => {
 });
 
 // Watch for path changes in SPAs
-let lastPath = location.pathname + location.search + location.hash;
-var navObserver = new MutationObserver(() => {
+lastPath = location.pathname + location.search + location.hash;
+navObserver = new MutationObserver(() => {
   const currentPath = location.pathname + location.search + location.hash;
   if (currentPath !== lastPath) {
     lastPath = currentPath;

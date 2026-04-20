@@ -44,6 +44,24 @@ function setStatePill(id, text, state) {
     if (state) el.classList.add(state);
 }
 
+function renderSidebarAccount() {
+    const stateEl = document.getElementById('sidebar-account-state');
+    const emailEl = document.getElementById('sidebar-account-email');
+    const logoutBtn = document.getElementById('btn-cloud-signout');
+    if (!stateEl || !emailEl || !logoutBtn) return;
+
+    if (cloudStatus.loggedIn && cloudStatus.user) {
+        stateEl.textContent = 'Signed in';
+        emailEl.textContent = cloudStatus.user.email || cloudStatus.user.displayName || 'Cloud sync active';
+        logoutBtn.hidden = false;
+        return;
+    }
+
+    stateEl.textContent = 'Local only mode';
+    emailEl.textContent = cloudStatus.configured ? 'Cloud sync when signed in' : 'Cloud sync not configured';
+    logoutBtn.hidden = true;
+}
+
 function resolveTheme(pref) {
     if (pref === 'dark' || pref === 'light') return pref;
     const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -254,6 +272,7 @@ async function loadAllData() {
             user: authStatus?.user || null,
             lastSync: authStatus?.lastSync || null,
         };
+        renderSidebarAccount();
         // Allow local-only usage without login
         document.getElementById('dashboard-auth-shield').style.display = 'none';
         document.getElementById('main-dashboard-app').style.display = 'flex';

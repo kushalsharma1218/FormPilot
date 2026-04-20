@@ -1,44 +1,67 @@
-# FormPilot AI — Elegant Application Copilot 🚀
+# FormPilot AI
 
-A powerful, privacy-first Chrome Extension that automates job applications and complex forms using local data and AI-powered intelligence.
+Chrome extension for job-form autofill, profile capture, resume handling, task tracking, and AI-assisted application workflows.
 
-## 🚀 Key Features
+## Active App Layout
 
-- **🤖 AI Job Copilot**:
-    - **Resume Parsing**: Upload your PDF/TXT resume and let AI extract your profile automatically.
-    - **Match Scoring**: Get an instant score on how well your profile matches a specific job description.
-    - **Cover Letter Generator**: Generate tailored, professional cover letters based on the job requirements.
-    - **Interview Prep**: Get custom behavioral and technical interview questions based on your experience and the job role.
-- **🌍 Global Profile**: Store your master personal data (Name, Email, LinkedIn, etc.) once and use it across ALL job portals.
-- **✨ Smart Autofill**: Remembers your inputs and cleanly autofills them when you visit other applications, saving you hours of work.
-- **📊 Application Tracker**: Automatically track your submitted applications, update statuses, and set follow-up reminders.
-- **🛡️ Privacy First**: All your personal data is stored **locally** on your device. You keep control of your data and your API keys.
-- **🧩 Advanced Field Detection**: Robust heuristics to identify fields on complex ATS platforms like Greenhouse, Workday, Lever, and more.
+Load the unpacked extension from the repository root:
 
-## 🛠️ Installation
+`/Users/Kushal.Sharma1/.gemini/antigravity/playground/Side project/Job-Auto-Fill-New`
 
-1. Clone or download this repository to your local machine.
-2. Open Chrome and navigate to `chrome://extensions/`.
-3. Toggle **Developer mode** ON in the top right corner.
-4. Click **Load unpacked** and select the top-level directory of this project.
-5. Pin the extension to your toolbar for easy access!
+The active code lives here:
 
-## 💡 Usage
+- `manifest.json`: extension entry point
+- `background.js`: service worker and storage orchestration
+- `content.js`: page detection, autofill, learning, overlays
+- `popup/`: browser action popup
+- `dashboard/`: full dashboard UI
+- `options/`: extension options page
+- `lib/`: shared storage and field utilities
+- `assets/`, `icons/`: static assets
+- `dev/`: local test pages and fixtures for manual QA
+- `tests/`: automated Node-based tests
+- `backend/`: optional Node backend for AI parsing flows
 
-### 1. Set Up Your Profile
-Click the extension icon and select **Settings** or **Profile**. Upload your resume to auto-populate your details, or fill them in manually.
+## Legacy And Archive Layout
 
-### 2. Configure AI (Optional but Recommended)
-In the **Settings** tab, enter your Google Gemini API Key. This enables the AI Copilot features like match scoring and cover letter generation.
+Old or superseded code is isolated so the active extension root stays clean:
 
-### 3. Apply with Confidence
-Navigate to any job posting. The **AI Copilot** will show up in your extension popup to help you evaluate the role and prepare your application!
+- `legacy/extensions/job-autofill-v1/`: older extension copy kept for reference
+- `legacy/debug/`: archived scratch files and debug artifacts
+- `dev/fixtures/`: local resume fixtures used for manual testing
 
-## 💻 Tech Stack
-* **Frontend**: HTML5, CSS3 (Vanilla), JavaScript (ES6+)
-* **Extension**: Chrome Extension API (Manifest V3)
-* **Backend (AI Parsing)**: Node.js, Express, pdf-parse, Google Gemini AI
-* **Storage**: `chrome.storage.local`
+Nothing under `legacy/` is used by the current extension runtime.
 
----
-*Built for job seekers who want to work smarter, not harder.*
+## Common Commands
+
+From the repo root:
+
+```bash
+npm test
+```
+
+Run the real-site e2e helper:
+
+```bash
+npm run e2e:real
+```
+
+From `backend/`:
+
+```bash
+npm test
+node index.js
+```
+
+## Local Setup
+
+1. Open `chrome://extensions/`
+2. Turn on Developer Mode
+3. Click `Load unpacked`
+4. Select `/Users/Kushal.Sharma1/.gemini/antigravity/playground/Side project/Job-Auto-Fill-New`
+
+## Notes
+
+- `config.private.js` is local-only runtime config.
+- `manifest.key` stays out of git and should remain private.
+- Keep new experiments inside `dev/`, `tests/`, or `legacy/` instead of the repo root.

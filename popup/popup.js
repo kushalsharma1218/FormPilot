@@ -24,6 +24,20 @@ function withTimeout(promise, ms, fallback = null) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
+function renderCloudAccount(authStatus) {
+  const strip = document.getElementById('account-strip');
+  const emailEl = document.getElementById('account-email');
+  if (!strip || !emailEl) return;
+  const loggedIn = !!authStatus?.loggedIn;
+  strip.hidden = !loggedIn;
+  if (!loggedIn) {
+    emailEl.textContent = '';
+    return;
+  }
+  const user = authStatus?.user || {};
+  emailEl.textContent = user.email || user.displayName || 'Signed in';
+}
+
 // ── Utilities ──────────────────────────────────────────────────
 function escHtml(str) {
   if (str == null) return '';
@@ -319,6 +333,7 @@ async function init() {
       5000,
       null
     );
+    renderCloudAccount(authStatus);
     if (!authStatus) {
       const errEl = document.getElementById('auth-error-msg');
       if (errEl) {
@@ -674,6 +689,7 @@ function setupAuthListeners() {
   const btnGoogle = document.getElementById('btn-auth-google');
   const btnEmail = document.getElementById('btn-auth-signin');
   const msg = document.getElementById('auth-error-msg');
+  const btnSignOut = document.getElementById('btn-auth-signout');
 
   document.getElementById('auth-link-setup').addEventListener('click', (e) => {
     e.preventDefault();
@@ -762,11 +778,31 @@ function setupAuthListeners() {
       }
     });
   }
+
+  if (btnSignOut) {
+    btnSignOut.addEventListener('click', async () => {
+      btnSignOut.disabled = true;
+      try {
+        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
+        if (!resp?.ok) {
+          showToast(resp?.error || 'Logout failed', 'error');
+          return;
+        }
+        renderCloudAccount({ loggedIn: false });
+        showToast('Logged out. Local data stays on this device.', 'success');
+      } catch (err) {
+        showToast(err.message || 'Logout failed', 'error');
+      } finally {
+        btnSignOut.disabled = false;
+      }
+    });
+  }
 }
 
 // ── Kickoff ────────────────────────────────────────────────────
 initTheme();
 initPopupDrag();
+setupAuthListeners();
 const themeBtn = document.getElementById('btn-theme-toggle');
 if (themeBtn) themeBtn.addEventListener('click', () => { cycleTheme(); });
 init();
