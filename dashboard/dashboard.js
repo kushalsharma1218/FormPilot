@@ -28,11 +28,26 @@ function escHtml(str) {
     return d.innerHTML;
 }
 
+// escHtml escapes & < > but NOT quotes, so it is unsafe inside an attribute value.
+// Anything interpolated into an attribute must go through escAttr.
+function escAttr(str) {
+    return String(str == null ? '' : str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Job URLs are scraped from arbitrary pages: reject javascript:/data:/vbscript:
+// rather than rendering them into an href in the extension's own origin.
 function normalizeUrl(url) {
     const raw = (url || '').trim();
     if (!raw) return '';
+    if (/^\s*(javascript|data|vbscript|file|blob):/i.test(raw)) return '';
     if (/^(https?:)?\/\//i.test(raw)) return raw;
     if (/^(mailto:|tel:)/i.test(raw)) return raw;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return ''; // any other unknown scheme
     return 'https://' + raw;
 }
 
@@ -72,7 +87,7 @@ function applyTheme(pref) {
     themePreference = pref || 'system';
     const resolved = resolveTheme(themePreference);
     document.documentElement.dataset.theme = resolved;
-    document.querySelectorAll('.theme-btn').forEach(btn => {
+    document.querySelectorAll('#theme-toggle .theme-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.theme === themePreference);
     });
 }
@@ -95,13 +110,51 @@ async function initTheme() {
 }
 
 function bindThemeToggle() {
-    document.querySelectorAll('.theme-btn').forEach(btn => {
+    document.querySelectorAll('#theme-toggle .theme-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const pref = btn.dataset.theme || 'system';
             applyTheme(pref);
             try {
                 await chrome.storage.local.set({ [THEME_KEY]: pref });
-            } catch (_) {}
+            } catch (_) { }
+        });
+    });
+}
+
+// ── Autofill Mode (local-only vs. require sign-in) ─────────────
+function renderAutofillMode(requireSignIn) {
+    document.querySelectorAll('#autofill-mode-toggle .theme-btn').forEach(btn => {
+        btn.classList.toggle('active', (btn.dataset.requireSignin === 'true') === requireSignIn);
+    });
+}
+
+async function initAutofillMode() {
+    const toggle = document.getElementById('autofill-mode-toggle');
+    if (!toggle) return;
+    let requireSignIn = false;
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'GET_EXT_SETTINGS' });
+        requireSignIn = resp?.settings?.requireSignIn === true;
+    } catch (_) { }
+    renderAutofillMode(requireSignIn);
+
+    toggle.querySelectorAll('.theme-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const next = btn.dataset.requireSignin === 'true';
+            renderAutofillMode(next);
+            try {
+                const resp = await chrome.runtime.sendMessage({
+                    type: 'SAVE_EXT_SETTINGS',
+                    settings: { requireSignIn: next },
+                });
+                if (!resp?.ok) throw new Error(resp?.error || 'Save failed');
+                showToast(next
+                    ? 'Autofill now requires sign-in.'
+                    : 'Autofill works offline in local-only mode.', 'success');
+            } catch (err) {
+                renderAutofillMode(!next);
+                showToast('Could not save autofill mode.', 'error');
+            }
         });
     });
 }
@@ -220,11 +273,11 @@ function showConfirmModal(title, message, onConfirm) {
     document.getElementById('confirm-modal').hidden = false;
     confirmCallback = onConfirm;
 }
-bindEvent('modal-cancel','click', () => {
+bindEvent('modal-cancel', 'click', () => {
     document.getElementById('confirm-modal').hidden = true;
     confirmCallback = null;
 });
-bindEvent('modal-confirm','click', async () => {
+bindEvent('modal-confirm', 'click', async () => {
     document.getElementById('confirm-modal').hidden = true;
     if (confirmCallback) await confirmCallback();
     confirmCallback = null;
@@ -258,7 +311,7 @@ document.querySelectorAll('.nav-item').forEach(btn => {
     });
 });
 
-bindEvent('btn-view-all-apps','click', () => {
+bindEvent('btn-view-all-apps', 'click', () => {
     document.querySelector('[data-tab="tracker"]').click();
 });
 
@@ -273,9 +326,14 @@ async function loadAllData() {
             lastSync: authStatus?.lastSync || null,
         };
         renderSidebarAccount();
-        // Allow local-only usage without login
-        document.getElementById('dashboard-auth-shield').style.display = 'none';
-        document.getElementById('main-dashboard-app').style.display = 'flex';
+        if (cloudStatus.loggedIn) {
+            document.getElementById('dashboard-auth-shield').style.display = 'none';
+            document.getElementById('main-dashboard-app').style.display = 'flex';
+        } else {
+            document.getElementById('dashboard-auth-shield').style.display = 'flex';
+            document.getElementById('main-dashboard-app').style.display = 'none';
+            return; // Stop loading data if not logged in
+        }
 
         const [dataResp, profileResp, aiResp, appsResp, tasksResp, metricsResp] = await Promise.all([
             chrome.runtime.sendMessage({ type: 'GET_ALL_DATA' }),
@@ -346,7 +404,7 @@ function renderOverview() {
         list.innerHTML = applications.slice(0, 5).map(app => `
             <div class="recent-site-item">
                 <div class="recent-site-info">
-                    <div class="site-favicon">${getInitials(app.companyName)}</div>
+                    <div class="site-favicon">${escHtml(getInitials(app.companyName))}</div>
                     <div>
                         <div class="recent-site-name">${escHtml(app.companyName)}</div>
                         <div class="recent-site-fields">${escHtml(app.jobTitle || 'Untitled')} · ${relativeDate(app.appliedAt)}</div>
@@ -473,10 +531,10 @@ function renderSites(filter = '') {
         const quality = getSiteQuality(site);
         const qualityBadge = quality !== null ? `<span class="site-quality-badge ${getQualityClass(quality)}">Quality ${quality}</span>` : '';
         return `
-        <div class="site-card" data-hostname="${hostname}">
-            <div class="site-card-header" data-toggle="${hostname}">
+        <div class="site-card" data-hostname="${escAttr(hostname)}">
+            <div class="site-card-header" data-toggle="${escAttr(hostname)}">
                 <div class="site-card-left">
-                    <div class="site-favicon">${getInitials(hostname)}</div>
+                    <div class="site-favicon">${escHtml(getInitials(hostname))}</div>
                     <div>
                         <div class="site-card-name">${escHtml(hostname)}</div>
                         <div class="site-card-meta">${fields.length} field(s)</div>
@@ -488,13 +546,13 @@ function renderSites(filter = '') {
                     <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
                 </div>
             </div>
-            <div class="site-card-body" id="body-${hostname}">
+            <div class="site-card-body" id="body-${escAttr(hostname)}">
                 <div class="site-fields-grid">
                     ${fields.map(([k, v]) => `
                         <div class="site-field-row">
-                            <span class="site-field-key" title="${escHtml(k)}">${escHtml(k)}</span>
-                            <input class="site-field-value" data-hostname="${hostname}" data-key="${escHtml(k)}" value="${escHtml(v)}" />
-                            <button class="btn-field-delete" data-hostname="${hostname}" data-key="${k}" title="Delete field">
+                            <span class="site-field-key" title="${escAttr(k)}">${escHtml(k)}</span>
+                            <input class="site-field-value" data-hostname="${escAttr(hostname)}" data-key="${escAttr(k)}" value="${escAttr(v)}" />
+                            <button class="btn-field-delete" data-hostname="${escAttr(hostname)}" data-key="${escAttr(k)}" title="Delete field">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                             </button>
                         </div>
@@ -502,8 +560,8 @@ function renderSites(filter = '') {
                     ${fields.length === 0 ? '<div class="empty-state" style="padding:20px">No fields saved</div>' : ''}
                 </div>
                 <div style="display:flex;gap:8px;margin-top:14px;">
-                    <button class="btn btn-danger btn-sm" data-action="clear" data-hostname="${hostname}">Clear Data</button>
-                    <button class="btn btn-danger btn-sm" data-action="disable" data-hostname="${hostname}">${site.disabled ? 'Re-enable' : 'Disable Site'}</button>
+                    <button class="btn btn-danger btn-sm" data-action="clear" data-hostname="${escAttr(hostname)}">Clear Data</button>
+                    <button class="btn btn-danger btn-sm" data-action="disable" data-hostname="${escAttr(hostname)}">${site.disabled ? 'Re-enable' : 'Disable Site'}</button>
                 </div>
             </div>
         </div>`;
@@ -565,7 +623,7 @@ function attachSiteListeners() {
             const hostname = btn.dataset.hostname;
             const site = allData.sites[hostname];
             if (site?.disabled) {
-                await chrome.runtime.sendMessage({ type: 'SET_ENABLED', hostname, enabled: false, clearDisabled: true });
+                await chrome.runtime.sendMessage({ type: 'SET_ENABLED', hostname, enabled: true, clearDisabled: true });
                 site.disabled = false;
             } else {
                 await chrome.runtime.sendMessage({ type: 'DISABLE_SITE', hostname });
@@ -578,7 +636,7 @@ function attachSiteListeners() {
     });
 }
 
-bindEvent('site-search','input', (e) => {
+bindEvent('site-search', 'input', (e) => {
     renderSites(e.target.value);
 });
 
@@ -626,8 +684,8 @@ function addSkill() {
     input.focus();
 }
 
-bindEvent('btn-add-skill','click', addSkill);
-bindEvent('skill-input','keydown', e => {
+bindEvent('btn-add-skill', 'click', addSkill);
+bindEvent('skill-input', 'keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); addSkill(); }
 });
 
@@ -646,15 +704,15 @@ function renderWorkHistory() {
                 <button class="btn btn-danger btn-sm" data-remove-work="${i}">Remove</button>
             </div>
             <div class="form-grid">
-                <div class="form-group"><label>Company</label><input type="text" data-wf="company" data-wi="${i}" value="${escHtml(w.company || '')}"></div>
-                <div class="form-group"><label>Title</label><input type="text" data-wf="title" data-wi="${i}" value="${escHtml(w.title || '')}"></div>
-                <div class="form-group"><label>Location</label><input type="text" data-wf="location" data-wi="${i}" value="${escHtml(w.location || '')}"></div>
-                <div class="form-group"><label>Start Date</label><input type="text" data-wf="startDate" data-wi="${i}" value="${escHtml(w.startDate || '')}"></div>
-                <div class="form-group"><label>End Date</label><input type="text" data-wf="endDate" data-wi="${i}" value="${escHtml(w.endDate || '')}"></div>
+                <div class="form-group"><label>Company</label><input type="text" data-wf="company" data-wi="${i}" value="${escAttr(w.company || '')}"></div>
+                <div class="form-group"><label>Title</label><input type="text" data-wf="title" data-wi="${i}" value="${escAttr(w.title || '')}"></div>
+                <div class="form-group"><label>Location</label><input type="text" data-wf="location" data-wi="${i}" value="${escAttr(w.location || '')}"></div>
+                <div class="form-group"><label>Start Date</label><input type="text" data-wf="startDate" data-wi="${i}" value="${escAttr(w.startDate || '')}"></div>
+                <div class="form-group"><label>End Date</label><input type="text" data-wf="endDate" data-wi="${i}" value="${escAttr(w.endDate || '')}"></div>
             </div>
             <div class="work-bullets">
                 <label>Achievements (one per line)</label>
-                <textarea data-wf="bullets" data-wi="${i}">${(w.bullets || []).join('\n')}</textarea>
+                <textarea data-wf="bullets" data-wi="${i}">${escHtml((w.bullets || []).join('\n'))}</textarea>
             </div>
         </div>
     `).join('');
@@ -667,7 +725,7 @@ function renderWorkHistory() {
     });
 }
 
-bindEvent('btn-add-work','click', () => {
+bindEvent('btn-add-work', 'click', () => {
     if (!globalProfile.workHistory) globalProfile.workHistory = [];
     globalProfile.workHistory.push({ company: '', title: '', location: '', startDate: '', endDate: '', bullets: [] });
     renderWorkHistory();
@@ -688,11 +746,11 @@ function renderEducation() {
                 <button class="btn btn-danger btn-sm" data-remove-edu="${i}">Remove</button>
             </div>
             <div class="form-grid">
-                <div class="form-group"><label>School</label><input type="text" data-ef="school" data-ei="${i}" value="${escHtml(e.school || '')}"></div>
-                <div class="form-group"><label>Degree</label><input type="text" data-ef="degree" data-ei="${i}" value="${escHtml(e.degree || '')}"></div>
-                <div class="form-group"><label>Field of Study</label><input type="text" data-ef="field" data-ei="${i}" value="${escHtml(e.field || '')}"></div>
-                <div class="form-group"><label>End Date</label><input type="text" data-ef="endDate" data-ei="${i}" value="${escHtml(e.endDate || '')}"></div>
-                <div class="form-group"><label>GPA</label><input type="text" data-ef="gpa" data-ei="${i}" value="${escHtml(e.gpa || '')}"></div>
+                <div class="form-group"><label>School</label><input type="text" data-ef="school" data-ei="${i}" value="${escAttr(e.school || '')}"></div>
+                <div class="form-group"><label>Degree</label><input type="text" data-ef="degree" data-ei="${i}" value="${escAttr(e.degree || '')}"></div>
+                <div class="form-group"><label>Field of Study</label><input type="text" data-ef="field" data-ei="${i}" value="${escAttr(e.field || '')}"></div>
+                <div class="form-group"><label>End Date</label><input type="text" data-ef="endDate" data-ei="${i}" value="${escAttr(e.endDate || '')}"></div>
+                <div class="form-group"><label>GPA</label><input type="text" data-ef="gpa" data-ei="${i}" value="${escAttr(e.gpa || '')}"></div>
             </div>
         </div>
     `).join('');
@@ -704,14 +762,14 @@ function renderEducation() {
     });
 }
 
-bindEvent('btn-add-edu','click', () => {
+bindEvent('btn-add-edu', 'click', () => {
     if (!globalProfile.education) globalProfile.education = [];
     globalProfile.education.push({ school: '', degree: '', field: '', endDate: '', gpa: '' });
     renderEducation();
 });
 
 // Save Profile
-bindEvent('profile-form','submit', async (e) => {
+bindEvent('profile-form', 'submit', async (e) => {
     e.preventDefault();
     // Collect basic fields from form
     const basicFields = ['firstName', 'lastName', 'email', 'phone', 'linkedin', 'github', 'portfolio', 'address', 'city', 'state', 'zipcode', 'currentCompany', 'currentTitle', 'totalYearsExperience', 'summary'];
@@ -775,14 +833,14 @@ function renderResumeVault() {
         const label = item.label ? `<span class="resume-pill">${escHtml(item.label)}</span>` : '';
         const def = isDefault ? `<span class="resume-pill default">Default</span>` : '';
         return `
-        <div class="resume-vault-item" data-resume-id="${item.id}">
+        <div class="resume-vault-item" data-resume-id="${escAttr(item.id)}">
             <div class="resume-vault-meta">
                 <div class="resume-vault-name">${escHtml(item.name || 'Resume')}</div>
                 <div class="resume-vault-sub">${formatBytes(item.size)} · ${item.mime || 'file'} · ${relativeDate(item.updatedAt)}</div>
                 <div class="resume-vault-sub">${label} ${def}</div>
             </div>
             <div class="resume-vault-actions-row">
-                <input class="resume-label-input" placeholder="Label (e.g., ATS)" value="${escHtml(item.label || '')}" />
+                <input class="resume-label-input" placeholder="Label (e.g., ATS)" value="${escAttr(item.label || '')}" />
                 ${isDefault ? '' : `<button class="btn btn-secondary btn-sm btn-resume-default">Set Default</button>`}
                 <button class="btn btn-danger btn-sm btn-resume-delete">Delete</button>
             </div>
@@ -869,10 +927,10 @@ if (resumeVaultBtn && resumeVaultInput) {
 }
 
 // ── Resume Parsing ─────────────────────────────────────────────
-bindEvent('btn-upload-resume','click', () => {
+bindEvent('btn-upload-resume', 'click', () => {
     document.getElementById('resume-file-input').click();
 });
-bindEvent('resume-file-input','change', async (e) => {
+bindEvent('resume-file-input', 'change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
 
@@ -958,7 +1016,7 @@ bindEvent('resume-file-input','change', async (e) => {
     e.target.value = '';
 });
 
-bindEvent('btn-parse-resume','click', async () => {
+bindEvent('btn-parse-resume', 'click', async () => {
     const text = document.getElementById('resume-text').value.trim();
     if (!text) { showToast('Please paste or upload your resume text first', 'error'); return; }
 
@@ -1098,13 +1156,13 @@ function renderTrackerList(filtered) {
             🤖 ${msLabel}
           </div>`;
         const linkIcon = app.url
-            ? `<a class="app-link-icon" href="${normalizeUrl(app.url)}" target="_blank" title="Open job link">↗</a>`
+            ? `<a class="app-link-icon" href="${escAttr(normalizeUrl(app.url))}" target="_blank" title="Open job link">↗</a>`
             : '';
         return `
-        <div class="app-card" data-app-id="${app.id}">
-            <div class="app-card-header" data-apptoggle="${app.id}">
+        <div class="app-card" data-app-id="${escAttr(app.id)}">
+            <div class="app-card-header" data-apptoggle="${escAttr(app.id)}">
                 <div class="app-card-left">
-                    <div class="app-card-icon">${getInitials(app.companyName)}</div>
+                    <div class="app-card-icon">${escHtml(getInitials(app.companyName))}</div>
                     <div class="app-card-info">
                         <div class="app-card-company">${escHtml(app.companyName)}</div>
                         <div class="app-card-title">${escHtml(app.jobTitle || 'Untitled Role')}</div>
@@ -1118,7 +1176,7 @@ function renderTrackerList(filtered) {
                     <svg class="chevron-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
                 </div>
             </div>
-            <div class="app-card-body" id="appbody-${app.id}">
+            <div class="app-card-body" id="appbody-${escAttr(app.id)}">
                 <div class="app-detail-grid">
                     <div class="app-detail-item">
                         <span class="app-detail-label">Location</span>
@@ -1130,10 +1188,10 @@ function renderTrackerList(filtered) {
                     </div>
                     <div class="app-detail-item">
                         <span class="app-detail-label">Status</span>
-                        <select class="app-status-select" data-appstatus="${app.id}">
+                        <select class="app-status-select" data-appstatus="${escAttr(app.id)}">
                             ${TRACKER_STATUSES.map(s =>
-        `<option value="${s}" ${s === app.status ? 'selected' : ''}>${s}</option>`
-    ).join('')}
+            `<option value="${s}" ${s === app.status ? 'selected' : ''}>${s}</option>`
+        ).join('')}
                         </select>
                     </div>
                     ${hasMatch ? `
@@ -1143,18 +1201,18 @@ function renderTrackerList(filtered) {
                             ${ms}/100 &mdash; ${app.matchDetails?.recommendation ? escHtml(app.matchDetails.recommendation.substring(0, 60)) : ''}
                         </span>
                     </div>` : ''}
-                    ${app.url ? `<div class="app-detail-item"><span class="app-detail-label">URL</span><a href="${normalizeUrl(app.url)}" target="_blank" class="app-link-icon" style="border:none;padding:0;">Open →</a></div>` : ''}
+                    ${app.url ? `<div class="app-detail-item"><span class="app-detail-label">URL</span><a href="${escAttr(normalizeUrl(app.url))}" target="_blank" class="app-link-icon" style="border:none;padding:0;">Open →</a></div>` : ''}
                 </div>
                 <div class="app-notes-area">
                     <label>Notes</label>
-                    <textarea data-appnotes="${app.id}" placeholder="Add personal notes...">${escHtml(app.notes || '')}</textarea>
+                    <textarea data-appnotes="${escAttr(app.id)}" placeholder="Add personal notes...">${escHtml(app.notes || '')}</textarea>
                 </div>
                 <div class="app-card-actions-row">
-                    <button class="btn btn-secondary btn-sm" data-action="rematch" data-app-id="${app.id}" title="Re-run AI match score">🤖 Re-match</button>
-                    <button class="btn btn-secondary btn-sm" data-action="interview" data-app-id="${app.id}">💬 Interview Prep</button>
-                    <button class="btn btn-secondary btn-sm" data-action="followup" data-app-id="${app.id}">📧 Follow-up</button>
-                    <button class="btn btn-secondary btn-sm" data-action="tailor" data-app-id="${app.id}">📄 Tailor Resume</button>
-                    <button class="btn btn-danger btn-sm" data-action="deleteapp" data-app-id="${app.id}">🗑 Delete</button>
+                    <button class="btn btn-secondary btn-sm" data-action="rematch" data-app-id="${escAttr(app.id)}" title="Re-run AI match score">🤖 Re-match</button>
+                    <button class="btn btn-secondary btn-sm" data-action="interview" data-app-id="${escAttr(app.id)}">💬 Interview Prep</button>
+                    <button class="btn btn-secondary btn-sm" data-action="followup" data-app-id="${escAttr(app.id)}">📧 Follow-up</button>
+                    <button class="btn btn-secondary btn-sm" data-action="tailor" data-app-id="${escAttr(app.id)}">📄 Tailor Resume</button>
+                    <button class="btn btn-danger btn-sm" data-action="deleteapp" data-app-id="${escAttr(app.id)}">🗑 Delete</button>
                 </div>
             </div>
         </div>`;
@@ -1187,16 +1245,16 @@ function renderTrackerBoard(filtered) {
                 ? `<span style="font-size:10px;font-weight:700;color:${msColor};background:${msColor}15;border-radius:12px;padding:2px 6px;border:1px solid ${msColor}33;">🤖 ${ms}%</span>`
                 : '';
             return `
-              <div class="kanban-card" data-app-id="${app.id}">
+              <div class="kanban-card" data-app-id="${escAttr(app.id)}">
                 <div class="kanban-card-header">
                   <div class="kanban-card-title">${escHtml(app.companyName)}</div>
-                  <span class="kanban-drag" draggable="true" data-app-id="${app.id}" title="Drag to move">⋮⋮</span>
+                  <span class="kanban-drag" draggable="true" data-app-id="${escAttr(app.id)}" title="Drag to move">⋮⋮</span>
                 </div>
                 <div class="kanban-card-role">${escHtml(app.jobTitle || 'Untitled Role')}</div>
                 <div class="kanban-card-meta">
                   <span>${relativeDate(app.appliedAt)}</span>
                   ${matchBadge}
-                  ${app.url ? `<a class="kanban-card-link" href="${normalizeUrl(app.url)}" target="_blank">Open</a>` : ''}
+                  ${app.url ? `<a class="kanban-card-link" href="${escAttr(normalizeUrl(app.url))}" target="_blank">Open</a>` : ''}
                 </div>
               </div>
             `;
@@ -1637,11 +1695,11 @@ function renderTaskBoard(filtered) {
             const progressBadge = isEpic && children.length
                 ? `<span class="task-badge ${doneCount === children.length ? 'low' : 'medium'}">${doneCount}/${children.length} done</span>`
                 : '';
-            const dragHandle = isEpic ? '' : `<span class="kanban-drag" draggable="true" data-task-id="${task.id}" title="Drag to move">⋮⋮</span>`;
+            const dragHandle = isEpic ? '' : `<span class="kanban-drag" draggable="true" data-task-id="${escAttr(task.id)}" title="Drag to move">⋮⋮</span>`;
             const descText = task.description ? task.description.slice(0, 140) : '';
             const descLine = descText ? `<div class="task-desc">${escHtml(descText)}${task.description.length > 140 ? '…' : ''}</div>` : '';
             return `
-              <div class="task-card ${overdue ? 'overdue' : ''}" data-task-id="${task.id}">
+              <div class="task-card ${overdue ? 'overdue' : ''}" data-task-id="${escAttr(task.id)}">
                 <div class="task-card-header">
                   <div class="task-title">${escHtml(task.title)}</div>
                   ${dragHandle}
@@ -1690,22 +1748,22 @@ function renderTaskList(filtered) {
             ? `<div class="task-desc">Epic · ${doneCount}/${children.length} done</div>`
             : (parentEpic ? `<div class="task-desc">Epic: ${escHtml(parentEpic.title)}</div>` : '');
         return `
-          <div class="task-list-row ${overdue ? 'overdue' : ''}" data-task-id="${task.id}">
+          <div class="task-list-row ${overdue ? 'overdue' : ''}" data-task-id="${escAttr(task.id)}">
             <div>
               <strong>${escHtml(task.title)}</strong>
               <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">${escHtml(task.description || '—')}</div>
               ${epicLine}
             </div>
-            <input type="date" data-task-due="${task.id}" value="${task.dueDate || ''}" />
-            <select data-task-priority="${task.id}">
+            <input type="date" data-task-due="${escAttr(task.id)}" value="${escAttr(task.dueDate || '')}" />
+            <select data-task-priority="${escAttr(task.id)}">
               <option value="low" ${task.priority === 'low' ? 'selected' : ''}>Low</option>
               <option value="medium" ${task.priority === 'medium' ? 'selected' : ''}>Medium</option>
               <option value="high" ${task.priority === 'high' ? 'selected' : ''}>High</option>
             </select>
-            <select data-task-status="${task.id}">
+            <select data-task-status="${escAttr(task.id)}">
               ${TASK_STATUSES.map(s => `<option value="${s}" ${s === task.status ? 'selected' : ''}>${taskStatusLabel(s)}</option>`).join('')}
             </select>
-            <button class="btn btn-secondary btn-sm" data-task-edit="${task.id}">Edit</button>
+            <button class="btn btn-secondary btn-sm" data-task-edit="${escAttr(task.id)}">Edit</button>
           </div>
         `;
     }).join('');
@@ -1806,6 +1864,85 @@ function attachTaskListListeners() {
             const statusSel = row.querySelector('[data-task-status]');
             if (statusSel) statusSel.disabled = true;
         }
+    });
+}
+
+// ── Sync Security (E2EE) ──────────────────────────────────────
+async function updateSyncSecurityUI() {
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'GET_SYNC_STATUS' });
+        const setupContainer = document.getElementById('sync-setup-container');
+        const activeContainer = document.getElementById('sync-active-container');
+        const badge = document.getElementById('sync-security-badge');
+
+        if (resp.ok && resp.hasSyncKey) {
+            setupContainer.hidden = true;
+            activeContainer.hidden = false;
+            badge.hidden = false;
+        } else {
+            setupContainer.hidden = false;
+            activeContainer.hidden = true;
+            badge.hidden = true;
+        }
+    } catch (err) {
+        console.warn('[Security] Failed to update sync status:', err);
+    }
+}
+
+function bindSecurityControls() {
+    const btnSet = document.getElementById('btn-set-sync-passphrase');
+    const btnChange = document.getElementById('btn-change-sync-passphrase');
+    const passInput = document.getElementById('sync-passphrase');
+    const confirmInput = document.getElementById('sync-passphrase-confirm');
+
+    btnSet?.addEventListener('click', async () => {
+        const pass = passInput.value;
+        const confirm = confirmInput.value;
+
+        if (pass.length < 8) {
+            showToast('Passphrase must be at least 8 characters.', 'error');
+            return;
+        }
+
+        if (pass !== confirm) {
+            showToast('Passphrases do not match.', 'error');
+            return;
+        }
+
+        btnSet.disabled = true;
+        btnSet.textContent = 'Deriving Key...';
+
+        try {
+            const resp = await chrome.runtime.sendMessage({ type: 'SET_SYNC_PASSPHRASE', passphrase: pass });
+            if (resp.ok) {
+                showToast(resp.firstTime
+                    ? 'End-to-End Encryption activated!'
+                    : 'Passphrase accepted — sync unlocked.', 'success');
+                passInput.value = '';
+                confirmInput.value = '';
+                updateSyncSecurityUI();
+                if (resp.firstTime) {
+                    // Only on first activation: encrypt what is already stored.
+                    // On a later unlock, pushing local state could clobber newer cloud data.
+                    chrome.runtime.sendMessage({ type: 'CLOUD_PUSH' });
+                } else {
+                    chrome.runtime.sendMessage({ type: 'CLOUD_PULL' });
+                }
+            } else {
+                showToast(resp.error || 'Failed to set passphrase.', 'error');
+            }
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btnSet.disabled = false;
+            btnSet.textContent = 'Activate Encryption';
+        }
+    });
+
+    btnChange?.addEventListener('click', () => {
+        document.getElementById('sync-setup-container').hidden = false;
+        document.getElementById('sync-active-container').hidden = true;
+        passInput.focus();
     });
 }
 
@@ -1947,13 +2084,13 @@ function bindTaskModal() {
 }
 
 // Add Application Modal
-bindEvent('btn-add-application','click', () => {
+bindEvent('btn-add-application', 'click', () => {
     document.getElementById('add-app-modal').hidden = false;
 });
-bindEvent('add-app-cancel','click', () => {
+bindEvent('add-app-cancel', 'click', () => {
     document.getElementById('add-app-modal').hidden = true;
 });
-bindEvent('add-app-save','click', async () => {
+bindEvent('add-app-save', 'click', async () => {
     const rawUrl = document.getElementById('app-url').value.trim();
     const app = {
         companyName: document.getElementById('app-company').value.trim(),
@@ -1987,12 +2124,12 @@ function renderInterviewAppSelect() {
         ).join('');
 }
 
-bindEvent('interview-app-select','change', (e) => {
+bindEvent('interview-app-select', 'change', (e) => {
     const app = applications.find(a => a.id === e.target.value);
     if (app) document.getElementById('interview-jd-input').value = app.jobDescription || '';
 });
 
-bindEvent('btn-generate-interview','click', async () => {
+bindEvent('btn-generate-interview', 'click', async () => {
     const jd = document.getElementById('interview-jd-input').value.trim();
     if (!jd) { showToast('Please select an application or paste a job description', 'error'); return; }
     const btn = document.getElementById('btn-generate-interview');
@@ -2139,16 +2276,16 @@ async function checkBuiltInAIStatus() {
     }
 }
 
-bindEvent('ai-provider','change', (e) => {
+bindEvent('ai-provider', 'change', (e) => {
     updateProviderUI(e.target.value);
 });
 
-bindEvent('btn-toggle-key','click', () => {
+bindEvent('btn-toggle-key', 'click', () => {
     const input = document.getElementById('ai-api-key');
     input.type = input.type === 'password' ? 'text' : 'password';
 });
 
-bindEvent('btn-save-ai','click', async () => {
+bindEvent('btn-save-ai', 'click', async () => {
     const provider = document.getElementById('ai-provider').value;
     const isBuiltIn = provider === 'built-in';
     const settings = {
@@ -2167,7 +2304,7 @@ bindEvent('btn-save-ai','click', async () => {
     setTimeout(() => { msg.className = 'status-msg'; }, 3000);
 });
 
-bindEvent('btn-test-ai','click', async () => {
+bindEvent('btn-test-ai', 'click', async () => {
     const btn = document.getElementById('btn-test-ai');
     const msg = document.getElementById('ai-status-msg');
     const provider = document.getElementById('ai-provider').value;
@@ -2215,12 +2352,12 @@ function renderDisabledSites() {
     list.innerHTML = disabled.map(([hostname]) => `
         <div class="disabled-site-item">
             <span class="disabled-site-name">${escHtml(hostname)}</span>
-            <button class="btn btn-secondary btn-sm" data-reenable="${hostname}">Re-enable</button>
+            <button class="btn btn-secondary btn-sm" data-reenable="${escAttr(hostname)}">Re-enable</button>
         </div>
     `).join('');
     list.querySelectorAll('[data-reenable]').forEach(btn => {
         btn.addEventListener('click', async () => {
-            await chrome.runtime.sendMessage({ type: 'SET_ENABLED', hostname: btn.dataset.reenable, enabled: false, clearDisabled: true });
+            await chrome.runtime.sendMessage({ type: 'SET_ENABLED', hostname: btn.dataset.reenable, enabled: true, clearDisabled: true });
             if (allData.sites[btn.dataset.reenable]) allData.sites[btn.dataset.reenable].disabled = false;
             renderDisabledSites();
             renderSites();
@@ -2230,7 +2367,7 @@ function renderDisabledSites() {
 }
 
 // Export
-bindEvent('btn-export','click', async () => {
+bindEvent('btn-export', 'click', async () => {
     const exportData = {
         version: '2.0.0',
         exportedAt: new Date().toISOString(),
@@ -2250,10 +2387,10 @@ bindEvent('btn-export','click', async () => {
 });
 
 // Import
-bindEvent('btn-import','click', () => {
+bindEvent('btn-import', 'click', () => {
     document.getElementById('import-file').click();
 });
-bindEvent('import-file','change', async (e) => {
+bindEvent('import-file', 'change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     try {
@@ -2276,7 +2413,7 @@ bindEvent('import-file','change', async (e) => {
                 sites: mergedSites,
                 hostnameMappings: { ...allData.hostnameMappings, ...(imported.autofill_data.hostnameMappings || {}) }
             };
-            await chrome.storage.local.set({ autofill_data: mergedData });
+            await chrome.runtime.sendMessage({ type: 'IMPORT_SITE_DATA', data: mergedData });
             if (imported.global_profile) {
                 const mergedProfile = { ...globalProfile };
                 for (const [key, val] of Object.entries(imported.global_profile)) {
@@ -2304,7 +2441,7 @@ bindEvent('import-file','change', async (e) => {
 });
 
 // Nuke
-bindEvent('btn-nuke','click', () => {
+bindEvent('btn-nuke', 'click', () => {
     showConfirmModal('Delete All Data', 'This will permanently delete ALL extension data including sites, profile, applications, and AI settings. This cannot be undone.', async () => {
         await chrome.storage.local.clear();
         showToast('✓ All data deleted', 'success');
@@ -2350,12 +2487,12 @@ async function renderDebugLogs() {
     }
 }
 
-bindEvent('btn-debug-refresh','click', async () => {
+bindEvent('btn-debug-refresh', 'click', async () => {
     await renderDebugLogs();
     showToast('Logs refreshed', 'info');
 });
 
-bindEvent('btn-debug-copy','click', async () => {
+bindEvent('btn-debug-copy', 'click', async () => {
     const output = document.getElementById('debug-log-output');
     if (!output) return;
     const text = output.textContent || '';
@@ -2367,7 +2504,7 @@ bindEvent('btn-debug-copy','click', async () => {
     }
 });
 
-bindEvent('btn-debug-clear','click', async () => {
+bindEvent('btn-debug-clear', 'click', async () => {
     await chrome.runtime.sendMessage({ type: 'LOG_CLEAR' });
     await renderDebugLogs();
     showToast('✓ Logs cleared', 'success');
@@ -2397,12 +2534,11 @@ async function renderCloudSync() {
     if (prefsResp?.prefs) cloudPrefs = prefsResp.prefs;
 
     const msgEl = document.getElementById('cloud-auth-msg');
-    const authForms = document.getElementById('cloud-auth-forms');
     const loggedInView = document.getElementById('cloud-logged-in');
     const prefsWrap = document.getElementById('cloud-sync-prefs');
 
-    msgEl.textContent = '';
-    
+    if (msgEl) msgEl.textContent = '';
+
     if (!configured) {
         badge.textContent = 'Not Configured';
         badge.style.background = 'rgba(239, 68, 68, 0.12)';
@@ -2413,23 +2549,24 @@ async function renderCloudSync() {
     }
 
     if (loggedIn && user) {
-        authForms.style.display = 'none';
-        loggedInView.style.display = 'block';
+        if (loggedInView) loggedInView.style.display = 'block';
         badge.textContent = 'Connected';
         badge.style.background = 'rgba(34, 197, 94, 0.12)';
         badge.style.color = 'var(--green-400)';
 
-        document.getElementById('cloud-user-name').textContent = user.displayName || 'Job Hunter';
-        document.getElementById('cloud-user-email').textContent = user.email;
+        const nameEl = document.getElementById('cloud-user-name');
+        const emailEl = document.getElementById('cloud-user-email');
+        if (nameEl) nameEl.textContent = user.displayName || 'Job Hunter';
+        if (emailEl) emailEl.textContent = user.email;
 
-        const timeStr = lastSync?.lastPushedAt || lastSync?.lastPulledAt 
-            ? new Date(lastSync.lastPushedAt || lastSync.lastPulledAt).toLocaleString() 
+        const timeStr = lastSync?.lastPushedAt || lastSync?.lastPulledAt
+            ? new Date(lastSync.lastPushedAt || lastSync.lastPulledAt).toLocaleString()
             : 'Never';
-        document.getElementById('cloud-last-sync').textContent = timeStr;
+        const lastSyncEl = document.getElementById('cloud-last-sync');
+        if (lastSyncEl) lastSyncEl.textContent = timeStr;
         if (prefsWrap) prefsWrap.style.display = 'block';
     } else {
-        authForms.style.display = 'grid';
-        loggedInView.style.display = 'none';
+        if (loggedInView) loggedInView.style.display = 'none';
         badge.textContent = 'Disconnected';
         badge.style.background = 'rgba(251, 191, 36, 0.12)';
         badge.style.color = 'var(--amber-400)';
@@ -2543,139 +2680,11 @@ function setupCloudPrefListeners() {
     }
 }
 
-const cloudUiRoot = document.getElementById('cloud-status-badge');
-if (cloudUiRoot) {
-    bindEvent('btn-cloud-signin','click', async () => {
-        const email = document.getElementById('cloud-email').value;
-        const pwd = document.getElementById('cloud-password').value;
-        const msg = document.getElementById('cloud-auth-msg');
-        const btn = document.getElementById('btn-cloud-signin');
+function bindCloudAuthControls() {
+    // Sign-in/sign-up live on the auth shield (dashboard.html:14-68), not here.
+    // The Settings-tab duplicates of those forms never existed in the markup.
 
-        if (!email || !pwd) {
-            msg.textContent = '❌ Email and password required.';
-            msg.className = 'status-msg error';
-            return;
-        }
-
-        // Ensure cloud is configured before attempting sign-in
-        try {
-            const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
-            if (!status?.configured) {
-                msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
-                msg.className = 'status-msg error';
-                return;
-            }
-        } catch (_) {}
-
-        setLoading(btn, true);
-        msg.textContent = 'Signing in...';
-        msg.className = 'status-msg';
-        
-        try {
-            const resp = await withTimeout(
-                chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd }).catch(() => null),
-                6000,
-                null
-            );
-            if (!resp) {
-                msg.textContent = '❌ Background not responding. Reload extension.';
-                msg.className = 'status-msg error';
-                return;
-            }
-            if (resp.ok) {
-                msg.textContent = '✓ Sign in successful!';
-                msg.className = 'status-msg success';
-                document.getElementById('cloud-email').value = '';
-                document.getElementById('cloud-password').value = '';
-                await loadAllData();
-            } else {
-                msg.textContent = '❌ ' + resp.error;
-                msg.className = 'status-msg error';
-            }
-        } catch (err) {
-            msg.textContent = '❌ ' + err.message;
-            msg.className = 'status-msg error';
-        } finally {
-            setLoading(btn, false);
-        }
-    });
-
-    bindEvent('btn-cloud-signup','click', async () => {
-        const email = document.getElementById('cloud-email').value;
-        const pwd = document.getElementById('cloud-password').value;
-        const msg = document.getElementById('cloud-auth-msg');
-        const btn = document.getElementById('btn-cloud-signup');
-
-        if (!email || !pwd) {
-            msg.textContent = '❌ Email and password required.';
-            msg.className = 'status-msg error';
-            return;
-        }
-
-        // Ensure cloud is configured before attempting sign-up
-        try {
-            const status = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' }).catch(() => null);
-            if (!status?.configured) {
-                msg.textContent = '❌ Cloud sync is not configured. Add config.private.js and reload the extension.';
-                msg.className = 'status-msg error';
-                return;
-            }
-        } catch (_) {}
-
-        setLoading(btn, true);
-        msg.textContent = 'Creating account...';
-        msg.className = 'status-msg';
-        
-        try {
-            const resp = await withTimeout(
-                chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_UP', email, password: pwd }).catch(() => null),
-                6000,
-                null
-            );
-            if (!resp) {
-                msg.textContent = '❌ Background not responding. Reload extension.';
-                msg.className = 'status-msg error';
-                return;
-            }
-            if (resp.ok) {
-                msg.textContent = '✓ Account created & logged in!';
-                msg.className = 'status-msg success';
-                document.getElementById('cloud-email').value = '';
-                document.getElementById('cloud-password').value = '';
-                await loadAllData();
-            } else {
-                msg.textContent = '❌ ' + resp.error;
-                msg.className = 'status-msg error';
-            }
-        } catch (err) {
-            msg.textContent = '❌ ' + err.message;
-            msg.className = 'status-msg error';
-        } finally {
-            setLoading(btn, false);
-        }
-    });
-
-    bindEvent('btn-cloud-sync','click', async () => {
-        const btn = document.getElementById('btn-cloud-sync');
-        setLoading(btn, true);
-        showToast('Syncing with cloud...', 'success');
-        
-        try {
-            const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SYNC' });
-            if (resp.ok) {
-                showToast('✓ Cloud sync complete', 'success');
-                await loadAllData();
-            } else {
-                showToast('❌ Sync failed: ' + resp.error, 'error');
-            }
-        } catch (err) {
-            showToast('❌ Sync failed: ' + err.message, 'error');
-        } finally {
-            setLoading(btn, false);
-        }
-    });
-
-    bindEvent('btn-cloud-signout','click', async () => {
+    bindEvent('btn-cloud-signout', 'click', async () => {
         // 1. Clear Google Identity Cache if possible
         try {
             chrome.identity.getAuthToken({ interactive: false }, (token) => {
@@ -2688,8 +2697,16 @@ if (cloudUiRoot) {
         } catch (e) { console.warn('Identity clear failed:', e); }
 
         // 2. Logout from Firebase
-        await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
-        showToast('Signed out. Local data for this account is still saved.', 'success');
+        let resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
+        if (resp?.needsConfirm) {
+            if (!confirm(resp.error)) return;
+            resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT', force: true });
+        }
+        if (!resp?.ok) {
+            showToast(resp?.error || 'Sign out failed', 'error');
+            return;
+        }
+        showToast('Signed out.', 'success');
         await loadAllData();
     });
 }
@@ -2734,7 +2751,7 @@ function setupDashAuth() {
         // Clear existing token first to force account picker
         chrome.identity.getAuthToken({ interactive: false }, (oldToken) => {
             if (oldToken) chrome.identity.removeCachedAuthToken({ token: oldToken });
-            
+
             chrome.identity.getAuthToken({ interactive: true }, async (token) => {
                 if (chrome.runtime.lastError || !token) {
                     msg.textContent = chrome.runtime.lastError?.message || 'Google Auth failed or cancelled.';
@@ -2752,12 +2769,23 @@ function setupDashAuth() {
             });
         });
     });
+
+    chrome.runtime.onMessage.addListener((msg) => {
+        if (msg?.type === 'AUTH_STATE_CHANGED') {
+            loadAllData();
+        }
+    });
 }
 
 // ── Init ───────────────────────────────────────────────
 initTheme();
+initAutofillMode();
+renderCloudSync().catch(err => console.warn('[Dashboard] Cloud sync panel failed:', err));
 setupDashAuth();
 loadAllData().then(() => {
+    bindCloudAuthControls();
+    bindSecurityControls();
+    updateSyncSecurityUI();
     bindTaskControls();
     bindTaskModal();
     // Handle hash-based tab navigation (e.g. #tab-profile from popup)

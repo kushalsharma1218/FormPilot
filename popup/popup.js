@@ -38,6 +38,33 @@ function renderCloudAccount(authStatus) {
   emailEl.textContent = user.email || user.displayName || 'Signed in';
 }
 
+// The first sync after sign-in runs in the background so login returns straight
+// away; this is the only signal the user gets that it is still going.
+function renderSyncState(state) {
+  const el = document.getElementById('account-sync');
+  if (!el) return;
+  if (state?.syncing) {
+    el.hidden = false;
+    el.textContent = 'syncing…';
+    el.classList.remove('sync-error');
+  } else if (state?.lastError) {
+    el.hidden = false;
+    el.textContent = 'sync failed';
+    el.classList.add('sync-error');
+    el.title = state.lastError;
+  } else {
+    el.hidden = true;
+    el.textContent = '';
+    el.classList.remove('sync-error');
+  }
+}
+
+async function refreshSyncState() {
+  try {
+    renderSyncState(await chrome.runtime.sendMessage({ type: 'CLOUD_GET_SYNC_STATE' }));
+  } catch (_) { }
+}
+
 // ── Utilities ──────────────────────────────────────────────────
 function escHtml(str) {
   if (str == null) return '';
@@ -297,7 +324,7 @@ async function sendToTab(tabId, message) {
   if (!tabId) return null;
   try {
     const resp = await chrome.runtime.sendMessage({ type: 'BROADCAST_TO_FRAMES', tabId, payload: message });
-    if (resp && typeof resp.ok !== 'undefined') return resp;
+    if (resp && resp.ok) return resp;
   } catch (_) { }
   try {
     return await chrome.tabs.sendMessage(tabId, message);
@@ -315,10 +342,6 @@ async function init() {
     const authEl = document.getElementById('auth-ui');
     const mainEl = document.getElementById('main-ui');
 
-    // Default to main UI (local use should never be blocked by cloud auth)
-    if (authEl) authEl.style.display = 'none';
-    if (mainEl) mainEl.style.display = 'block';
-
     const tab = await getActiveTab();
     try {
       const url = new URL(tab.url);
@@ -334,22 +357,35 @@ async function init() {
       null
     );
     renderCloudAccount(authStatus);
-    if (!authStatus) {
-      const errEl = document.getElementById('auth-error-msg');
-      if (errEl) {
-        errEl.innerHTML = 'Background not responding. <a href="#" id="auth-retry">Retry</a>';
-        const retry = document.getElementById('auth-retry');
-        if (retry) {
-          retry.addEventListener('click', (e) => {
-            e.preventDefault();
-            init();
-          });
+
+    if (!authStatus || !authStatus.loggedIn) {
+      if (authEl) authEl.style.display = 'flex';
+      if (mainEl) mainEl.style.display = 'none';
+
+      // Background not responding scenario
+      if (!authStatus) {
+        const errEl = document.getElementById('auth-error-msg');
+        if (errEl) {
+          errEl.innerHTML = 'Background not responding. <a href="#" id="auth-retry">Retry</a>';
+          const retry = document.getElementById('auth-retry');
+          if (retry) {
+            retry.addEventListener('click', (e) => {
+              e.preventDefault();
+              init();
+            });
+          }
+        }
+        if (initAttempts < 3) {
+          setTimeout(() => init(), 1200);
         }
       }
-      if (initAttempts < 3) {
-        setTimeout(() => init(), 1200);
-      }
+      return; // Stop loading data
     }
+
+    // User is logged in, show main UI
+    if (authEl) authEl.style.display = 'none';
+    if (mainEl) mainEl.style.display = 'block';
+    refreshSyncState();
     document.getElementById('site-badge').textContent = currentHostname;
 
     // Load site data & AI settings in parallel
@@ -455,6 +491,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     const btn = document.getElementById('btn-teach');
     teachActive = false;
     if (btn?.dataset.defaultHtml) btn.innerHTML = btn.dataset.defaultHtml;
+  } else if (msg?.type === 'CLOUD_SYNC_STATE_CHANGED') {
+    renderSyncState(msg);
+  } else if (msg?.type === 'AUTH_STATE_CHANGED') {
+    window.location.reload();
   }
 });
 
@@ -711,11 +751,11 @@ function setupAuthListeners() {
     try {
       const resp = await withTimeout(
         chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_IN', email, password: pwd }).catch(() => null),
-        6000,
+        20000,
         null
       );
       if (!resp) {
-        msg.textContent = 'Background not responding. Please reload the extension.';
+        msg.textContent = 'Sign-in timed out. Check your connection and try again.';
         return;
       }
       if (resp.ok) {
@@ -783,13 +823,17 @@ function setupAuthListeners() {
     btnSignOut.addEventListener('click', async () => {
       btnSignOut.disabled = true;
       try {
-        const resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
+        let resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT' });
+        if (resp?.needsConfirm) {
+          if (!confirm(resp.error)) return;
+          resp = await chrome.runtime.sendMessage({ type: 'CLOUD_SIGN_OUT', force: true });
+        }
         if (!resp?.ok) {
           showToast(resp?.error || 'Logout failed', 'error');
           return;
         }
         renderCloudAccount({ loggedIn: false });
-        showToast('Logged out. Local data stays on this device.', 'success');
+        showToast('Signed out.', 'success');
       } catch (err) {
         showToast(err.message || 'Logout failed', 'error');
       } finally {
