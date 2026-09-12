@@ -23,8 +23,8 @@ function applyPrivateConfig() {
 const CloudAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {};
 const FirestoreUtils = (globalThis.JobAutofill && JobAutofill.FirestoreUtils) || null;
 const getAuthState = CloudAuthStore.getAuthState || (async () => null);
-const saveAuthState = CloudAuthStore.saveAuthState || (async () => {});
-const clearAuthState = CloudAuthStore.clearAuthState || (async () => {});
+const saveAuthState = CloudAuthStore.saveAuthState || (async () => { });
+const clearAuthState = CloudAuthStore.clearAuthState || (async () => { });
 const getUserKey = CloudAuthStore.getUserKey || (async (baseKey) => baseKey);
 const toFirestoreValue = FirestoreUtils?.toFirestoreValue || function (val) {
   if (val === null || val === undefined) return { nullValue: null };
@@ -85,41 +85,8 @@ const SYNC_META_KEY = 'cloud_sync_meta';
 const CLOUD_CONFIG_KEY = 'cloud_config';
 let configLoadPromise = null;
 
-function mergeMetricBucket(a = {}, b = {}) {
-  return {
-    runs: Math.max(Number(a.runs || 0), Number(b.runs || 0)),
-    fieldsDetected: Math.max(Number(a.fieldsDetected || 0), Number(b.fieldsDetected || 0)),
-    fieldsMatched: Math.max(Number(a.fieldsMatched || 0), Number(b.fieldsMatched || 0)),
-    fieldsFilled: Math.max(Number(a.fieldsFilled || 0), Number(b.fieldsFilled || 0)),
-    timeSavedSec: Math.max(Number(a.timeSavedSec || 0), Number(b.timeSavedSec || 0)),
-    lastAt: a.lastAt && b.lastAt ? (a.lastAt > b.lastAt ? a.lastAt : b.lastAt) : (a.lastAt || b.lastAt || null),
-  };
-}
-
-function mergeUsageMetrics(local = {}, remote = {}) {
-  const merged = {};
-  merged.totalRuns = Math.max(Number(local.totalRuns || 0), Number(remote.totalRuns || 0));
-  merged.totalFieldsDetected = Math.max(Number(local.totalFieldsDetected || 0), Number(remote.totalFieldsDetected || 0));
-  merged.totalFieldsMatched = Math.max(Number(local.totalFieldsMatched || 0), Number(remote.totalFieldsMatched || 0));
-  merged.totalFieldsFilled = Math.max(Number(local.totalFieldsFilled || 0), Number(remote.totalFieldsFilled || 0));
-  merged.totalTimeSavedSec = Math.max(Number(local.totalTimeSavedSec || 0), Number(remote.totalTimeSavedSec || 0));
-  merged.lastRunAt = local.lastRunAt && remote.lastRunAt
-    ? (local.lastRunAt > remote.lastRunAt ? local.lastRunAt : remote.lastRunAt)
-    : (local.lastRunAt || remote.lastRunAt || null);
-
-  const daily = { ...(local.daily || {}) };
-  Object.entries(remote.daily || {}).forEach(([key, bucket]) => {
-    daily[key] = mergeMetricBucket(daily[key], bucket);
-  });
-  merged.daily = daily;
-
-  const perSite = { ...(local.perSite || {}) };
-  Object.entries(remote.perSite || {}).forEach(([key, bucket]) => {
-    perSite[key] = mergeMetricBucket(perSite[key], bucket);
-  });
-  merged.perSite = perSite;
-  return merged;
-}
+// mergeMetricBucket / mergeUsageMetrics are defined in background.js, which is
+// loaded after this file and therefore owns both.
 
 function mergeAliasMaps(local = {}, remote = {}) {
   const merged = { ...(local || {}) };
@@ -278,8 +245,23 @@ async function getValidToken() {
     return data.id_token;
   } catch (err) {
     // If refresh fails, clear auth state (user must re-login)
-    if (err.message?.includes('TOKEN_EXPIRED') || err.message?.includes('INVALID_REFRESH_TOKEN')) {
+    // USER_NOT_FOUND / USER_DISABLED are just as terminal as an expired token: a
+    // deleted or disabled account used to stay "signed in" forever while every
+    // sync failed, with no way out but guessing that sign-out fixes it.
+    const terminal = ['TOKEN_EXPIRED', 'INVALID_REFRESH_TOKEN', 'USER_NOT_FOUND', 'USER_DISABLED']
+      .some(code => err.message?.includes(code));
+    if (terminal) {
       await clearAuthState();
+      // Tell the rest of the extension. Clearing auth silently meant getUserKey()
+      // started returning un-scoped keys and everything written afterwards was
+      // orphaned the moment the user signed back in.
+      try { await globalThis.broadcastAuthState?.(false); } catch (_) { }
+      try {
+        chrome.runtime.sendMessage({
+          type: 'CLOUD_SESSION_EXPIRED',
+          reason: err.message || 'Session expired',
+        }).catch(() => { });
+      } catch (_) { }
     }
     throw err;
   }
@@ -350,8 +332,11 @@ async function cloudSignIn(email, password) {
   }
 
   // Get display name
-  let displayName = data.displayName || data.email.split('@')[0];
+  let displayName = data.displayName || (data.email || '').split('@')[0] || 'Account';
+  // Only pay for the extra lookup round trip when the name is actually missing —
+  // sign-in latency is what the popup is waiting on.
   try {
+    if (data.displayName) throw new Error('skip-lookup');
     const profileResp = await fetch(authUrl('lookup'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -402,7 +387,7 @@ async function cloudSignInWithGoogle(googleAccessToken) {
   const authState = {
     userId: data.localId,
     email: data.email,
-    displayName: data.displayName || data.email.split('@')[0],
+    displayName: data.displayName || (data.email || '').split('@')[0] || 'Account',
     idToken: data.idToken,
     refreshToken: data.refreshToken,
     tokenExpiresAt: Date.now() + (parseInt(data.expiresIn) * 1000),
@@ -457,13 +442,32 @@ async function pushDataToCloud(dataKey, data) {
   const docPath = `users/${auth.userId}/${dataKey}/data`;
   const url = firestoreUrl(docPath);
 
+  await assertNotDowngradingToPlaintext(dataKey);
+
+  let payload = data;
+
+  // E2EE: Encrypt if a sync key is present
+  if (globalThis.currentSyncKey) {
+    console.log(`[CloudSync] Encrypting ${dataKey} payload...`);
+    const encrypted = await globalThis.JobAutofill.CryptoUtils.encrypt(data, globalThis.currentSyncKey);
+    payload = {
+      encrypted: true,
+      iv: encrypted.iv,
+      ciphertext: encrypted.ciphertext,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  // Full-document PATCH (Firestore creates the doc if it does not exist).
+  // Do NOT add an empty ?updateMask.fieldPaths= — that asks Firestore to update
+  // zero fields, which silently writes nothing.
   const resp = await fetch(url, {
     method: 'PATCH',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
-    body: JSON.stringify(toFirestoreDoc(data)),
+    body: JSON.stringify(toFirestoreDoc(payload)),
   });
 
   if (!resp.ok) {
@@ -471,6 +475,167 @@ async function pushDataToCloud(dataKey, data) {
     throw new Error(err.error?.message || `Failed to push ${dataKey}`);
   }
 
+  return true;
+}
+
+// ── Delta Sync (Offline Queue) ─────────────────────────────────
+
+const MAX_QUEUE_ATTEMPTS = 5;
+
+async function bumpQueueAttempts(items) {
+  if (!globalThis.JobAutofill?.SyncQueue) return;
+  const ids = new Set(items.map(i => i.id));
+  const queue = await globalThis.JobAutofill.SyncQueue.getQueue();
+  for (const entry of queue) {
+    if (ids.has(entry.id)) entry.attempts = (entry.attempts || 0) + 1;
+  }
+  await chrome.storage.local.set({ cloud_sync_queue: queue });
+}
+
+async function drainSyncQueue() {
+  if (!globalThis.JobAutofill?.SyncQueue) return;
+  const queue = await globalThis.JobAutofill.SyncQueue.getQueue();
+  if (!queue || queue.length === 0) return;
+
+  await ensureFirebaseConfigLoaded();
+  const auth = await getAuthState();
+  if (!auth) return;
+  const token = await getValidToken();
+
+  console.log(`[CloudSync] Draining sync queue of ${queue.length} items`);
+
+  // Group by document key to batch updates
+  const updatesByKey = {};
+  for (const item of queue) {
+    if (!updatesByKey[item.key]) updatesByKey[item.key] = { items: [], id: item.key };
+    updatesByKey[item.key].items.push(item);
+  }
+
+  const queueOwner = queue[0]?.userId;
+  if (queueOwner && queueOwner !== auth.userId) {
+    // Queued by a different account (e.g. someone signed out mid-outage).
+    // Uploading it now would write their data into this account's documents.
+    console.warn('[CloudSync] Dropping sync queue left behind by another account.');
+    await globalThis.JobAutofill.SyncQueue.clearQueue();
+    return;
+  }
+
+  const successIds = [];
+
+  for (const [dataKey, group] of Object.entries(updatesByKey)) {
+    const attempts = Math.max(...group.items.map(i => i.attempts || 0));
+    try {
+      // For now, if there are multiple patches for a single doc, we just take the latest payload
+      const latestItem = group.items[group.items.length - 1];
+      const docPath = `users/${auth.userId}/${dataKey}/data`;
+      const url = firestoreUrl(docPath);
+
+      await assertNotDowngradingToPlaintext(dataKey);
+
+      // E2EE: Encrypt if a sync key is present
+      let payload = latestItem.payload;
+      if (globalThis.currentSyncKey) {
+        const encrypted = await globalThis.JobAutofill.CryptoUtils.encrypt(payload, globalThis.currentSyncKey);
+        payload = {
+          encrypted: true,
+          iv: encrypted.iv,
+          ciphertext: encrypted.ciphertext,
+          updatedAt: new Date().toISOString()
+        };
+      }
+
+      const resp = await fetch(url, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify(toFirestoreDoc(payload)),
+      });
+
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          // Undeliverable. Firestore PATCH creates missing docs, so a repeated 404
+          // means this item will never land — drop it rather than grow the queue forever.
+          console.warn(`[CloudSync] Target doc ${dataKey} not found after ${attempts} attempts; dropping queued items.`);
+          if (attempts >= MAX_QUEUE_ATTEMPTS) {
+            successIds.push(...group.items.map(i => i.id));
+          } else {
+            await bumpQueueAttempts(group.items);
+          }
+        } else {
+          const err = await resp.json();
+          throw new Error(err.error?.message || `Failed to push ${dataKey}`);
+        }
+      } else {
+        successIds.push(...group.items.map(i => i.id));
+      }
+    } catch (err) {
+      console.error(`[CloudSync] Failed to process queue for ${dataKey}:`, err);
+      // Count the attempt on EVERY failure, not just 404 — otherwise a
+      // permanently-rejected item (400, oversized doc, revoked auth) is retried
+      // forever and the queue grows without bound.
+      if (attempts + 1 >= MAX_QUEUE_ATTEMPTS) {
+        console.warn(`[CloudSync] Dropping ${dataKey} after ${MAX_QUEUE_ATTEMPTS} failed attempts.`);
+        successIds.push(...group.items.map(i => i.id));
+      } else {
+        await bumpQueueAttempts(group.items);
+      }
+    }
+  }
+
+  if (successIds.length > 0) {
+    await globalThis.JobAutofill.SyncQueue.removeItems(successIds);
+  }
+}
+
+// Reads a document WITHOUT attempting decryption. Needed for sync_meta, which
+// holds the PBKDF2 salt and the passphrase verifier and is deliberately plaintext.
+// The in-memory sync key dies with the MV3 worker, but the account's E2EE status
+// does not. Pushing without the key would rewrite encrypted documents as
+// plaintext and report success — so refuse instead, and let the UI ask for the
+// passphrase again.
+async function assertNotDowngradingToPlaintext(dataKey) {
+  if (globalThis.currentSyncKey) return;
+  const usesE2ee = typeof accountUsesE2ee === 'function' ? await accountUsesE2ee() : false;
+  if (usesE2ee) {
+    throw new Error(`Sync passphrase required before syncing ${dataKey} (refusing to upload unencrypted).`);
+  }
+}
+
+async function pullRawFromCloud(dataKey) {
+  await ensureFirebaseConfigLoaded();
+  const auth = await getAuthState();
+  if (!auth) throw new Error('Not logged in');
+  const token = await getValidToken();
+
+  const resp = await fetch(firestoreUrl(`users/${auth.userId}/${dataKey}/data`), {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error?.message || `Failed to pull ${dataKey}`);
+  }
+  return fromFirestoreDoc(await resp.json());
+}
+
+// Writes a document WITHOUT encrypting it. Same rationale as pullRawFromCloud.
+async function pushRawToCloud(dataKey, data) {
+  await ensureFirebaseConfigLoaded();
+  const auth = await getAuthState();
+  if (!auth) throw new Error('Not logged in');
+  const token = await getValidToken();
+
+  const resp = await fetch(firestoreUrl(`users/${auth.userId}/${dataKey}/data`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify(toFirestoreDoc(data)),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error?.message || `Failed to push ${dataKey}`);
+  }
   return true;
 }
 
@@ -494,7 +659,18 @@ async function pullDataFromCloud(dataKey) {
   }
 
   const doc = await resp.json();
-  return fromFirestoreDoc(doc);
+  const data = fromFirestoreDoc(doc);
+
+  // E2EE: Decrypt if data is encrypted
+  if (data && data.encrypted && data.ciphertext && data.iv) {
+    if (!globalThis.currentSyncKey) {
+      console.warn(`[CloudSync] Data for ${dataKey} is encrypted but no sync key is available.`);
+      throw new Error('Sync passphrase required to decrypt data');
+    }
+    return await globalThis.JobAutofill.CryptoUtils.decrypt(data.ciphertext, data.iv, globalThis.currentSyncKey);
+  }
+
+  return data;
 }
 
 // ── Full Sync ──────────────────────────────────────────────────
@@ -571,6 +747,11 @@ async function pushAllToCloud(prefs = {}) {
   if (syncMetrics) pushTasks.push(pushDataToCloud('metrics', metrics || {}));
   if (pushTasks.length) await Promise.all(pushTasks);
 
+  // Clear sync queue since we just did a full push
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.clearQueue();
+  }
+
   // Save sync metadata
   await chrome.storage.local.set({
     [SYNC_META_KEY]: {
@@ -581,6 +762,17 @@ async function pushAllToCloud(prefs = {}) {
 
   return true;
 }
+
+// Global reference exported locally for queueCloudSync
+globalThis.CloudSync = {
+  drainSyncQueue,
+  pullRawFromCloud,
+  pushRawToCloud,
+  pushAllToCloud,
+  pullAllFromCloud,
+  pullDataFromCloud,
+  pushDataToCloud
+};
 
 async function pullAllFromCloud(prefs = {}) {
   const auth = await getAuthState();

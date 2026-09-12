@@ -9,7 +9,19 @@ try {
 } catch (_) {
   // Optional private Firebase config (not committed)
 }
+importScripts('lib/sync-queue.js');
+importScripts('lib/crypto-utils.js');
 importScripts('cloud-sync.js');
+
+const AuthStore = JobAutofill.AuthStore;
+const CryptoUtils = JobAutofill.CryptoUtils;
+const SyncQueue = JobAutofill.SyncQueue;
+
+// ── In-Memory Security State ───────────────────────────────────
+// Must live on globalThis: cloud-sync.js reads globalThis.currentSyncKey, and a
+// top-level `let` is a lexical binding, not a property of the worker global.
+globalThis.currentSyncKey = null; // AES CryptoKey, never persisted to local storage
+globalThis.syncKeySalt = null;    // Uint8Array salt for the current user
 
 const STORAGE_KEY = 'autofill_data';
 const GLOBAL_STORAGE_KEY = 'global_profile_data';
@@ -18,6 +30,9 @@ const METRICS_KEY = 'usage_metrics';
 const SESSION_KEY = 'autofill_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CLOUD_PREFS_KEY = 'cloud_sync_prefs';
+// Deliberately not user-scoped: content.js reads this before it knows who (if anyone)
+// is signed in, so it cannot live behind AuthStore.getUserKey().
+const EXT_SETTINGS_KEY = 'extension_settings';
 const EXCLUDED_SITES_KEY = 'excluded_sites';
 const METRIC_TIME_PER_FIELD_SEC = 8;
 const DEBUG_LOG_KEY = 'fp_debug_logs';
@@ -50,13 +65,73 @@ async function broadcastToTabFrames(tabId, payload) {
       chrome.tabs.sendMessage(tabId, payload, { frameId }).catch(() => null)
     )
   );
-  const ok = results.some(r => r.status === 'fulfilled' && r.value && r.value.ok);
-  return { ok };
+  // Return the answering frame's payload, not just a boolean: callers need the
+  // data (extracted page text, saved-field count), and collapsing it to { ok }
+  // is why those popup features reported undefined.
+  const answered = results.find(r => r.status === 'fulfilled' && r.value && r.value.ok);
+  if (answered) return { ...answered.value, ok: true };
+  return { ok: false };
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   FRAME_REGISTRY.delete(tabId);
 });
+
+// The first sync after sign-in is ~14 Firestore round trips. The popup times its
+// sign-in request out after 6s, so awaiting the sync made a perfectly successful
+// login report "Background not responding". Auth is already persisted by
+// cloudSignIn/cloudSignUp, so reply immediately and sync in the background.
+let initialSyncState = { syncing: false, lastError: null, lastSyncAt: null };
+
+async function finishSignIn(mode) {
+  try {
+    await saveCloudPrefs({ enabled: true });
+  } catch (err) {
+    console.warn('[Cloud] Could not enable sync prefs:', err);
+  }
+  await broadcastAuthState(true);
+
+  initialSyncState = { syncing: true, lastError: null, lastSyncAt: null };
+  broadcastSyncState();
+
+  // Deliberately not awaited.
+  (async () => {
+    try {
+      const { prefs } = await getCloudPrefs();
+      if (mode === 'pull-then-push') await pullAllFromCloud(prefs);
+      if (prefs.enabled) await pushAllToCloud(prefs);
+      initialSyncState = { syncing: false, lastError: null, lastSyncAt: new Date().toISOString() };
+    } catch (err) {
+      console.warn('[Cloud] Initial sync failed:', err);
+      initialSyncState = { syncing: false, lastError: err?.message || 'Sync failed', lastSyncAt: null };
+    }
+    broadcastSyncState();
+    await broadcastAuthState(true); // let tabs pick up freshly pulled data
+  })();
+}
+
+function broadcastSyncState() {
+  const payload = { type: 'CLOUD_SYNC_STATE_CHANGED', ...initialSyncState };
+  chrome.runtime.sendMessage(payload).catch(() => { }); // popup/dashboard, if open
+}
+
+// content.js gates init() on sign-in state, so every auth transition must reach
+// already-open tabs — otherwise they stay suppressed until the user reloads.
+// Exposed on globalThis so cloud-sync.js can reach it — it is loaded first, and a
+// bare function declaration here is not visible to it by name at call time.
+globalThis.broadcastAuthState = broadcastAuthState;
+async function broadcastAuthState(loggedIn) {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (err) {
+    console.warn('[Auth] Could not enumerate tabs:', err);
+    return;
+  }
+  await Promise.allSettled(
+    tabs.map(tab => broadcastToTabFrames(tab.id, { type: 'AUTH_STATE_CHANGED', loggedIn }))
+  );
+}
 
 async function flushDebugLogs() {
   if (debugLogBuffer.length === 0) return;
@@ -109,10 +184,42 @@ async function clearGoogleIdentityTokenCache() {
 }
 
 // ── Storage Helpers (Account Aware) ────────────────────────────
-const AuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
-  getUserKey: async (baseKey) => baseKey,
-  getAuthState: async () => null,
-};
+// (AuthStore is aliased at the top of this file; cloud-sync.js owns CloudAuthStore.)
+
+// Reads a user-scoped key, adopting pre-sign-in ("anonymous") data exactly once.
+//
+// The anonymous copy is REMOVED after adoption. Leaving it behind meant the next
+// account to sign in on the same device inherited the previous user's data — a
+// cross-account leak that needed no race and no failure to trigger. It also
+// covers the three stores that had no migration at all, so a user who worked
+// signed out (the default) no longer loses resumes, applications and tasks the
+// moment they sign up.
+async function readUserScoped(baseKey, fallback, isEmpty) {
+  const key = await AuthStore.getUserKey(baseKey);
+  const result = await chrome.storage.local.get([key, baseKey]);
+  let value = result[key];
+
+  if (key !== baseKey && isEmpty(value) && !isEmpty(result[baseKey])) {
+    value = result[baseKey];
+    await chrome.storage.local.set({ [key]: value });
+    await chrome.storage.local.remove(baseKey);
+    console.log(`[Background] Adopted anonymous "${baseKey}" into ${key}`);
+  }
+
+  return { key, value: isEmpty(value) ? fallback : value };
+}
+
+const isEmptyList = (v) => !Array.isArray(v) || v.length === 0;
+
+// Serialises read-modify-write cycles on the shared storage blobs. content.js is
+// injected with all_frames:true, so two frames of one page routinely save at the
+// same moment and the last writer used to win outright.
+let storageWriteChain = Promise.resolve();
+function withStorageLock(fn) {
+  const run = storageWriteChain.then(fn, fn);
+  storageWriteChain = run.then(() => { }, () => { });
+  return run;
+}
 
 async function getData() {
   try {
@@ -127,6 +234,7 @@ async function getData() {
         console.log(`[Background] Migrating ${Object.keys(anonData.sites).length} sites from anonymous storage to user ${key}`);
         data = anonData;
         await chrome.storage.local.set({ [key]: data });
+        await chrome.storage.local.remove(STORAGE_KEY);
       }
     }
     // Ensure structure exists
@@ -153,6 +261,9 @@ async function getData() {
 async function saveData(data) {
   const key = await AuthStore.getUserKey(STORAGE_KEY);
   await chrome.storage.local.set({ [key]: data });
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'autofill', data);
+  }
 }
 
 async function getGlobalProfile() {
@@ -168,6 +279,7 @@ async function getGlobalProfile() {
         console.log(`[Background] Migrating global profile from anonymous storage to user ${key}`);
         profile = anonProfile;
         await chrome.storage.local.set({ [key]: profile });
+        await chrome.storage.local.remove(GLOBAL_STORAGE_KEY);
       }
     }
     return profile;
@@ -180,6 +292,9 @@ async function getGlobalProfile() {
 async function saveGlobalProfile(profile) {
   const key = await AuthStore.getUserKey(GLOBAL_STORAGE_KEY);
   await chrome.storage.local.set({ [key]: profile });
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'profile', profile);
+  }
 }
 
 function defaultUsageMetrics() {
@@ -212,6 +327,9 @@ async function getUsageMetrics() {
 async function saveUsageMetrics(metrics) {
   const key = await AuthStore.getUserKey(METRICS_KEY);
   await chrome.storage.local.set({ [key]: metrics });
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'metrics', metrics);
+  }
 }
 
 function getLocalDateKey(d = new Date()) {
@@ -334,6 +452,112 @@ function isSiteDisabled(data, siteKey) {
 }
 
 // ── Cloud Sync Preferences ─────────────────────────────────────
+// ── Sync key derivation state ──────────────────────────────────
+const SYNC_SALT_KEY = 'sync_salt';
+const SYNC_VERIFIER_KEY = 'sync_verifier';
+const SYNC_VERIFIER_PROBE = 'formpilot-sync-verifier-v1';
+
+// The salt and the passphrase verifier belong to the ACCOUNT, not the device.
+//
+// A PBKDF2 salt is not a secret — it exists to make precomputed tables useless,
+// not to stay hidden — and the verifier is a probe that only the right key can
+// decrypt. Keeping either only in local storage meant the sign-out sweep
+// (`user_<id>_*`) destroyed them, which made every encrypted document in the
+// cloud permanently unreadable, and meant a second device could never derive the
+// same key. Both are therefore mirrored to users/<uid>/sync_meta/data.
+const SYNC_META_DOC = 'sync_meta';
+
+async function loadSyncMeta() {
+  const saltKey = await AuthStore.getUserKey(SYNC_SALT_KEY);
+  const verifierKey = await AuthStore.getUserKey(SYNC_VERIFIER_KEY);
+  const local = await chrome.storage.local.get([saltKey, verifierKey, SYNC_SALT_KEY]);
+
+  let salt = local[saltKey] || null;
+  let verifier = local[verifierKey] || null;
+
+  // Authoritative copy lives with the account; local storage is only a cache.
+  if (!salt || !verifier) {
+    try {
+      const remote = await globalThis.CloudSync?.pullRawFromCloud?.(SYNC_META_DOC);
+      if (remote?.salt) {
+        salt = salt || remote.salt;
+        verifier = verifier || (remote.verifierIv && remote.verifierCiphertext
+          ? { iv: remote.verifierIv, ciphertext: remote.verifierCiphertext }
+          : null);
+      }
+    } catch (err) {
+      console.warn('[Security] Could not read sync_meta from cloud:', err?.message || err);
+    }
+  }
+
+  // Pre-per-user salt, kept so data encrypted before this change still decrypts.
+  if (!salt && local[SYNC_SALT_KEY]) salt = local[SYNC_SALT_KEY];
+
+  return { salt, verifier, saltKey, verifierKey };
+}
+
+async function saveSyncMeta({ salt, verifier, saltKey, verifierKey }) {
+  const writes = {};
+  if (salt) writes[saltKey] = salt;
+  if (verifier) writes[verifierKey] = verifier;
+  if (Object.keys(writes).length) await chrome.storage.local.set(writes);
+
+  try {
+    await globalThis.CloudSync?.pushRawToCloud?.(SYNC_META_DOC, {
+      salt,
+      verifierIv: verifier?.iv || '',
+      verifierCiphertext: verifier?.ciphertext || '',
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    // Non-fatal, but the user is now one sign-out away from losing access.
+    console.warn('[Security] Could not mirror sync_meta to cloud:', err?.message || err);
+  }
+}
+
+// true = passphrase matches, false = wrong passphrase, null = no verifier yet.
+async function verifySyncKey(key, verifier) {
+  if (!verifier?.iv || !verifier?.ciphertext) return null;
+  try {
+    return (await CryptoUtils.decrypt(verifier.ciphertext, verifier.iv, key)) === SYNC_VERIFIER_PROBE;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Does this account use E2EE? Consulted before any push, so that a worker restart
+// (which drops the in-memory key) cannot silently downgrade the cloud to plaintext.
+async function accountUsesE2ee() {
+  try {
+    const { verifier } = await loadSyncMeta();
+    return !!(verifier?.iv && verifier?.ciphertext);
+  } catch (_) {
+    return false;
+  }
+}
+
+const DEFAULT_EXT_SETTINGS = {
+  // false = local-only mode: autofill works signed out, sign-in only adds cloud sync.
+  // true  = autofill stays disabled until the user signs in.
+  requireSignIn: false,
+};
+
+async function getExtSettings() {
+  try {
+    const result = await chrome.storage.local.get(EXT_SETTINGS_KEY);
+    return { ...DEFAULT_EXT_SETTINGS, ...(result[EXT_SETTINGS_KEY] || {}) };
+  } catch (err) {
+    console.warn('[Settings] Falling back to defaults:', err);
+    return { ...DEFAULT_EXT_SETTINGS };
+  }
+}
+
+async function saveExtSettings(patch) {
+  const next = { ...(await getExtSettings()), ...(patch || {}) };
+  await chrome.storage.local.set({ [EXT_SETTINGS_KEY]: next });
+  return next;
+}
+
 async function getCloudPrefs() {
   const key = await AuthStore.getUserKey(CLOUD_PREFS_KEY);
   const result = await chrome.storage.local.get(key);
@@ -350,15 +574,13 @@ async function getCloudPrefs() {
     ...stored,
   };
   const auth = await AuthStore.getAuthState();
-  if (auth) {
+  if (auth && stored.enabled === undefined) {
+    // Signing in turns sync on by default, but never overrides a stored choice —
+    // forcing every category true made the per-category opt-outs unsaveable.
     prefs.enabled = true;
-    prefs.syncProfile = true;
-    prefs.syncAutofill = true;
-    prefs.syncApplications = true;
-    prefs.syncTasks = true;
-    prefs.syncAiSettings = true;
-    prefs.syncResumes = true;
-    prefs.syncMetrics = true;
+  }
+  if (!auth) {
+    prefs.enabled = false;
   }
   return { key, prefs };
 }
@@ -367,13 +589,9 @@ async function saveCloudPrefs(next) {
   const { key, prefs } = await getCloudPrefs();
   const merged = { ...prefs, ...(next || {}) };
   if (merged.enabled) {
+    // Profile is the one category that is genuinely not optional — it is what
+    // makes an account useful on a second device. The rest are the user's call.
     merged.syncProfile = true;
-    merged.syncAutofill = true;
-    merged.syncApplications = true;
-    merged.syncTasks = true;
-    merged.syncAiSettings = true;
-    merged.syncResumes = true;
-    merged.syncMetrics = true;
   }
   await chrome.storage.local.set({ [key]: merged });
   return merged;
@@ -381,15 +599,21 @@ async function saveCloudPrefs(next) {
 
 // ── Resume Vault (Local + Cloud Sync) ──────────────────────────
 async function getResumesStore() {
-  const key = await AuthStore.getUserKey(RESUMES_KEY);
-  const result = await chrome.storage.local.get(key);
-  const data = result[key] || { items: [], defaultId: null };
+  const { key, value } = await readUserScoped(
+    RESUMES_KEY,
+    { items: [], defaultId: null },
+    (v) => !v || isEmptyList(v.items)
+  );
+  const data = value;
   if (!Array.isArray(data.items)) data.items = [];
   return { key, data };
 }
 
 async function saveResumesStore(key, data) {
   await chrome.storage.local.set({ [key]: data });
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'resumes', data);
+  }
 }
 
 function sanitizeResumeMeta(item) {
@@ -472,6 +696,193 @@ function resolveSiteKey(data, hostname) {
   if (!hostname) return hostname;
   return (data.hostnameMappings || {})[hostname] || hostname;
 }
+
+// ── Application Tracker ────────────────────────────────────────
+async function getApplications() {
+  const { value } = await readUserScoped(APPLICATIONS_KEY, [], isEmptyList);
+  return value;
+}
+
+async function saveApplications(apps) {
+  const key = await AuthStore.getUserKey(APPLICATIONS_KEY);
+  await chrome.storage.local.set({ [key]: apps });
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'applications', { list: apps });
+  }
+}
+
+async function addApplication(app) {
+  const apps = await getApplications();
+  const exists = apps.find(a => a.companyName === app.companyName && a.jobTitle === app.jobTitle);
+  if (exists) {
+    Object.assign(exists, app, { updatedAt: new Date().toISOString() });
+  } else {
+    apps.unshift({
+      id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+      ...app,
+      status: app.status || 'applied',
+      appliedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      notes: '',
+      jobDescription: app.jobDescription || '',
+    });
+  }
+  await saveApplications(apps);
+  return apps;
+}
+
+async function updateApplication(id, updates) {
+  const apps = await getApplications();
+  const app = apps.find(a => a.id === id);
+  if (app) {
+    Object.assign(app, updates, { updatedAt: new Date().toISOString() });
+    await saveApplications(apps);
+  }
+  return apps;
+}
+
+async function deleteApplication(id) {
+  let apps = await getApplications();
+  apps = apps.filter(a => a.id !== id);
+  await saveApplications(apps);
+  return apps;
+}
+
+// ── Task Tracker ───────────────────────────────────────────────
+// Tolerant of legacy/free-form statuses ("completed", "To Do", "in progress").
+// TASK_STATUS_SET / TASK_STATUS_ALIASES come from ai-service.js (imported first).
+function normalizeTaskStatus(status) {
+  if (!status) return 'new';
+  const raw = String(status).trim().toLowerCase();
+  if (!raw) return 'new';
+  const normalized = raw.replace(/[\s-]+/g, '_');
+  if (TASK_STATUS_SET.has(normalized)) return normalized;
+  if (TASK_STATUS_ALIASES[normalized]) return TASK_STATUS_ALIASES[normalized];
+  return 'backlog';
+}
+
+function normalizeTaskList(list) {
+  let changed = false;
+  const next = list.map(task => {
+    const normalized = normalizeTaskStatus(task?.status);
+    if (normalized !== task?.status) {
+      changed = true;
+      return { ...task, status: normalized };
+    }
+    return task;
+  });
+  return { next, changed };
+}
+
+async function getTasks() {
+  const { value: list } = await readUserScoped(TASKS_KEY, [], isEmptyList);
+  const { next, changed } = normalizeTaskList(list);
+  if (changed) await saveTasks(next);
+  return next;
+}
+
+async function saveTasks(tasks) {
+  const key = await AuthStore.getUserKey(TASKS_KEY);
+  await chrome.storage.local.set({ [key]: tasks });
+  if (globalThis.JobAutofill?.SyncQueue) {
+    await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'tasks', { list: tasks });
+  }
+}
+
+function recomputeEpics(tasks) {
+  const epics = tasks.filter(t => t.type === 'epic');
+  for (const epic of epics) {
+    const children = tasks.filter(t => t.parentId === epic.id && t.type !== 'epic');
+    if (children.length === 0) continue;
+    const allDone = children.every(c => c.status === 'done');
+    const anyActive = children.some(c => c.status === 'in_progress' || c.status === 'blocked');
+    const anyDone = children.some(c => c.status === 'done');
+    const anyBacklog = children.some(c => c.status === 'backlog');
+    const anyNew = children.some(c => c.status === 'new');
+    let nextStatus = 'new';
+    if (allDone) nextStatus = 'done';
+    else if (anyActive || anyDone) nextStatus = 'in_progress';
+    else if (anyBacklog) nextStatus = 'backlog';
+    else if (anyNew) nextStatus = 'new';
+    if (epic.status !== nextStatus) {
+      epic.status = nextStatus;
+      epic.updatedAt = new Date().toISOString();
+    }
+  }
+  return tasks;
+}
+
+async function addTask(task) {
+  const tasks = await getTasks();
+  const now = new Date().toISOString();
+  const isEpic = task.type === 'epic' || task.isEpic === true;
+  const parentCandidate = isEpic ? '' : (task.parentId || '');
+  const parentId = parentCandidate && parentCandidate !== task.id ? parentCandidate : '';
+  const entryId = task.id && !tasks.some(t => t.id === task.id)
+    ? task.id
+    : (Date.now().toString(36) + Math.random().toString(36).substr(2, 5));
+  const entry = {
+    id: entryId,
+    title: task.title || 'Untitled Task',
+    description: task.description || '',
+    status: normalizeTaskStatus(task.status || (isEpic ? 'new' : 'new')),
+    priority: task.priority || 'medium',
+    dueDate: task.dueDate || '',
+    createdAt: now,
+    updatedAt: now,
+    tags: Array.isArray(task.tags) ? task.tags : [],
+    type: isEpic ? 'epic' : 'task',
+    parentId,
+  };
+  tasks.unshift(entry);
+  const next = recomputeEpics(tasks);
+  await saveTasks(next);
+  return next;
+}
+
+async function updateTask(id, updates) {
+  const tasks = await getTasks();
+  const task = tasks.find(t => t.id === id);
+  if (task) {
+    const nextUpdates = { ...(updates || {}) };
+    if (nextUpdates.status !== undefined) {
+      nextUpdates.status = normalizeTaskStatus(nextUpdates.status);
+    }
+    if (nextUpdates.type === 'epic') {
+      nextUpdates.parentId = '';
+    }
+    if (task.type === 'epic' && nextUpdates.parentId !== undefined) {
+      delete nextUpdates.parentId;
+    }
+    if (nextUpdates.parentId && nextUpdates.parentId === id) {
+      nextUpdates.parentId = '';
+    }
+    Object.assign(task, nextUpdates, { updatedAt: new Date().toISOString() });
+    const next = recomputeEpics(tasks);
+    await saveTasks(next);
+    return next;
+  }
+  return tasks;
+}
+
+async function deleteTask(id) {
+  let tasks = await getTasks();
+  const removed = tasks.find(t => t.id === id);
+  tasks = tasks.filter(t => t.id !== id);
+  if (removed?.type === 'epic') {
+    const now = new Date().toISOString();
+    tasks.forEach(t => {
+      if (t.parentId === id) {
+        t.parentId = '';
+        t.updatedAt = now;
+      }
+    });
+  }
+  const next = recomputeEpics(tasks);
+  await saveTasks(next);
+  return next;
+}
+
 
 async function resolveSiteKeyForHost(hostname) {
   const data = await getData();
@@ -660,14 +1071,17 @@ async function handleMessage(msg, sender) {
     }
 
     case 'SAVE_FIELDS': {
-      const data = await getData();
-      const siteKey = resolveSiteKey(data, msg.hostname);
-      if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
-      if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, flags: {}, metrics: {}, sandbox: {} };
-      data.sites[siteKey].fields = Object.assign({}, data.sites[siteKey].fields, msg.fields || {});
-      await saveData(data);
-      queueCloudSync();
-      return { ok: true };
+      // Under the lock: all_frames means several frames of one page save at once.
+      return withStorageLock(async () => {
+        const data = await getData();
+        const siteKey = resolveSiteKey(data, msg.hostname);
+        if (isSiteDisabled(data, siteKey)) return { ok: false, error: 'Site disabled' };
+        if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: true, fields: {}, flags: {}, metrics: {}, sandbox: {} };
+        data.sites[siteKey].fields = Object.assign({}, data.sites[siteKey].fields, msg.fields || {});
+        await saveData(data);
+        queueCloudSync();
+        return { ok: true };
+      });
     }
 
     case 'SANDBOX_MERGE': {
@@ -825,6 +1239,9 @@ async function handleMessage(msg, sender) {
       data.sites[siteKey].disabled = true;
       data.sites[siteKey].enabled = false; // Also disable if specifically blocked
       await saveData(data);
+      if (globalThis.JobAutofill?.SyncQueue) {
+        await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'autofill', data);
+      }
       queueCloudSync();
       return { ok: true };
     }
@@ -834,19 +1251,28 @@ async function handleMessage(msg, sender) {
       const data = await getData();
       const host = (msg.hostname || '').toLowerCase().replace(/^www\./, '');
       if (!host) return { ok: false, error: 'No hostname provided' };
-      if (!data.excludedSites.includes(host)) {
+
+      const isAlreadyCovered = data.excludedSites.some(h => host === h || host.endsWith('.' + h));
+      if (!isAlreadyCovered) {
+        // Remove any existing subdomains of this new broader exclusion
+        data.excludedSites = data.excludedSites.filter(h => !h.endsWith('.' + host));
         data.excludedSites.push(host);
       }
+
       // Also disable the site
       const siteKey = resolveSiteKey(data, host);
       if (!data.sites[siteKey]) data.sites[siteKey] = { enabled: false, fields: {}, flags: {}, metrics: {}, sandbox: {} };
       data.sites[siteKey].disabled = true;
       data.sites[siteKey].enabled = false;
       await saveData(data);
+      if (globalThis.JobAutofill?.SyncQueue) {
+        await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'autofill', data);
+      }
       queueCloudSync();
       // Broadcast to content scripts in the current tab
       if (sender?.tab?.id !== undefined) {
         broadcastToTabFrames(sender.tab.id, { type: 'SITE_EXCLUDED_UPDATE', excluded: true }).catch(() => { });
+        broadcastToTabFrames(sender.tab.id, { type: 'AUTH_STATE_CHANGED', loggedIn: false }).catch(() => { }); // Reset local state just in case
       }
       return { ok: true };
     }
@@ -855,7 +1281,12 @@ async function handleMessage(msg, sender) {
       const data = await getData();
       const host = (msg.hostname || '').toLowerCase().replace(/^www\./, '');
       if (!host) return { ok: false, error: 'No hostname provided' };
-      data.excludedSites = data.excludedSites.filter(h => h !== host);
+
+      // Remove exact matches and parent matches
+      data.excludedSites = data.excludedSites.filter(h => {
+        return h !== host && !host.endsWith('.' + h) && !h.endsWith('.' + host);
+      });
+
       // Re-enable the site
       const siteKey = resolveSiteKey(data, host);
       if (data.sites[siteKey]) {
@@ -863,6 +1294,9 @@ async function handleMessage(msg, sender) {
         data.sites[siteKey].enabled = true;
       }
       await saveData(data);
+      if (globalThis.JobAutofill?.SyncQueue) {
+        await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'autofill', data);
+      }
       queueCloudSync();
       if (sender?.tab?.id !== undefined) {
         broadcastToTabFrames(sender.tab.id, { type: 'SITE_EXCLUDED_UPDATE', excluded: false }).catch(() => { });
@@ -874,7 +1308,8 @@ async function handleMessage(msg, sender) {
     case 'IS_SITE_EXCLUDED': {
       const data = await getData();
       const host = (msg.hostname || '').toLowerCase().replace(/^www\./, '');
-      return { excluded: data.excludedSites.includes(host) };
+      const isExcluded = data.excludedSites.some(h => host === h || host.endsWith('.' + h));
+      return { excluded: isExcluded };
     }
 
     case 'GET_EXCLUDED_SITES': {
@@ -894,6 +1329,9 @@ async function handleMessage(msg, sender) {
         data.sites[siteKey].sandbox = {};
       }
       await saveData(data);
+      if (globalThis.JobAutofill?.SyncQueue) {
+        await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'autofill', data);
+      }
       return { ok: true };
     }
 
@@ -908,7 +1346,27 @@ async function handleMessage(msg, sender) {
       }
       data.hostnameMappings[msg.hostname] = newKey;
       await saveData(data);
+      if (globalThis.JobAutofill?.SyncQueue) {
+        await globalThis.JobAutofill.SyncQueue.enqueue('patch', 'autofill', data);
+      }
       return { ok: true, newKey };
+    }
+
+    case 'IMPORT_SITE_DATA': {
+      // The dashboard used to write chrome.storage.local.autofill_data directly,
+      // but every reader goes through AuthStore.getUserKey() — so imported sites
+      // silently vanished for any signed-in user.
+      if (!msg.data || typeof msg.data !== 'object') {
+        return { ok: false, error: 'No data supplied' };
+      }
+      const existing = await getData();
+      const merged = {
+        ...existing,
+        sites: { ...(existing.sites || {}), ...(msg.data.sites || {}) },
+        hostnameMappings: { ...(existing.hostnameMappings || {}), ...(msg.data.hostnameMappings || {}) },
+      };
+      await saveData(merged);
+      return { ok: true, siteCount: Object.keys(merged.sites || {}).length };
     }
 
     case 'GET_ALL_DATA': {
@@ -939,6 +1397,14 @@ async function handleMessage(msg, sender) {
     case 'AI_GET_SETTINGS': {
       const settings = await getAiSettings();
       return { settings };
+    }
+
+    // Content scripts only ever need the boolean. AI_GET_SETTINGS returns the
+    // user's plaintext API key, and a content script runs in every frame of every
+    // page — there is no reason for the key to be there.
+    case 'AI_IS_ENABLED': {
+      const settings = await getAiSettings();
+      return { ok: true, enabled: !!(settings?.enabled && settings?.apiKey) };
     }
 
     case 'AI_SAVE_SETTINGS': {
@@ -1125,6 +1591,18 @@ async function handleMessage(msg, sender) {
     }
 
     // ── Cloud Sync ────────────────────────────────────────────────
+    case 'GET_EXT_SETTINGS': {
+      return { ok: true, settings: await getExtSettings() };
+    }
+
+    case 'SAVE_EXT_SETTINGS': {
+      const settings = await saveExtSettings(msg.settings || {});
+      // Open tabs gate on this, so re-evaluate them immediately.
+      const auth = await AuthStore.getAuthState();
+      await broadcastAuthState(!!auth);
+      return { ok: true, settings };
+    }
+
     case 'CLOUD_GET_PREFS': {
       const { prefs } = await getCloudPrefs();
       return { ok: true, prefs };
@@ -1138,7 +1616,7 @@ async function handleMessage(msg, sender) {
     case 'CLOUD_DELETE_REMOTE': {
       const { prefs } = await getCloudPrefs();
       if (!prefs.enabled) return { ok: false, error: 'Cloud sync is disabled' };
-      const keys = ['autofill', 'profile', 'ai_settings', 'applications', 'metrics', 'resumes'];
+      const keys = ['autofill', 'profile', 'ai_settings', 'applications', 'tasks', 'metrics', 'resumes', 'sync_meta'];
       if (typeof deleteCloudData === 'function') {
         await deleteCloudData(keys);
         return { ok: true };
@@ -1179,50 +1657,103 @@ async function handleMessage(msg, sender) {
 
     case 'CLOUD_SIGN_UP': {
       if (!msg.email || !msg.password) return { ok: false, error: 'Email and password are required' };
-      console.log('[Cloud] Sign up attempt:', msg.email);
+      console.log('[Cloud] Sign up attempt');
       const auth = await cloudSignUp(msg.email, msg.password, msg.displayName || '');
-      // Auto-push local data to cloud on signup
-      try {
-        await saveCloudPrefs({ enabled: true });
-        const { prefs } = await getCloudPrefs();
-        if (prefs.enabled) await pushAllToCloud(prefs);
-      } catch (e) { console.warn('[Cloud] Post-signup push failed:', e); }
+      await finishSignIn('push');
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
     case 'CLOUD_SIGN_IN': {
       if (!msg.email || !msg.password) return { ok: false, error: 'Email and password are required' };
-      console.log('[Cloud] Sign in attempt:', msg.email);
+      console.log('[Cloud] Sign in attempt');
       const auth = await cloudSignIn(msg.email, msg.password);
-      // Auto-pull cloud data on login
-      try {
-        await saveCloudPrefs({ enabled: true });
-        const { prefs } = await getCloudPrefs();
-        await pullAllFromCloud(prefs);
-        await pushAllToCloud(prefs);
-      } catch (e) { console.warn('[Cloud] Post-login sync failed:', e); }
+      await finishSignIn('pull-then-push');
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
     }
 
     case 'CLOUD_SIGN_IN_GOOGLE': {
       if (!msg.accessToken) return { ok: false, error: 'Google Access Token is required' };
       const auth = await cloudSignInWithGoogle(msg.accessToken);
-      // Auto-pull cloud data on login
-      try {
-        await saveCloudPrefs({ enabled: true });
-        const { prefs } = await getCloudPrefs();
-        await pullAllFromCloud(prefs);
-        await pushAllToCloud(prefs);
-      } catch (e) { console.warn('[Cloud] Post-login sync failed:', e); }
+      await finishSignIn('pull-then-push');
       return { ok: true, user: { email: auth.email, displayName: auth.displayName } };
+    }
+
+    case 'CLOUD_GET_SYNC_STATE': {
+      return { ok: true, ...initialSyncState };
     }
 
     case 'CLOUD_SIGN_OUT': {
       try {
-        await clearGoogleIdentityTokenCache();
-      } catch (_) { /* ignore */ }
-      await cloudSignOut();
-      return { ok: true };
+        const auth = await AuthStore.getAuthState();
+        const userId = auth?.userId;
+
+        // 1. Clear Google identity cache
+        try { await clearGoogleIdentityTokenCache(); } catch (_) { }
+
+        // 2. Official sign out (clears Firebase token)
+        await cloudSignOut();
+
+        // 3. Try to get local work to the cloud BEFORE deleting it. Signing out
+        //    while offline used to destroy the only copy of anything that had not
+        //    synced yet. If the push fails, keep the data and say so — the caller
+        //    can re-issue with force:true once the user has accepted the loss.
+        if (userId && !msg.force) {
+          let pushed = false;
+          try {
+            const { prefs } = await getCloudPrefs();
+            if (prefs.enabled) {
+              await pushAllToCloud(prefs);
+              pushed = true;
+            }
+          } catch (err) {
+            console.warn('[Cloud] Final push before sign-out failed:', err);
+          }
+          if (!pushed) {
+            // Sync off, or the push failed — either way the cloud does not have
+            // this data, and the sweep below is the only copy's last moment.
+            return {
+              ok: false,
+              needsConfirm: true,
+              error: 'Your data has not been backed up to the cloud. Sign out anyway and delete it from this device?',
+            };
+          }
+        }
+
+        // 4. Clear ALL user-scoped storage keys if we have a userId
+        if (userId) {
+          const userPrefix = 'user_' + userId + '_';
+          const allLocal = await chrome.storage.local.get(null);
+          const userKeys = Object.keys(allLocal).filter(k => k.startsWith(userPrefix));
+          if (userKeys.length > 0) {
+            await chrome.storage.local.remove(userKeys);
+          }
+        }
+
+        // 4. Clear AuthStore and general local caches
+        await AuthStore.clearAuthState();
+        await chrome.storage.local.remove(['cloud_sync_meta', 'cloud_config', 'session_store']);
+
+        // 5. Reset in-memory state — the derived sync key must never survive into
+        //    the next account's session.
+        globalThis.currentSyncKey = null;
+        globalThis.syncKeySalt = null;
+        await chrome.storage.local.remove([SYNC_SALT_KEY]); // legacy non-user-scoped salt
+        // Not user-scoped, so the prefix sweep misses it. Anything still queued
+        // belongs to the account signing out.
+        try { await SyncQueue.clearQueue(); } catch (_) { }
+        debugLogBuffer = [];
+        if (debugFlushTimer) { clearTimeout(debugFlushTimer); debugFlushTimer = null; }
+        if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+
+        // 6. Notify all tabs to reset their state
+        await broadcastAuthState(false);
+
+        console.log('[Cloud] Comprehensive logout complete.');
+        return { ok: true };
+      } catch (err) {
+        console.error('[Cloud] Logout failure:', err);
+        return { ok: false, error: err.message };
+      }
     }
 
     case 'CLOUD_RESET_PASSWORD': {
@@ -1249,6 +1780,53 @@ async function handleMessage(msg, sender) {
       await pullAllFromCloud(prefs);
       await pushAllToCloud(prefs);
       return { ok: true };
+    }
+
+    case 'SET_SYNC_PASSPHRASE': {
+      if (!msg.passphrase) return { ok: false, error: 'Passphrase required' };
+      try {
+        const auth = await AuthStore.getAuthState();
+        if (!auth) return { ok: false, error: 'User must be logged in' };
+
+        const meta = await loadSyncMeta();
+        const saltB64 = meta.salt || CryptoUtils.b64Encode(CryptoUtils.generateSalt());
+        const salt = CryptoUtils.b64Decode(saltB64);
+        const key = await CryptoUtils.deriveKey(msg.passphrase, salt);
+
+        // Verify against the stored probe so a typo is reported as a wrong
+        // passphrase instead of silently deriving a key that fails against real
+        // data later.
+        const verified = await verifySyncKey(key, meta.verifier);
+        if (verified === false) {
+          return { ok: false, error: 'Incorrect passphrase for this account' };
+        }
+
+        const probe = verified === null ? await CryptoUtils.encrypt(SYNC_VERIFIER_PROBE, key) : null;
+        await saveSyncMeta({
+          salt: saltB64,
+          verifier: probe ? { iv: probe.iv, ciphertext: probe.ciphertext } : meta.verifier,
+          saltKey: meta.saltKey,
+          verifierKey: meta.verifierKey,
+        });
+
+        globalThis.syncKeySalt = salt;
+        globalThis.currentSyncKey = key;
+        console.log('[Security] Sync key successfully derived.');
+        return { ok: true, firstTime: verified === null };
+      } catch (err) {
+        console.error('[Security] Failed to set sync passphrase:', err);
+        return { ok: false, error: 'Failed to derive security key' };
+      }
+    }
+
+    case 'GET_SYNC_STATUS': {
+      const hasSyncKey = !!globalThis.currentSyncKey;
+      return {
+        ok: true,
+        hasSyncKey,
+        hasKey: hasSyncKey, // alias kept for older callers
+        isEncrypted: hasSyncKey
+      };
     }
 
     case 'OPEN_DASHBOARD': {
@@ -1283,7 +1861,11 @@ function queueCloudSync() {
         console.log('[Cloud] Auto-syncing...');
         // Pull latest first to keep local in sync, then push merged updates
         await pullAllFromCloud(prefs);
-        await pushAllToCloud(prefs);
+        if (globalThis.CloudSync?.drainSyncQueue) {
+          await globalThis.CloudSync.drainSyncQueue();
+        } else {
+          await pushAllToCloud(prefs);
+        }
         console.log('[Cloud] Auto-sync complete.');
       }
     } catch (err) {
@@ -1295,7 +1877,7 @@ function queueCloudSync() {
 // ── Periodic Cloud Pull (keeps local updated) ──────────────────
 const CLOUD_PULL_ALARM = 'cloud_pull_alarm';
 if (chrome.alarms) {
-  chrome.alarms.create(CLOUD_PULL_ALARM, { periodInMinutes: 3 });
+  chrome.alarms.create(CLOUD_PULL_ALARM, { periodInMinutes: 5 });
   chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm?.name !== CLOUD_PULL_ALARM) return;
     try {
