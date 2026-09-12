@@ -21,11 +21,31 @@ try {
 const CONTENT_INSTANCE_ID = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 globalThis.__JA_CONTENT_INSTANCE_ID = CONTENT_INSTANCE_ID;
 
+// Declared here (not with the other UI state) because flog() runs at script load.
+let debugOverlayEnabled = false;
+
+const __flogNoop = () => { };
+// Getters, not wrappers: returning a *bound* console method means devtools
+// attributes each line to its real call site. A plain wrapper function made every
+// log in this file report as content.js:<the wrapper line>, which is useless.
+Object.defineProperty(globalThis, 'flog', {
+  configurable: true,
+  get() { return isDebugOverlayEnabled() ? console.log.bind(console) : __flogNoop; },
+});
+Object.defineProperty(globalThis, 'fgroup', {
+  configurable: true,
+  get() { return isDebugOverlayEnabled() ? console.group.bind(console) : __flogNoop; },
+});
+Object.defineProperty(globalThis, 'fgroupEnd', {
+  configurable: true,
+  get() { return isDebugOverlayEnabled() ? console.groupEnd.bind(console) : __flogNoop; },
+});
+
 function isCurrentContentInstance() {
   return globalThis.__JA_CONTENT_INSTANCE_ID === CONTENT_INSTANCE_ID;
 }
 
-console.log(`[FormPilot] Content script loaded on: ${location.hostname} (stored under: ${hostname})`);
+flog(`[FormPilot] Content script loaded on: ${location.hostname} (stored under: ${hostname})`);
 
 const BRAND_FONT_ID = 'ja-font-face';
 const BRAND_FONT_URL = chrome.runtime?.getURL
@@ -78,10 +98,20 @@ let aiFocusTrackingAttached = false;
 let essayObserver = null;
 let essayButtons = new Set();
 let globalAliases = {};
+// Mirrors the "Require sign-in" setting; see init().
+let requireSignIn = false;
 let autofillInProgress = false;
 let autofillGuardTimer = null;
 let lastFillTimestamp = 0;
 const FILL_COOLDOWN_MS = 500;
+// Window after a fill during which DOM mutations are assumed to be our own doing.
+const FILL_SETTLE_MS = 700;
+// Hard cap on observer-driven refill passes: a page that re-renders forever must
+// not be able to keep the extension re-scanning forever.
+const MAX_OBSERVER_PASSES = 6;
+const MAX_EMPTY_FRAME_RECHECKS = 3;
+let emptyFrameRechecks = 0;
+let emptyFrameTimer = null;
 let coverageBannerTimer = null;
 let fieldKeyCache = new WeakMap();
 let fieldSignatureCache = new WeakMap();
@@ -103,7 +133,6 @@ let lastPath = location.pathname + location.search + location.hash;
 const PERFORMANCE_MODE = true;
 let jobContextState = { status: 'unknown', signature: '', jobScore: 0, formScore: 0, loginScore: 0, ts: 0 };
 let debugInfo = {};
-let debugOverlayEnabled = false;
 const LEARNING_SESSION_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const ACCURACY_MODE = false;
 const DEBUG_AUTOFILL = true; // ← set false to silence debug logs
@@ -173,6 +202,25 @@ function shouldShowUi() {
   if (!isTopFrame()) return false;
   if (!isJobFlowEligible()) return false;
   return true;
+}
+
+// Used when a frame reports zero fillable fields: poll a couple of times with the
+// cheap visible-input check rather than attaching a full subtree observer.
+function scheduleEmptyFrameRecheck(savedFields) {
+  if (emptyFrameTimer) return;
+  if (emptyFrameRechecks >= MAX_EMPTY_FRAME_RECHECKS) return;
+  emptyFrameTimer = setTimeout(() => {
+    emptyFrameTimer = null;
+    emptyFrameRechecks += 1;
+    if (!isCurrentContentInstance() || isSiteDisabled()) return;
+    if (!hasFillableFields()) {
+      scheduleEmptyFrameRecheck(savedFields);
+      return;
+    }
+    flog('[FormPilot] Fields appeared in a previously empty frame — filling.');
+    resetFieldCaches();
+    fillFields(savedFields, { skipCooldown: true });
+  }, 1200);
 }
 
 function resetFieldCaches() {
@@ -253,6 +301,9 @@ function isDebugOverlayEnabled() {
   return debugOverlayEnabled;
 }
 
+// Content scripts run in every frame of every page the user visits, so routine
+// logging is gated behind the same ?ja_debug=1 flag as the debug overlay.
+// Warnings and errors are always shown.
 function updateDebugInfo(patch) {
   debugInfo = { ...debugInfo, ...(patch || {}) };
   if (isDebugOverlayEnabled()) renderDebugOverlay();
@@ -487,18 +538,19 @@ function startStepReapplyObserver(savedFields) {
       return;
     }
     if (reapplyCount >= MAX_REAPPLY) {
-      console.log('[FormPilot] Max step-reapply count reached, stopping observer.');
+      flog('[FormPilot] Max step-reapply count reached, stopping observer.');
       stopStepReapplyObserver();
       return;
     }
+    if (Date.now() - lastFillTimestamp < FILL_SETTLE_MS) return;
     mutationCount += 1;
-    resetFieldCaches();
     if (stepReapplyTimer) clearTimeout(stepReapplyTimer);
     stepReapplyTimer = setTimeout(() => {
       stepReapplyTimer = null;
       if (mutationCount === 0) return;
       mutationCount = 0;
       reapplyCount++;
+      resetFieldCaches();
       fillFields(savedFields || {}, { skipObserver: true, skipCooldown: true, source: 'step-reapply' });
     }, 450);
   });
@@ -673,13 +725,67 @@ function normalizeForCompare(val, type, fieldKey) {
   return v.toLowerCase();
 }
 
+function isDropdownLike(el) {
+  const tag = el?.tagName?.toUpperCase();
+  const role = el?.getAttribute?.('role') || '';
+  return tag === 'SELECT' || role === 'listbox' || role === 'combobox'
+    || el?.getAttribute?.('aria-haspopup') === 'listbox';
+}
+
+// A dropdown is filled by *scoring* an option against the saved value, so "is it
+// already filled?" has to ask the same question. Comparing raw strings meant a
+// near match ("Bachelor's Degree" selecting "Bachelor's Degree (BA/BS)") never
+// counted as done: every re-render refilled it, which fired change events, which
+// caused another re-render — the fill loop that locked the page up.
+function dropdownAlreadyMatches(el, desiredVal) {
+  const decoded = decodeSelectValue(desiredVal);
+  const targets = [decoded.text, decoded.value, desiredVal].filter(Boolean);
+  if (!targets.length) return false;
+  const threshold = getDropdownMatchThreshold(decoded, getDropdownMeta(el));
+
+  if (el.tagName?.toUpperCase() === 'SELECT' && el.multiple) {
+    const wanted = String(decoded.text || desiredVal).split(',').map(v => v.trim()).filter(Boolean);
+    if (!wanted.length) return false;
+    const selected = Array.from(el.selectedOptions || []);
+    if (!selected.length) return false;
+    return wanted.every(w => selected.some(o =>
+      computeOptionMatchScore(o.text, o.value, [w]) >= threshold));
+  }
+
+  const current = getFieldValue(el);
+  if (!current) return false;
+  const currentValue = el.tagName?.toUpperCase() === 'SELECT'
+    ? (el.options[el.selectedIndex]?.value || '')
+    : '';
+  return computeOptionMatchScore(current, currentValue, targets) >= threshold;
+}
+
 function alreadyMatches(el, fieldKey, desiredVal) {
+  if (isDropdownLike(el)) return dropdownAlreadyMatches(el, desiredVal);
   const current = getFieldValue(el);
   if (!current) return false;
   const type = inferFieldType(el, fieldKey);
   const desiredNorm = normalizeForCompare(desiredVal, type, fieldKey);
   const currentNorm = normalizeForCompare(current, type, fieldKey);
   return !!desiredNorm && desiredNorm === currentNorm;
+}
+
+// Safety net independent of the matching logic above: a page that rewrites our
+// value on every render must never be able to hold the user hostage. Attempts are
+// per element+field, and the WeakMap resets naturally when the node is replaced.
+const FILL_ATTEMPT_LIMIT = 4;
+const fillAttemptCounts = new WeakMap();
+
+function noteFillAttempt(el, fieldKey) {
+  const byKey = fillAttemptCounts.get(el) || Object.create(null);
+  byKey[fieldKey] = (byKey[fieldKey] || 0) + 1;
+  fillAttemptCounts.set(el, byKey);
+  return byKey[fieldKey];
+}
+
+function fillAttemptsExhausted(el, fieldKey) {
+  const byKey = fillAttemptCounts.get(el);
+  return !!byKey && (byKey[fieldKey] || 0) >= FILL_ATTEMPT_LIMIT;
 }
 
 function isUsableTextTarget(el) {
@@ -724,20 +830,32 @@ function findBestFillTarget(el, fieldKey) {
 }
 
 // Boolean / Yes-No smart resolver for select/radio options
-function resolveBooleanOption(savedVal, optionText, optionValue) {
-  const v = String(savedVal).toLowerCase().trim();
-  const trueTokens = ['yes', 'true', '1', 'y', 'agree', 'authorized', 'citizen', 'eligible', 'will', 'can'];
-  const falseTokens = ['no', 'false', '0', 'n', 'disagree', 'not authorized', 'not eligible', 'cannot'];
-  const isTrue = trueTokens.some(t => v === t || v.startsWith(t));
-  const isFalse = falseTokens.some(t => v === t || v.startsWith(t));
-  if (!isTrue && !isFalse) return false;
+const BOOL_TRUE_VALUES = new Set([
+  'y', 'yes', 'true', '1', 'si', 'oui', 'agree', 'agreed', 'authorized', 'authorised', 'citizen', 'eligible'
+]);
+const BOOL_FALSE_VALUES = new Set([
+  'n', 'no', 'false', '0', 'non', 'disagree', 'unauthorized', 'not authorized', 'not eligible', 'ineligible'
+]);
 
-  const optLow = (String(optionText || '') + ' ' + String(optionValue || '')).toLowerCase().trim();
-  const trueMatch = ['yes', 'y', '1', 'true', 'si', 'oui', 'agree', 'authorize', 'eligible'];
-  const falseMatch = ['no', 'n', '0', 'false', 'non', 'disagree', 'not author', 'not eligible'];
-  if (isTrue && trueMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
-  if (isFalse && falseMatch.some(t => optLow === t || optLow.startsWith(t))) return true;
-  return false;
+// Returns true/false for a recognisable yes-no answer, or null when the string is
+// not a boolean at all. Tokens are matched whole (or on a word boundary) — matching
+// 'y'/'n' as prefixes turned "Yemen" into "Yes" and "New York"/"Norway" into "No".
+function boolSense(str) {
+  const v = String(str == null ? '' : str).toLowerCase().trim().replace(/[.!,;]+$/, '');
+  if (!v) return null;
+  if (BOOL_TRUE_VALUES.has(v)) return true;
+  if (BOOL_FALSE_VALUES.has(v)) return false;
+  if (/^yes\b/.test(v) || /^i am authoriz(ed|ted)\b/.test(v)) return true;
+  if (/^no\b/.test(v) || /^not (authorized|authorised|eligible)\b/.test(v)) return false;
+  return null;
+}
+
+function resolveBooleanOption(savedVal, optionText, optionValue) {
+  const saved = boolSense(savedVal);
+  if (saved === null) return false;
+  const option = boolSense(optionText) ?? boolSense(optionValue);
+  if (option === null) return false;
+  return saved === option;
 }
 
 // EEO / custom job-specific question detection
@@ -811,7 +929,7 @@ function recordCorrection(fieldKey, originalVal, correctedVal) {
       if (profile[profileKey] !== correctedVal) {
         profile[profileKey] = correctedVal;
         chrome.runtime.sendMessage({ type: 'SAVE_GLOBAL_PROFILE', profile }).catch(() => { });
-        console.log(`[FormPilot] AI Learning: profile.${profileKey} updated from correction`);
+        flog(`[FormPilot] AI Learning: profile.${profileKey} updated from correction`);
       }
     }).catch(() => { });
   }
@@ -961,8 +1079,10 @@ function queueProfileUpdate(profileKey, value) {
 function maybeAutoLearnProfile(el, fieldKey, value) {
   if (!el || !fieldKey) return;
   if (autofillInProgress) return;
-  const lastAuto = Number(el.dataset?.jaAutofillTs || 0);
-  if (lastAuto && (Date.now() - lastAuto) < 900) return;
+  // Never learn from our own output. The flag is set when we write a value and
+  // cleared only by genuine user interaction (see markUserEdited), so a wrong
+  // fill can no longer be promoted into the profile a second later.
+  if (el.dataset?.jaFilledByUs === '1') return;
   const profileKey = resolveProfileKeyFromField(el, fieldKey);
   if (!profileKey) return;
   const normalized = normalizeLearnedValue(el, value);
@@ -1059,6 +1179,11 @@ function showApprovalBanner() {
 function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   if (!el) return false;
   if (!shouldFillValue(el, fieldKey, primaryVal)) return false;
+  if (fillAttemptsExhausted(el, fieldKey)) {
+    flog(`[FormPilot] Giving up on "${fieldKey}" after ${FILL_ATTEMPT_LIMIT} attempts — the page keeps resetting it.`);
+    return false;
+  }
+  noteFillAttempt(el, fieldKey);
   const tag = el.tagName?.toUpperCase();
   const type = (el.type || '').toLowerCase();
 
@@ -1175,25 +1300,29 @@ function isPlaceholderText(text) {
 }
 
 const OPTION_NORMALIZE_MAP = {
-  'us': 'united states',
-  'u s': 'united states',
-  'usa': 'united states',
-  'u s a': 'united states',
-  'u.s.': 'united states',
-  'united states of america': 'united states',
-  'yes': 'yes',
-  'y': 'yes',
-  'true': 'yes',
-  'no': 'no',
-  'n': 'no',
-  'false': 'no',
-  'male': 'male',
-  'm': 'male',
-  'female': 'female',
-  'f': 'female',
-  'on site': 'onsite',
-  'on-site': 'onsite',
-  'onsite': 'onsite',
+  // Countries. Deliberately no bare two-letter codes: 'ca'/'in'/'de' collide with
+  // US state abbreviations (California, Indiana, Delaware) on address dropdowns.
+  'united states': 'united states', 'us': 'united states', 'u s': 'united states', 'usa': 'united states', 'u s a': 'united states', 'u.s.': 'united states', 'united states of america': 'united states',
+  'united kingdom': 'united kingdom', 'uk': 'united kingdom', 'great britain': 'united kingdom',
+  'india': 'india',
+  'canada': 'canada',
+
+  // Work Auth / Yes-No
+  'yes': 'yes', 'y': 'yes', 'true': 'yes', 'authorized': 'yes', 'i am authorized': 'yes',
+  'no': 'no', 'n': 'no', 'false': 'no', 'not authorized': 'no', 'unauthorized': 'no',
+
+  // Experience Levels
+  'entry': 'entry level', 'entry-level': 'entry level', 'entry level': 'entry level',
+  'mid': 'mid level', 'mid-level': 'mid level',
+  'senior': 'senior level', 'senior-level': 'senior level',
+
+  // Gender
+  'male': 'male', 'm': 'male',
+  'female': 'female', 'f': 'female',
+  'non-binary': 'non-binary', 'non binary': 'non-binary',
+
+  // Work Type
+  'on site': 'onsite', 'on-site': 'onsite', 'onsite': 'onsite',
   'remote': 'remote',
   'hybrid': 'hybrid',
 };
@@ -2022,14 +2151,25 @@ const GLOBAL_HEURISTICS = [
   { pId: 'phone', regex: /phone|mobile|cell|tel|telephone|contact.?number/i },
   { pId: 'linkedin', regex: /linkedin|linked\s*in/i },
   { pId: 'github', regex: /github|git\s*hub/i },
-  { pId: 'portfolio', regex: /portfolio|website|personal.?site/i },
-  { pId: 'address', regex: /address|street/i },
-  { pId: 'city', regex: /city/i },
-  { pId: 'state', regex: /state|province/i },
-  { pId: 'zipcode', regex: /zip|postal|post\s*code/i },
+  { pId: 'portfolio', regex: /portfolio|personal.*web|website/i },
+  { pId: 'address', regex: /address|street|addr(?:ess)?.*line.*1/i },
+  { pId: 'addressLine2', regex: /address.*line.*2|apt|suite|unit/i },
+  { pId: 'city', regex: /\bcity\b/i },
+  { pId: 'state', regex: /\bstate\b|province/i },
+  { pId: 'zipcode', regex: /zip|postal.*code|postcode/i },
+  { pId: 'country', regex: /country|nation/i },
   { pId: 'currentTitle', regex: /current title|job title|position/i },
   { pId: 'currentCompany', regex: /company|employer/i },
-  { pId: 'totalYearsExperience', regex: /years?.*experience|experience.*years|total.*experience/i }
+  { pId: 'totalYearsExperience', regex: /years?.*experience|experience.*years|total.*experience/i },
+  { pId: 'visaStatus', regex: /visa|work.*auth|sponsor|immigration/i },
+  { pId: 'salary', regex: /salary|compensation|pay.*expect/i },
+  { pId: 'startDate', regex: /start.*date|available.*date|earliest.*start/i },
+  { pId: 'gender', regex: /\bgender\b|\bsex\b/i },
+  { pId: 'race', regex: /\brace\b|ethnicit/i },
+  { pId: 'veteranStatus', regex: /veteran|military/i },
+  { pId: 'disability', regex: /disabilit/i },
+  { pId: 'coverLetter', regex: /cover.*letter/i },
+  { pId: 'summary', regex: /summary|about|bio|objective/i }
 ];
 
 function normalizeLabelKey(label) {
@@ -2073,33 +2213,58 @@ function getGlobalMatch(fieldKey) {
   return null;
 }
 
-function getGlobalMatchMeta(fieldKey) {
+const FieldMatch = (globalThis.JobAutofill && JobAutofill.FieldMatch) || null;
+const ValueVocab = (globalThis.JobAutofill && JobAutofill.ValueVocab) || null;
+
+function getGlobalMatchMeta(fieldKey, el) {
   if (!fieldKey || !currentGlobalProfile) return null;
   const cleanKey = fieldKey.replace(/\[\d+\]$/, '');
 
-  // 0. Alias map (promoted from confirmed learning)
-  const aliasKey = normalizeLabelKey(cleanKey);
-  const aliasEntry = globalAliases?.[aliasKey];
-  if (aliasEntry?.key && aliasEntry.count >= GLOBAL_ALIAS_PROMOTE_COUNT) {
-    const aliasValue = currentGlobalProfile[aliasEntry.key];
-    if (aliasValue !== undefined) {
-      return { value: aliasValue, key: aliasEntry.key, score: 0.96 };
+  // 1. Global aliases first (learned from user corrections). Aliases confirmed
+  // GLOBAL_ALIAS_PROMOTE_COUNT times score higher than provisional ones.
+  const normalizedLabel = normalizeLabelKey(cleanKey);
+  const alias = globalAliases?.[normalizedLabel];
+  if (alias?.key) {
+    const val = currentGlobalProfile[alias.key];
+    if (val !== undefined && val !== '') {
+      const promoted = (alias.count || 0) >= GLOBAL_ALIAS_PROMOTE_COUNT;
+      return { value: val, key: alias.key, score: promoted ? 0.98 : 0.96, source: 'alias' };
     }
   }
 
-  // 1. Direct profile key match (often happens when AI mapped it)
+  // 2. Typed match: rejects candidates whose value kind cannot answer this
+  //    control, lets the label veto a candidate, and prefers the head noun.
+  //    Returns null rather than guessing when nothing is clearly ahead.
+  if (FieldMatch) {
+    const typed = FieldMatch.matchField({
+      label: cleanKey,
+      tag: el?.tagName,
+      type: el?.type,
+    }, currentGlobalProfile);
+    if (typed) {
+      return {
+        value: currentGlobalProfile[typed.key],
+        key: typed.key,
+        score: 0.95,
+        source: 'typed',
+        reason: typed.reason,
+      };
+    }
+  }
+
+  // 3. Direct profile key match (often happens when AI mapped it)
   // Ensure it's an actual property, not a prototype method like 'valueOf'
   if (Object.prototype.hasOwnProperty.call(currentGlobalProfile, cleanKey) && currentGlobalProfile[cleanKey] !== undefined) {
     return { value: currentGlobalProfile[cleanKey], key: cleanKey, score: 1.0 };
   }
 
-  // 1b. Infer common keys from label
+  // 2b. Infer common keys from label
   const inferred = inferProfileKeyFromLabel(cleanKey);
   if (inferred && currentGlobalProfile[inferred] !== undefined) {
     return { value: currentGlobalProfile[inferred], key: inferred, score: 0.9 };
   }
 
-  // 2. Heuristic fallback
+  // 3. Heuristic fallback
   for (const h of GLOBAL_HEURISTICS) {
     if (h.regex.test(cleanKey) && currentGlobalProfile[h.pId]) {
       const score = Math.max(0.7, scoreStringMatch(cleanKey, h.pId));
@@ -2107,7 +2272,7 @@ function getGlobalMatchMeta(fieldKey) {
     }
   }
 
-  // 3. Fuzzy match against any profile key (camelCase-aware)
+  // 4. Fuzzy match against any profile key (camelCase-aware)
   const target = normalizeHint(humanizeKey(cleanKey));
   if (target) {
     let best = { key: '', score: 0 };
@@ -3050,7 +3215,7 @@ function getWorkdayFields() {
     }
   });
 
-  console.log(`[FormPilot] Workday fields captured:`, fields);
+  flog(`[FormPilot] Workday fields captured:`, fields);
   return fields;
 }
 
@@ -3092,7 +3257,7 @@ function getFormFields() {
     Object.assign(fields, wdFields);
     // If we got good Workday data, return early — no need for generic scraping
     if (Object.keys(wdFields).length > 3) {
-      console.log(`[FormPilot] Workday capture found ${Object.keys(wdFields).length} fields, skipping generic scan.`);
+      flog(`[FormPilot] Workday capture found ${Object.keys(wdFields).length} fields, skipping generic scan.`);
       return fields;
     }
   }
@@ -3365,11 +3530,33 @@ function applyValueWithEvents(el, value) {
 function markAutofilledElement(el) {
   if (!el) return;
   const ts = String(Date.now());
-  try { el.dataset.jaAutofillTs = ts; } catch (_) { }
+  try {
+    el.dataset.jaAutofillTs = ts;
+    el.dataset.jaFilledByUs = '1';
+    attachUserEditListener(el);
+  } catch (_) { }
   const inputChild = el.tagName === 'INPUT' ? el : el.querySelector?.('input, textarea');
   if (inputChild && inputChild !== el) {
-    try { inputChild.dataset.jaAutofillTs = ts; } catch (_) { }
+    try {
+      inputChild.dataset.jaAutofillTs = ts;
+      inputChild.dataset.jaFilledByUs = '1';
+      attachUserEditListener(inputChild);
+    } catch (_) { }
   }
+}
+
+// Clears the "we wrote this" flag on real user interaction, so a value the user
+// actually corrects becomes learnable again — which is exactly the signal we want.
+function attachUserEditListener(el) {
+  if (!el || el.__jaUserEditBound) return;
+  el.__jaUserEditBound = true;
+  const clear = (evt) => {
+    if (evt && evt.isTrusted === false) return; // synthetic events are ours
+    try { delete el.dataset.jaFilledByUs; } catch (_) { }
+  };
+  el.addEventListener('keydown', clear, true);
+  el.addEventListener('paste', clear, true);
+  el.addEventListener('pointerdown', clear, true);
 }
 
 function scheduleVerifyFill(el, fieldKey, primaryVal, altVal) {
@@ -3466,23 +3653,73 @@ function pickBestCandidate(candidates, targets) {
 
 function getDropdownMatchThreshold(decoded, meta) {
   const sameList = decoded?.fingerprint && meta?.fingerprint && decoded.fingerprint === meta.fingerprint;
-  return sameList ? 0.7 : 0.92;
+  // 0.82 sits above token-overlap and fuzzy scores but below a real token-run
+  // match. It is only safe because computeOptionMatchScore no longer hands out
+  // 0.85 for an accidental substring — do not lower it without checking that.
+  return sameList ? 0.7 : 0.82;
 }
 
 function trySelectCandidate(selectEl, candidate) {
   if (!selectEl || !candidate) return false;
-  selectEl.selectedIndex = candidate.index;
+  // Go through the native value setter so React/Vue see the change they track;
+  // assigning selectedIndex alone gets reverted on the next render.
+  const setter = getValueSetter(selectEl);
+  if (setter && candidate.value !== '') {
+    try { setter.call(selectEl, candidate.value); } catch (_) { /* fall through */ }
+  }
+  if (selectEl.selectedIndex !== candidate.index) {
+    selectEl.selectedIndex = candidate.index;
+  }
   triggerEvents(selectEl);
   markAutofilledElement(selectEl);
   return true;
 }
 
+// Which canonical value type (if any) backs this field, so the dropdown matcher
+// knows whether it is looking at countries, a yes/no, a degree, a number of years…
+function getValueTypeHint(fieldKey, el) {
+  if (!FieldMatch || !currentGlobalProfile) return null;
+  const match = FieldMatch.matchField(
+    { label: String(fieldKey || '').replace(/\[\d+\]$/, ''), tag: el?.tagName, type: el?.type },
+    currentGlobalProfile
+  );
+  if (match) {
+    const entry = (globalThis.JobAutofill?.FieldOntology?.FIELDS || [])
+      .find(f => f.id === match.key);
+    if (entry) return entry.type;
+  }
+  return null;
+}
+
 function fillSelectSafely(selectEl, decoded, fieldKey, unresolvedDropdowns) {
   const meta = getDropdownMeta(selectEl);
+  const valueTypeHint = getValueTypeHint(fieldKey, selectEl);
   const targets = [decoded.text, decoded.value].filter(Boolean);
   if (!targets.length || isPlaceholderText(targets[0])) return false;
   const candidates = buildSelectCandidates(selectEl);
   if (!candidates.length) return false;
+
+  // Canonical match first. "United States" vs "USA", "B.Tech" vs "Bachelors",
+  // "5" vs "3-5 years" are the same answer spelt differently; resolving both
+  // sides to a code (or an interval) settles them exactly, where string
+  // similarity cannot. Falls through to scoring when the type is unknown.
+  if (ValueVocab && valueTypeHint) {
+    const chosen = ValueVocab.chooseOption(valueTypeHint, targets[0], candidates);
+    if (chosen) {
+      flog(`[FormPilot] Dropdown matched via ${chosen.via} for "${fieldKey}".`);
+      trySelectCandidate(selectEl, chosen.option);
+      return true;
+    }
+  }
+
+  // Exact or high-confidence match first — a boolean guess must never pre-empt an
+  // option that matches the saved value outright.
+  for (const c of candidates) {
+    if (computeOptionMatchScore(c.text, c.value, targets) >= 1) {
+      trySelectCandidate(selectEl, c);
+      return true;
+    }
+  }
 
   // Boolean match (Yes/No)
   for (const c of candidates) {
@@ -3497,14 +3734,6 @@ function fillSelectSafely(selectEl, decoded, fieldKey, unresolvedDropdowns) {
     const byIndex = candidates.find(c => c.index === decoded.selectedIndex);
     if (byIndex && computeOptionMatchScore(byIndex.text, byIndex.value, targets) >= 0.7) {
       trySelectCandidate(selectEl, byIndex);
-      return true;
-    }
-  }
-
-  // Exact or high-confidence match
-  for (const c of candidates) {
-    if (computeOptionMatchScore(c.text, c.value, targets) >= 1) {
-      trySelectCandidate(selectEl, c);
       return true;
     }
   }
@@ -3557,7 +3786,7 @@ function fillFields(savedFields, opts = {}) {
   // Cooldown guard: prevent duplicate fills from rapid external calls (e.g., double-init)
   // Note: autofillInProgress is a signal for OTHER functions, not a guard here.
   if (!opts.skipCooldown && Date.now() - lastFillTimestamp < FILL_COOLDOWN_MS) {
-    console.log('[FormPilot] Fill cooldown active, skipping.');
+    flog('[FormPilot] Fill cooldown active, skipping.');
     return;
   }
   autofillInProgress = true;
@@ -3566,13 +3795,13 @@ function fillFields(savedFields, opts = {}) {
   savedFields = normalizeStoredFieldKeys(savedFields || {});
   const skipObserver = !!opts.skipObserver;
   if (DEBUG_AUTOFILL && !skipObserver) {
-    console.group('[FormPilot DEBUG] fillFields() called');
-    console.log('  savedFields keys:', Object.keys(savedFields || {}));
-    console.log('  savedFields values:', { ...savedFields });
-    console.log('  globalProfile keys:', Object.keys(currentGlobalProfile || {}));
-    console.log('  globalProfile values:', { ...currentGlobalProfile });
-    console.log('  currentSiteMappings:', currentSiteMappings);
-    console.groupEnd();
+    fgroup('[FormPilot DEBUG] fillFields() called');
+    flog('  savedFields keys:', Object.keys(savedFields || {}));
+    flog('  savedFields values:', { ...savedFields });
+    flog('  globalProfile keys:', Object.keys(currentGlobalProfile || {}));
+    flog('  globalProfile values:', { ...currentGlobalProfile });
+    flog('  currentSiteMappings:', currentSiteMappings);
+    fgroupEnd();
   }
   const stats = { detected: 0, matched: 0, filled: 0 };
   const unresolvedDropdowns = [];
@@ -3666,7 +3895,7 @@ function fillFields(savedFields, opts = {}) {
     let source = 'site';
     let globalMeta = null;
     if (val === undefined) {
-      globalMeta = getGlobalMatchMeta(fieldKey);
+      globalMeta = getGlobalMatchMeta(fieldKey, el);
       val = globalMeta?.value;
       source = 'global';
     }
@@ -3686,14 +3915,14 @@ function fillFields(savedFields, opts = {}) {
       }
     }
     if (val === undefined) {
-      globalMeta = getGlobalMatchMeta(fieldKey);
+      globalMeta = getGlobalMatchMeta(fieldKey, el);
       val = globalMeta?.value;
       source = 'global';
     }
 
     if (DEBUG_AUTOFILL) {
       const tag = el.tagName + (el.type ? `[${el.type}]` : '');
-      console.log(
+      flog(
         `[FP DEBUG] field="${fieldKey}" tag=${tag} src=${source} val=${val === undefined ? 'MISS' : JSON.stringify(String(val).slice(0, 60))}`
       );
     }
@@ -3708,7 +3937,7 @@ function fillFields(savedFields, opts = {}) {
     const canFill = shouldFillValue(el, fieldKey, primaryVal);
 
     if (DEBUG_AUTOFILL) {
-      console.log(`  → confidence=${confidence} canFill=${canFill} primaryVal=${JSON.stringify(String(primaryVal).slice(0, 60))}`);
+      flog(`  → confidence=${confidence} canFill=${canFill} primaryVal=${JSON.stringify(String(primaryVal).slice(0, 60))}`);
     }
 
     if (!canFill) return;
@@ -3748,7 +3977,7 @@ function fillFields(savedFields, opts = {}) {
       if (filled) break;
     }
     if (DEBUG_AUTOFILL) {
-      console.log(`  → filled=${filled}`);
+      flog(`  → filled=${filled}`);
     }
     logEvent({
       type: 'fill_attempt',
@@ -3799,7 +4028,7 @@ function fillFields(savedFields, opts = {}) {
         let source = 'site';
         let globalMeta = null;
         if (val === undefined) {
-          globalMeta = getGlobalMatchMeta(fieldKey);
+          globalMeta = getGlobalMatchMeta(fieldKey, el);
           val = globalMeta?.value;
           source = 'global';
         }
@@ -3811,7 +4040,7 @@ function fillFields(savedFields, opts = {}) {
           }
         }
         if (val === undefined) {
-          globalMeta = getGlobalMatchMeta(fieldKey);
+          globalMeta = getGlobalMatchMeta(fieldKey, el);
           val = globalMeta?.value;
           source = 'global';
         }
@@ -3828,7 +4057,7 @@ function fillFields(savedFields, opts = {}) {
         }
 
         if (DEBUG_AUTOFILL) {
-          console.log(`[FP DEBUG] combobox="${fieldKey}" trying to fill="${primaryVal}"`);
+          flog(`[FP DEBUG] combobox="${fieldKey}" trying to fill="${primaryVal}"`);
         }
 
         const meta = getDropdownMeta(el);
@@ -3884,7 +4113,7 @@ function fillFields(savedFields, opts = {}) {
     let source = 'site';
     let globalMeta = null;
     if (val === undefined) {
-      globalMeta = getGlobalMatchMeta(key);
+      globalMeta = getGlobalMatchMeta(key, listbox);
       val = globalMeta?.value;
       source = 'global';
     }
@@ -3896,7 +4125,7 @@ function fillFields(savedFields, opts = {}) {
       }
     }
     if (val === undefined) {
-      globalMeta = getGlobalMatchMeta(key);
+      globalMeta = getGlobalMatchMeta(key, listbox);
       val = globalMeta?.value;
       source = 'global';
     }
@@ -3924,19 +4153,40 @@ function fillFields(savedFields, opts = {}) {
   // Disconnect any previous observer so we don't stack them
   if (!skipObserver) {
     if (window._jaObserver) window._jaObserver.disconnect();
-    let observerTimer;
-    window._jaObserver = new MutationObserver(() => {
-      clearTimeout(observerTimer);
-      resetFieldCaches();
-      // Debounce: wait for DOM to settle before re-filling
-      observerTimer = setTimeout(() => {
-        fillFields(savedFields, { skipObserver: true });
-      }, 300);
-    });
-    window._jaObserver.observe(document.body, { childList: true, subtree: true, attributes: false });
 
-    // Stop observing after 30s (form is likely done changing by then)
-    setTimeout(() => window._jaObserver?.disconnect(), 30000);
+    if (!stats.detected) {
+      // A frame with nothing to fill — e.g. the marketing page that merely embeds
+      // the ATS form — must not run a subtree observer for 30s. Re-check cheaply
+      // a few times in case the form renders late, then stop.
+      scheduleEmptyFrameRecheck(savedFields);
+    } else {
+      let observerTimer;
+      let observerPasses = 0;
+      window._jaObserver = new MutationObserver(() => {
+        // Our own fills mutate the DOM and make the page re-render. Reacting to
+        // those is how the extension ended up chasing its own tail.
+        if (Date.now() - lastFillTimestamp < FILL_SETTLE_MS) return;
+        if (observerPasses >= MAX_OBSERVER_PASSES) {
+          flog('[FormPilot] Max dynamic-fill passes reached, stopping observer.');
+          window._jaObserver?.disconnect();
+          return;
+        }
+        clearTimeout(observerTimer);
+        // Debounce: wait for DOM to settle before re-filling. resetFieldCaches()
+        // used to run on every mutation rather than here — on a busy React page
+        // that meant thousands of cache rebuilds a second, which is what actually
+        // froze the page, not the filling itself.
+        observerTimer = setTimeout(() => {
+          observerPasses += 1;
+          resetFieldCaches();
+          fillFields(savedFields, { skipObserver: true });
+        }, 300);
+      });
+      window._jaObserver.observe(document.body, { childList: true, subtree: true, attributes: false });
+
+      // Stop observing after 30s (form is likely done changing by then)
+      setTimeout(() => window._jaObserver?.disconnect(), 30000);
+    }
   }
 
   if (!skipObserver) {
@@ -4499,27 +4749,75 @@ function findVisibleOptions() {
   return options.filter(isVisibleElement);
 }
 
+// Option scoring is token-aware on purpose.
+//
+// The previous version scored *any* raw substring containment 0.85 — so
+// "Bachelor's Degree" vs "Bachelor's Degree (BA/BS)" (a match we want) and "Male"
+// vs "Female" (one we must refuse) came out identical. Every non-exact pair
+// collapsed onto 0.85 while getDropdownMatchThreshold demanded 0.92 on an
+// unfamiliar list, so on a new site nothing but a literal exact match ever filled.
+// Matching whole tokens instead separates the two cases, which is what lets the
+// threshold come down far enough to be useful.
+function optionTokens(str) {
+  const n = normalizeOptionText(str);
+  return n ? n.split(' ').filter(Boolean) : [];
+}
+
+// Index of `needle` as a run of whole tokens inside `hay`, or -1.
+// Whole tokens is the point: "male" is a substring of "female" but not a token of it.
+function tokenRunIndex(hay, needle) {
+  if (!needle.length || needle.length > hay.length) return -1;
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (hay[i + j] !== needle[j]) { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+function tokenOverlapRatio(a, b) {
+  const sa = new Set(a);
+  const sb = new Set(b);
+  if (!sa.size || !sb.size) return 0;
+  let inter = 0;
+  sa.forEach(t => { if (sb.has(t)) inter++; });
+  return inter / (sa.size + sb.size - inter);
+}
+
+function scoreTokensAgainstTarget(optToks, targetToks) {
+  if (!optToks.length || !targetToks.length) return 0;
+  if (optToks.length === targetToks.length && optToks.every((t, i) => t === targetToks[i])) return 1;
+
+  const [short, long] = optToks.length <= targetToks.length
+    ? [optToks, targetToks]
+    : [targetToks, optToks];
+  const at = tokenRunIndex(long, short);
+  if (at !== -1) {
+    const ratio = short.length / long.length;
+    // A leading run ("Remote" in "Remote (Work from home)") is the common way ATS
+    // options are padded, so it earns credit at a lower ratio than an interior one.
+    if (at === 0 && ratio >= 0.25) return 0.80 + 0.15 * ratio;
+    if (ratio >= 0.5) return 0.75 + 0.20 * ratio;
+  }
+
+  const overlap = tokenOverlapRatio(optToks, targetToks);
+  if (overlap >= 0.5) return 0.60 + 0.30 * overlap;
+
+  const fuzzy = scoreStringMatch(optToks.join(' '), targetToks.join(' '));
+  return fuzzy ? Math.min(0.6, fuzzy * 0.7) : 0;
+}
+
 function computeOptionMatchScore(optText, optValue, targets) {
-  const tText = (optText || '').toString();
-  const tVal = (optValue || '').toString();
-  const optNorm = normalizeOptionText(tText);
-  const optValNorm = normalizeOptionText(tVal);
+  const textToks = optionTokens(optText);
+  const valueToks = optionTokens(optValue);
   let best = 0;
   (targets || []).forEach(t => {
-    const targetNorm = normalizeOptionText(t);
-    if (!targetNorm) return;
-    if ((optNorm && optNorm === targetNorm) || (optValNorm && optValNorm === targetNorm)) {
-      best = Math.max(best, 1);
-      return;
-    }
-    if (
-      (optNorm && (optNorm.includes(targetNorm) || targetNorm.includes(optNorm))) ||
-      (optValNorm && (optValNorm.includes(targetNorm) || targetNorm.includes(optValNorm)))
-    ) {
-      best = Math.max(best, 0.85);
-    }
-    const fuzzy = scoreStringMatch(optNorm, targetNorm);
-    if (fuzzy) best = Math.max(best, Math.min(0.6, fuzzy * 0.7));
+    const targetToks = optionTokens(t);
+    if (!targetToks.length) return;
+    best = Math.max(best, scoreTokensAgainstTarget(textToks, targetToks));
+    if (valueToks.length) best = Math.max(best, scoreTokensAgainstTarget(valueToks, targetToks));
   });
   return best;
 }
@@ -5638,7 +5936,7 @@ function showConfidenceOverlay(savedFields) {
     let source = 'site';
     let globalMeta = null;
     if (val === undefined) {
-      globalMeta = getGlobalMatchMeta(fieldKey);
+      globalMeta = getGlobalMatchMeta(fieldKey, el);
       val = globalMeta?.value;
       source = 'global';
     }
@@ -5868,7 +6166,7 @@ function showAutofillBanner(savedFields) {
   if (!hasFillableFields()) return;
   // Don't show if user already skipped or accepted during this session
   if (getSessionFlag('autofillDismissed')) {
-    console.log('[FormPilot] Autofill banner already dismissed this session, skipping.');
+    flog('[FormPilot] Autofill banner already dismissed this session, skipping.');
     return;
   }
 
@@ -6083,20 +6381,20 @@ function attachRecorder() {
     submissionDebounceTimer = setTimeout(() => { submissionDebounceTimer = null; }, 600);
 
     if (isSiteDisabled()) {
-      console.log('[FormPilot] Site disabled. Skipping auto-capture.');
+      flog('[FormPilot] Site disabled. Skipping auto-capture.');
       return;
     }
     if (!isJobFlowEligible()) {
-      console.log('[FormPilot] Non-job context detected. Skipping auto-capture.');
+      flog('[FormPilot] Non-job context detected. Skipping auto-capture.');
       return;
     }
 
     const stage = meta.stage || 'unknown';
     const effectiveStage = stage === 'unknown' ? 'final' : stage;
 
-    console.log(`[FormPilot] Intercepted submission via: ${source}`);
+    flog(`[FormPilot] Intercepted submission via: ${source}`);
     const fields = getFormFields();
-    console.log(`[FormPilot] Captured fields:`, fields);
+    flog(`[FormPilot] Captured fields:`, fields);
 
     if (Object.keys(fields).length > 0) {
       chrome.runtime.sendMessage({ type: 'SESSION_MERGE', hostname, fields }).catch(() => { });
@@ -6104,21 +6402,21 @@ function attachRecorder() {
       if (effectiveStage === 'next') {
         setSessionFlag('autofillActive', true);
         startStepReapplyObserver(normalizeStoredFieldKeys({ ...(siteData?.fields || {}), ...fields }));
-        console.log('[FormPilot] Multi-step detected. Carrying data forward silently.');
+        flog('[FormPilot] Multi-step detected. Carrying data forward silently.');
         return;
       }
 
       // If user previously clicked Save on page 1, silently save page 2+ data
       if (getSessionFlag('promptSkipped')) {
-        console.log(`[FormPilot] Banner skipped this session. Silently saving data.`);
+        flog(`[FormPilot] Banner skipped this session. Silently saving data.`);
         chrome.runtime.sendMessage({ type: 'SAVE_FIELDS', hostname, fields });
       } else {
-        console.log(`[FormPilot] Prompting to save data.`);
+        flog(`[FormPilot] Prompting to save data.`);
         showSaveDataBanner(fields);
       }
 
     } else {
-      console.log(`[FormPilot] No fields found, skipping prompt.`);
+      flog(`[FormPilot] No fields found, skipping prompt.`);
     }
 
     // Show a quick review panel and auto-track application on final submit
@@ -6243,15 +6541,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         const merged = normalizeStoredFieldKeys({ ...(site.fields || {}), ...(sessionResp?.fields || {}) });
 
-        console.group('[FormPilot DEBUG] MANUAL_AUTOFILL triggered');
-        console.log('  hostname:', hostname);
-        console.log('  site.enabled:', site.enabled, '| site.disabled:', site.disabled);
-        console.log('  site.fields count:', Object.keys(site.fields || {}).length, Object.keys(site.fields || {}));
-        console.log('  session.fields count:', Object.keys(sessionResp?.fields || {}).length, Object.keys(sessionResp?.fields || {}));
-        console.log('  globalProfile count:', Object.keys(currentGlobalProfile || {}).length, Object.keys(currentGlobalProfile || {}));
-        console.log('  merged fields count:', Object.keys(merged).length);
-        console.log('  mappings count:', currentSiteMappings.length);
-        console.groupEnd();
+        fgroup('[FormPilot DEBUG] MANUAL_AUTOFILL triggered');
+        flog('  hostname:', hostname);
+        flog('  site.enabled:', site.enabled, '| site.disabled:', site.disabled);
+        flog('  site.fields count:', Object.keys(site.fields || {}).length, Object.keys(site.fields || {}));
+        flog('  session.fields count:', Object.keys(sessionResp?.fields || {}).length, Object.keys(sessionResp?.fields || {}));
+        flog('  globalProfile count:', Object.keys(currentGlobalProfile || {}).length, Object.keys(currentGlobalProfile || {}));
+        flog('  merged fields count:', Object.keys(merged).length);
+        flog('  mappings count:', currentSiteMappings.length);
+        fgroupEnd();
         logEvent({
           type: 'manual_autofill',
           hostname,
@@ -6351,6 +6649,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'AUTH_STATE_CHANGED') {
+    if (!msg.loggedIn && !requireSignIn) {
+      // Local-only mode: cloud data is gone but local autofill keeps working.
+      currentGlobalProfile = {};
+      globalAliases = {};
+      debouncedInit();
+      sendResponse({ ok: true });
+      return true;
+    }
+    if (!msg.loggedIn) {
+      // 1. Reset all in-memory state
+      currentGlobalProfile = {};
+      siteData = { enabled: true, fields: {}, mappings: [], flags: {} };
+      currentSiteMappings = [];
+      sessionFlags = {};
+      globalAliases = {};
+
+      // 2. Remove all UI overlays
+      try {
+        const banner = document.getElementById('ja-banner');
+        if (banner) banner.remove();
+      } catch (_) { }
+      suppressSiteUi();
+
+      // 3. Clear timers
+      if (coverageBannerTimer) clearTimeout(coverageBannerTimer);
+      if (reinitTimer) clearTimeout(reinitTimer);
+
+      flog('[FormPilot] Logged out - stopped and cleared state.');
+    } else {
+      flog('[FormPilot] Logged in - re-initializing...');
+      debouncedInit();
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
   return false;
 });
 
@@ -6390,21 +6725,30 @@ async function triggerAiMapping(elementsToMap) {
 
   isAiMappingRunning = true;
   try {
-    const aiSettings = await chrome.runtime.sendMessage({ type: 'AI_GET_SETTINGS' }).then(r => r.settings).catch(() => null);
-    if (!aiSettings?.enabled || !aiSettings?.apiKey) return;
+    const aiState = await chrome.runtime.sendMessage({ type: 'AI_IS_ENABLED' }).catch(() => null);
+    if (!aiState?.enabled) return;
 
-    console.log(`[FormPilot] Triggering AI mapping for ${uniqueLabels.length} unknown fields...`);
+    flog(`[FormPilot] Triggering AI mapping for ${uniqueLabels.length} unknown fields...`);
     const resp = await chrome.runtime.sendMessage({ type: 'AI_MATCH_FIELDS', fieldLabels: uniqueLabels }).catch(() => null);
     if (resp?.ok && resp.mapping) {
       let added = 0;
       const newMappings = [];
+      // Field labels are authored by the page, so they can carry instructions into
+      // the prompt. Only accept a mapping onto a key that actually exists in the
+      // user's profile — anything else is the model being steered.
+      const allowedKeys = new Set(Object.keys(currentGlobalProfile || {}));
       for (const [label, matchedKey] of Object.entries(resp.mapping)) {
-        if (matchedKey && String(matchedKey).trim() && String(matchedKey).trim() !== 'null') {
+        const key = String(matchedKey ?? '').trim();
+        if (!allowedKeys.has(key)) {
+          if (key && key !== 'null') flog(`[FormPilot] Rejected AI mapping "${label}" -> "${key}" (not a profile key).`);
+          continue;
+        }
+        {
           const el = elMap.get(label);
           if (el) {
             const signature = getFieldSignature(el);
             const hints = buildElementHints(el);
-            const mapping = { signature, mappedKey: matchedKey, label, type: el.type || 'text', hints, confidence: 8 };
+            const mapping = { signature, mappedKey: key, label, type: el.type || 'text', hints, confidence: 8 };
             newMappings.push(mapping);
             added++;
           }
@@ -6420,7 +6764,7 @@ async function triggerAiMapping(elementsToMap) {
         siteData.mappings = currentSiteMappings;
         // Don't re-trigger fill here — mappings will be used on next user-initiated fill.
         // This prevents cascading fill loops from AI mapping → fillFields → observer → re-fill.
-        console.log(`[FormPilot] AI mapping complete. Learned ${added} new fields. Will be used on next autofill.`);
+        flog(`[FormPilot] AI mapping complete. Learned ${added} new fields. Will be used on next autofill.`);
       }
     }
   } catch (e) {
@@ -6432,7 +6776,29 @@ async function triggerAiMapping(elementsToMap) {
 
 // ── Init ───────────────────────────────────────────────────────
 let initRunning = false;
+let initInFlight = false;
+let lastInitAt = 0;
+const INIT_MIN_INTERVAL_MS = 1500;
+
+// Several things call debouncedInit() — SPA path changes, hash changes, auth
+// changes, site-setting messages. On a page whose embed script rewrites the query
+// string they can pile up, and each init() is a full scan. Throttle centrally.
 async function init() {
+  if (initInFlight) return;
+  if (Date.now() - lastInitAt < INIT_MIN_INTERVAL_MS) {
+    flog('[FormPilot] init() throttled — ran less than 1.5s ago.');
+    return;
+  }
+  initInFlight = true;
+  lastInitAt = Date.now();
+  try {
+    await runInit();
+  } finally {
+    initInFlight = false;
+  }
+}
+
+async function runInit() {
   if (initRunning) return;
   if (!isExtensionValid()) return;
   initRunning = true;
@@ -6448,14 +6814,40 @@ async function init() {
       if (excludeResp?.excluded) {
         siteExcluded = true;
         currentSiteActive = false;
-        console.log(`[FormPilot] Site excluded (not a job portal): ${hostname}`);
+        flog(`[FormPilot] Site excluded (not a job portal): ${hostname}`);
         suppressSiteUi();
         return;
       }
       siteExcluded = false;
     } catch (_) { siteExcluded = false; }
 
-    console.log(`[FormPilot] Initializing on ${location.href}`);
+    // Sign-in gate is opt-in (Settings → "Require sign-in"). Default is local-only
+    // mode: autofill works signed out, and signing in adds cloud sync on top.
+    try {
+      const settingsResp = await chrome.runtime.sendMessage({ type: 'GET_EXT_SETTINGS' });
+      requireSignIn = settingsResp?.settings?.requireSignIn === true;
+    } catch (_) { requireSignIn = false; }
+
+    if (requireSignIn) {
+      try {
+        const authStatus = await chrome.runtime.sendMessage({ type: 'CLOUD_GET_STATUS' });
+        if (!authStatus || !authStatus.loggedIn) {
+          flog('[FormPilot] Autofill paused: "Require sign-in" is on and no user is signed in.');
+          suppressSiteUi();
+          return;
+        }
+      } catch (_) { /* background unreachable — fail open rather than block the user */ }
+    }
+
+    if (location.href === 'about:blank' && !hasFillableFields()) {
+      // Blank frames get the content script injected (match_about_blank), then
+      // navigate to the real ATS document, which injects a fresh instance.
+      // Running the whole pipeline here is pure waste.
+      flog('[FormPilot] Blank frame with no fields — skipping init.');
+      return;
+    }
+
+    flog(`[FormPilot] Initializing on ${location.href}`);
     ensureBrandFont();
 
     const [resp, profileResp, sessionResp, aliasResp] = await Promise.all([
@@ -6476,7 +6868,7 @@ async function init() {
     // 1. If explicitly blocked ("Never") OR toggled off in popup, stop completely
     currentSiteActive = !(site?.disabled || site?.enabled === false);
     if (!currentSiteActive) {
-      console.log(`[FormPilot] Extension inactive for ${hostname} (Disabled: ${!!site?.disabled}, Enabled: ${site?.enabled})`);
+      flog(`[FormPilot] Extension inactive for ${hostname} (Disabled: ${!!site?.disabled}, Enabled: ${site?.enabled})`);
       suppressSiteUi();
       return;
     }
@@ -6531,19 +6923,19 @@ async function init() {
     });
 
     // ── DIAGNOSTIC LOG (remove when working) ─────────────────────
-    console.group('[FormPilot] INIT SUMMARY');
-    console.log('  hostname (storage key):', hostname);
-    console.log('  site.enabled:', site?.enabled, '| site.disabled:', site?.disabled);
-    console.log('  site.fields count:', Object.keys(site?.fields || {}).length, Object.keys(site?.fields || {}));
-    console.log('  session.fields count:', Object.keys(sessionFields).length, Object.keys(sessionFields));
-    console.log('  globalProfile count:', globalCount, Object.keys(currentGlobalProfile));
-    console.log('  merged fields:', savedCount, Object.keys(mergedFields));
-    console.log('  allowAuto:', allowAuto, '| jobContextOk:', jobContextOk, '| currentSiteActive:', currentSiteActive);
+    fgroup('[FormPilot] INIT SUMMARY');
+    flog('  hostname (storage key):', hostname);
+    flog('  site.enabled:', site?.enabled, '| site.disabled:', site?.disabled);
+    flog('  site.fields count:', Object.keys(site?.fields || {}).length, Object.keys(site?.fields || {}));
+    flog('  session.fields count:', Object.keys(sessionFields).length, Object.keys(sessionFields));
+    flog('  globalProfile count:', globalCount, Object.keys(currentGlobalProfile));
+    flog('  merged fields:', savedCount, Object.keys(mergedFields));
+    flog('  allowAuto:', allowAuto, '| jobContextOk:', jobContextOk, '| currentSiteActive:', currentSiteActive);
     if (savedCount === 0 && globalCount === 0) {
       console.warn('  ⚠️ NO DATA to autofill! Fill the form manually first, then click SAVE in the popup.');
       console.warn('  ⚠️ OR upload your resume in Dashboard to populate global profile.');
     }
-    console.groupEnd();
+    fgroupEnd();
     logEvent({
       type: 'init_summary',
       hostname,
@@ -6567,11 +6959,11 @@ async function init() {
 
     if (allowAuto && (savedCount > 0 || globalCount > 0)) {
       if (!ACCURACY_MODE) {
-        console.log('[FormPilot] Aggressive autofill enabled. Auto-filling now.');
+        flog('[FormPilot] Aggressive autofill enabled. Auto-filling now.');
         setSessionFlag('autofillActive', true);
         fillFields(mergedFields || {});
       } else if (getSessionFlag('autofillActive')) {
-        console.log(`[FormPilot] Autofill session active. Auto-filling new fields...`);
+        flog(`[FormPilot] Autofill session active. Auto-filling new fields...`);
         fillFields(mergedFields || {});
       } else {
         // Small delay to let the page fully render
@@ -6622,7 +7014,7 @@ async function init() {
   } catch (err) {
     // Extension context invalidated (e.g., extension was updated/reloaded)
     if (err.message?.includes('Extension context invalidated')) {
-      console.log('[FormPilot] Extension context invalidated, stopping.');
+      flog('[FormPilot] Extension context invalidated, stopping.');
       return;
     }
     console.error('[FormPilot] Init error:', err?.name || 'Error', err?.message || err);
@@ -6648,7 +7040,7 @@ init();
 
 // Handle SPA navigation (hash changes)
 window.addEventListener('hashchange', () => {
-  console.log('[FormPilot] Hash change detected, re-initializing...');
+  flog('[FormPilot] Hash change detected, re-initializing...');
   debouncedInit();
 });
 
@@ -6658,7 +7050,7 @@ navObserver = new MutationObserver(() => {
   const currentPath = location.pathname + location.search + location.hash;
   if (currentPath !== lastPath) {
     lastPath = currentPath;
-    console.log('[FormPilot] Path change detected, re-initializing...');
+    flog('[FormPilot] Path change detected, re-initializing...');
     debouncedInit();
   }
 });

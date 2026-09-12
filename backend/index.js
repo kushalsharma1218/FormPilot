@@ -16,14 +16,59 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ── CORS ───────────────────────────────────────────────────────
+// Default-deny. Set ALLOWED_ORIGINS to a comma-separated list, e.g.
+//   ALLOWED_ORIGINS=chrome-extension://abcdef...,http://localhost:5173
+// An empty list allows only same-origin/no-origin callers (curl, tests).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin) return callback(null, true); // curl, server-to-server, tests
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        return callback(new Error(`Origin not allowed: ${origin}`));
+    },
+}));
+app.use(express.json({ limit: '1mb' }));
+
+// ── Rate limiting ──────────────────────────────────────────────
+// Small in-process fixed-window limiter. Good enough for a single instance;
+// use a shared store (Redis) if this is ever run behind more than one process.
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 10);
+const rateBuckets = new Map();
+
+function rateLimit(req, res, next) {
+    const now = Date.now();
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const bucket = rateBuckets.get(ip);
+
+    if (!bucket || now >= bucket.resetAt) {
+        rateBuckets.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    } else if (bucket.count >= RATE_LIMIT_MAX) {
+        const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
+        res.set('Retry-After', String(retryAfter));
+        return res.status(429).json({ error: `Too many requests. Retry in ${retryAfter}s.` });
+    } else {
+        bucket.count += 1;
+    }
+
+    // Opportunistic cleanup so the map cannot grow without bound.
+    if (rateBuckets.size > 10_000) {
+        for (const [key, value] of rateBuckets) {
+            if (now >= value.resetAt) rateBuckets.delete(key);
+        }
+    }
+    return next();
+}
 
 // Set up multer for file uploads in memory
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+    limits: { fileSize: 5 * 1024 * 1024, files: 1 } // 5MB limit
 });
 
 // Setup Gemini
@@ -34,7 +79,7 @@ app.get('/health', (req, res) => {
 });
 
 // PDF Parse and Analyze Route
-app.post('/api/parse-resume', upload.single('resume'), async (req, res) => {
+app.post('/api/parse-resume', rateLimit, upload.single('resume'), async (req, res) => {
     try {
         const file = req.file;
         if (!file) {
@@ -62,8 +107,15 @@ app.post('/api/parse-resume', upload.single('resume'), async (req, res) => {
         const apiKeyHeader = req.headers['x-gemini-api-key'];
         let activeModel = model;
         if (apiKeyHeader) {
+            if (typeof apiKeyHeader !== 'string' || !/^[A-Za-z0-9_-]{20,200}$/.test(apiKeyHeader)) {
+                return res.status(400).json({ error: 'Malformed x-gemini-api-key header' });
+            }
             const customGenAI = new GoogleGenerativeAI(apiKeyHeader);
             activeModel = customGenAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+        } else if (!process.env.GEMINI_API_KEY) {
+            return res.status(400).json({
+                error: 'No Gemini API key available. Send your own key in the x-gemini-api-key header.'
+            });
         }
 
         const prompt = `You are a professional resume parser. Extract ALL structured data from the following resume text.
@@ -180,6 +232,18 @@ ${resumeText}
         console.error('Error parsing resume:', error);
         res.status(500).json({ error: error.message || 'Internal server error while parsing resume' });
     }
+});
+
+// Turn CORS rejections into a clean 403 rather than a 500 stack trace.
+app.use((err, req, res, next) => {
+    if (err && /^Origin not allowed/.test(err.message || '')) {
+        return res.status(403).json({ error: 'Origin not allowed' });
+    }
+    if (err && err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'Resume exceeds the 5MB limit' });
+    }
+    console.error('[Backend] Unhandled error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
 });
 
 if (require.main === module) {

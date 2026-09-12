@@ -1125,3 +1125,14 @@ body.site-excluded #btn-clear,
 body.site-excluded #btn-exclude {
   display: none !important;
 }
+
+.account-sync {
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-dim);
+}
+
+.account-sync.sync-error {
+    color: var(--danger);
+}

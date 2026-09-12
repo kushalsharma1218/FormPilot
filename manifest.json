@@ -1,14 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "FormPilot AI — Smart Application Autofill",
+  "name": "FormPilot AI \u2014 Smart Application Autofill",
   "version": "2.2.0",
   "description": "Elegant AI-powered autofill for job applications and complex forms. Learn once, fill everywhere.",
   "permissions": [
     "storage",
-    "activeTab",
-    "scripting",
     "tabs",
-    "sidePanel",
     "identity"
   ],
   "oauth2": {
@@ -32,6 +29,9 @@
       ],
       "js": [
         "lib/field-utils.js",
+        "lib/field-ontology.js",
+        "lib/value-vocab.js",
+        "lib/field-match.js",
         "content.js"
       ],
       "run_at": "document_idle",
@@ -60,13 +60,14 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "dashboard/pdf.worker.min.js",
-        "dashboard/pdf.min.js",
         "assets/fonts/plus-jakarta-sans-latin-wght-normal.woff2"
       ],
       "matches": [
         "<all_urls>"
       ]
     }
-  ]
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; frame-ancestors 'none'"
+  }
 }

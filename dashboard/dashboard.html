@@ -9,7 +9,7 @@
 </head>
 
 <body>
-<!-- DEBUG: if dashboard fails to load, this label proves HTML rendered -->
+    <!-- DEBUG: if dashboard fails to load, this label proves HTML rendered -->
 
     <div id="dashboard-auth-shield" class="dash-auth-shield" style="display:none;">
         <div class="dash-auth-card">
@@ -40,21 +40,29 @@
             </div>
 
             <div class="dash-auth-divider"><span>OR</span></div>
-            
+
             <button class="btn btn-secondary dash-auth-btn dash-auth-google" id="btn-dash-google">
                 <div class="dash-google-icon">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
-                        <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
-                        <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
-                        <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+                        <path
+                            d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                            fill="#4285F4" />
+                        <path
+                            d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                            fill="#34A853" />
+                        <path
+                            d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                            fill="#FBBC05" />
+                        <path
+                            d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                            fill="#EA4335" />
                     </svg>
                 </div>
                 Sign in with Google
             </button>
 
             <div id="dash-auth-error" class="dash-auth-error"></div>
-            
+
             <div id="dash-auth-setup-msg" class="dash-auth-footer"></div>
         </div>
     </div>
@@ -93,8 +101,7 @@
                     <span>Overview</span>
                 </button>
                 <button class="nav-item" data-tab="metrics">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                        stroke-width="2">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M3 3v18h18" />
                         <rect x="7" y="13" width="3" height="5" />
                         <rect x="12" y="9" width="3" height="9" />
@@ -213,7 +220,8 @@
                         <div class="stat-card-icon">
                             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                 stroke-width="2">
-                                <path d="M12 2l2.7 5.5 6.1.9-4.4 4.3 1 6.2L12 16.9 6.6 18.9l1-6.2-4.4-4.3 6.1-.9L12 2z" />
+                                <path
+                                    d="M12 2l2.7 5.5 6.1.9-4.4 4.3 1 6.2L12 16.9 6.6 18.9l1-6.2-4.4-4.3 6.1-.9L12 2z" />
                             </svg>
                         </div>
                         <div class="stat-card-data">
@@ -455,9 +463,11 @@
                     <p class="card-hint">Store multiple resumes and attach them to job applications with one click.</p>
                     <div class="resume-vault-actions">
                         <div class="resume-vault-controls">
-                            <input type="text" id="resume-vault-label" placeholder="Label / Style (e.g., ATS, Design)" />
+                            <input type="text" id="resume-vault-label"
+                                placeholder="Label / Style (e.g., ATS, Design)" />
                             <button class="btn btn-secondary" id="btn-resume-vault-upload">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
                                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                                     <polyline points="17 8 12 3 7 8" />
                                     <line x1="12" y1="3" x2="12" y2="15" />
@@ -884,6 +894,123 @@
                     </div>
                 </div>
 
+                <!-- Autofill Mode -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Autofill Mode</h2>
+                    </div>
+                    <p class="card-hint">“Local only” fills forms from data stored on this device, signed in or not.
+                        “Require sign-in” pauses autofill entirely until you sign in.</p>
+                    <div class="theme-toggle" id="autofill-mode-toggle">
+                        <button class="theme-btn" data-require-signin="false">Local only</button>
+                        <button class="theme-btn" data-require-signin="true">Require sign-in</button>
+                    </div>
+                </div>
+
+                <!-- AI Provider -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>AI Assistant</h2>
+                    </div>
+                    <p class="card-hint">FormPilot is bring-your-own-key: your key is stored on this
+                        device and used only for the AI features you trigger.</p>
+
+                    <div class="form-group">
+                        <label for="ai-provider">Provider</label>
+                        <select id="ai-provider">
+                            <option value="built-in">🧠 Built-in AI (Free — No Key)</option>
+                            <option value="groq">⚡ Groq (Free Tier Available)</option>
+                            <option value="gemini">💎 Google Gemini</option>
+                            <option value="openai">🟢 OpenAI (ChatGPT)</option>
+                            <option value="anthropic">🟣 Anthropic (Claude)</option>
+                        </select>
+                    </div>
+
+                    <div id="builtin-status" class="ai-status-box">
+                        <span id="builtin-status-icon">⏳</span>
+                        <div>
+                            <div id="builtin-status-text">Checking built-in AI…</div>
+                            <div id="builtin-status-hint" class="card-hint"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-group" id="model-group">
+                        <label for="ai-model">Model</label>
+                        <select id="ai-model"></select>
+                    </div>
+
+                    <div class="form-group" id="api-key-group">
+                        <label for="ai-api-key">API Key</label>
+                        <div class="ai-key-row">
+                            <input type="password" id="ai-api-key" placeholder="Paste your API key"
+                                autocomplete="off" spellcheck="false" />
+                            <button class="btn btn-secondary btn-sm" id="btn-toggle-key" type="button">Show</button>
+                        </div>
+                        <div id="api-key-hint" class="card-hint"></div>
+                    </div>
+
+                    <label class="ai-enable-row">
+                        <input type="checkbox" id="ai-enabled" />
+                        <span>Enable AI features</span>
+                    </label>
+
+                    <div class="ai-actions-row">
+                        <button class="btn btn-primary" id="btn-save-ai" type="button">Save</button>
+                        <button class="btn btn-secondary" id="btn-test-ai" type="button">Test Connection</button>
+                        <span id="ai-status-msg" class="card-hint"></span>
+                    </div>
+                </div>
+
+                <!-- Cloud Sync -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Cloud Sync</h2>
+                        <span class="card-badge" id="cloud-status-badge">Checking…</span>
+                    </div>
+                    <p class="card-hint" id="cloud-auth-msg"></p>
+
+                    <div id="cloud-logged-in" style="display:none">
+                        <div class="cloud-account">
+                            <div>
+                                <div class="cloud-account-name" id="cloud-user-name">—</div>
+                                <div class="card-hint" id="cloud-user-email">—</div>
+                            </div>
+                            <div class="card-hint">Last sync: <span id="cloud-last-sync">Never</span></div>
+                        </div>
+                    </div>
+
+                    <div id="cloud-sync-prefs" style="display:none">
+                        <label class="ai-enable-row">
+                            <input type="checkbox" id="cloud-sync-enabled" />
+                            <span>Sync this device</span>
+                        </label>
+                        <p class="card-hint">Choose what to keep in sync. Your profile always syncs.</p>
+                        <label class="ai-enable-row">
+                            <input type="checkbox" id="cloud-sync-profile" disabled checked />
+                            <span>Profile (always on)</span>
+                        </label>
+                        <label class="ai-enable-row">
+                            <input type="checkbox" id="cloud-sync-autofill" />
+                            <span>Saved site fields</span>
+                        </label>
+                        <label class="ai-enable-row">
+                            <input type="checkbox" id="cloud-sync-apps" />
+                            <span>Applications &amp; tasks</span>
+                        </label>
+                        <label class="ai-enable-row">
+                            <input type="checkbox" id="cloud-sync-ai" />
+                            <span>AI settings</span>
+                        </label>
+
+                        <div class="ai-actions-row">
+                            <button class="btn btn-secondary btn-sm" id="btn-cloud-push" type="button">Push now</button>
+                            <button class="btn btn-secondary btn-sm" id="btn-cloud-pull" type="button">Pull now</button>
+                            <button class="btn btn-danger btn-sm" id="btn-cloud-delete" type="button">Delete cloud data</button>
+                            <span id="cloud-sync-msg" class="card-hint"></span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Disabled Sites -->
                 <div class="card">
                     <div class="card-header">
@@ -893,6 +1020,47 @@
                     <p class="card-hint">The extension is completely disabled for these sites.</p>
                     <div id="disabled-sites-list" class="disabled-sites-list">
                         <div class="empty-state">No sites are currently disabled.</div>
+                    </div>
+                </div>
+
+                <!-- Sync Security (E2EE) -->
+                <div class="card card-premium">
+                    <div class="card-header">
+                        <h2>End-to-End Encryption (E2EE)</h2>
+                        <span class="card-badge badge-secure" id="sync-security-badge" hidden>Secure</span>
+                    </div>
+                    <p class="card-hint">Protect your profile and application data with a custom sync passphrase. Your
+                        data is encrypted locally before being sent to the cloud.</p>
+
+                    <div id="sync-setup-container" class="sync-setup-container">
+                        <div class="sync-setup-form">
+                            <div class="form-group">
+                                <label for="sync-passphrase">New Sync Passphrase</label>
+                                <input type="password" id="sync-passphrase" placeholder="At least 8 characters" />
+                            </div>
+                            <div class="form-group">
+                                <label for="sync-passphrase-confirm">Confirm Passphrase</label>
+                                <input type="password" id="sync-passphrase-confirm" placeholder="Repeat passphrase" />
+                            </div>
+                            <button class="btn btn-primary" id="btn-set-sync-passphrase">Activate Encryption</button>
+                        </div>
+                        <p class="card-warning-hint">⚠️ <strong>Important:</strong> FormPilot cannot recover this
+                            passphrase. If you lose it, you will lose access to your synced data on other devices.</p>
+                    </div>
+
+                    <div id="sync-active-container" class="sync-active-container" hidden>
+                        <div class="sync-status-row">
+                            <div class="sync-status-info">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                                </svg>
+                                <span>Encryption is Active</span>
+                            </div>
+                            <button class="btn btn-ghost btn-sm" id="btn-change-sync-passphrase">Change
+                                Passphrase</button>
+                        </div>
                     </div>
                 </div>
 

@@ -26,36 +26,19 @@ const TASK_STATUS_ALIASES = {
   on_hold: 'blocked',
 };
 
-function normalizeTaskStatus(status) {
-  if (!status) return 'new';
-  const raw = String(status).trim().toLowerCase();
-  if (!raw) return 'new';
-  const normalized = raw.replace(/[\s-]+/g, '_');
-  if (TASK_STATUS_SET.has(normalized)) return normalized;
-  if (TASK_STATUS_ALIASES[normalized]) return TASK_STATUS_ALIASES[normalized];
-  return 'backlog';
-}
-
-function normalizeTaskList(tasks) {
-  let changed = false;
-  const next = tasks.map(task => {
-    const normalized = normalizeTaskStatus(task?.status);
-    if (normalized !== task?.status) {
-      changed = true;
-      return { ...task, status: normalized };
-    }
-    return task;
-  });
-  return { next, changed };
-}
+// normalizeTaskStatus / normalizeTaskList now live in background.js (task tracker owner).
 
 const AIAuthStore = (globalThis.JobAutofill && JobAutofill.AuthStore) || {
   getUserKey: async (baseKey) => baseKey,
 };
 const AIUtils = (globalThis.JobAutofill && JobAutofill.AIUtils) || null;
-const PRIVATE_AI_CONFIG = globalThis.PRIVATE_AI_CONFIG || (globalThis.PRIVATE_GROQ_API_KEY
-  ? { provider: 'groq', apiKey: globalThis.PRIVATE_GROQ_API_KEY, model: 'llama-3.3-70b-versatile', enabled: true }
-  : null);
+// Bring-your-own-key only. A bundled key would ship inside the packaged extension,
+// where any installer can extract and spend it, so only non-secret defaults
+// (provider/model) are read from config.private.js — never an apiKey.
+const PRIVATE_AI_CONFIG = globalThis.PRIVATE_AI_CONFIG || null;
+if (PRIVATE_AI_CONFIG?.apiKey || globalThis.PRIVATE_GROQ_API_KEY) {
+  console.warn('[AI] Ignoring bundled API key: FormPilot uses your own key from Settings → AI.');
+}
 const extractJSON = AIUtils?.extractJSON || function (text) {
   if (!text || typeof text !== 'string') {
     throw new Error('AI returned empty or non-string response');
@@ -102,27 +85,43 @@ const retryWithBackoff = AIUtils?.retryWithBackoff || async function (fn, maxAtt
 };
 
 async function getAiSettings() {
-  if (PRIVATE_AI_CONFIG && PRIVATE_AI_CONFIG.apiKey) {
-    return {
-      enabled: PRIVATE_AI_CONFIG.enabled !== false,
-      provider: PRIVATE_AI_CONFIG.provider || 'groq',
-      apiKey: PRIVATE_AI_CONFIG.apiKey || '',
-      model: PRIVATE_AI_CONFIG.model || 'llama-3.3-70b-versatile',
-    };
-  }
   const key = await AIAuthStore.getUserKey(AI_SETTINGS_KEY);
   const result = await chrome.storage.local.get(key);
-  return result[key] || {
+  const stored = result[key] || {};
+  return {
     enabled: true,
-    provider: 'groq',
-    apiKey: '',
-    model: '',
+    // config.private.js may pre-select a provider/model for a local build, but the
+    // key always comes from the user's own settings.
+    provider: PRIVATE_AI_CONFIG?.provider || 'groq',
+    model: PRIVATE_AI_CONFIG?.model || '',
+    ...stored,
+    apiKey: stored.apiKey || '',
   };
 }
 
 async function saveAiSettings(settings) {
   const key = await AIAuthStore.getUserKey(AI_SETTINGS_KEY);
   await chrome.storage.local.set({ [key]: settings });
+}
+
+// Every provider call gets a deadline. Without one, a provider that accepts the
+// connection and never responds leaves sendResponse uncalled forever, so the
+// popup or dashboard button stays spinning with no error and no way back.
+const AI_REQUEST_TIMEOUT_MS = 45000;
+
+async function aiFetch(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+  try {
+    return await aiFetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`AI provider did not respond within ${AI_REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── Provider Registry ─────────────────────────────────────────
@@ -295,7 +294,7 @@ async function callGemini(prompt, apiKey, model, temperature, maxTokens, jsonMod
   for (const url of endpoints) {
     try {
       const result = await retryWithBackoff(async () => {
-        const resp = await fetch(url, {
+        const resp = await aiFetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -339,7 +338,7 @@ async function callOpenAI(prompt, apiKey, model, temperature, maxTokens, jsonMod
     };
     if (jsonMode) body.response_format = { type: 'json_object' };
 
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    const resp = await aiFetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -369,7 +368,7 @@ async function callAnthropic(prompt, apiKey, model, temperature, maxTokens, json
       ? 'You are a helpful assistant. Always respond with valid JSON only, no markdown or extra text.'
       : 'You are a helpful assistant.';
 
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    const resp = await aiFetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -411,7 +410,7 @@ async function callGroq(prompt, apiKey, model, temperature, maxTokens, jsonMode)
     };
     if (jsonMode) body.response_format = { type: 'json_object' };
 
-    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const resp = await aiFetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -470,7 +469,7 @@ YOUR OUTPUT MUST EXACTLY MATCH THIS JSON SCHEMA (replace descriptive values with
   "currentCompany": "most recent company",
   "currentTitle": "most recent job title",
   "summary": "professional summary",
-  "totalExperienceYears": 5,
+  "totalYearsExperience": 5,
   "skills": ["skill 1", "skill 2"],
   "workHistory": [
     {
@@ -692,164 +691,6 @@ Return ONLY email body (no greeting, no sign-off, no subject line).`;
   return await callAI(prompt, { temperature: 0.6, maxTokens: 256 });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// APPLICATION TRACKER
-// ═══════════════════════════════════════════════════════════════
-async function getApplications() {
-  const key = await AuthStore.getUserKey(APPLICATIONS_KEY);
-  const result = await chrome.storage.local.get(key);
-  return result[key] || [];
-}
+// APPLICATION TRACKER moved to background.js (its saveApplications also feeds the sync queue).
 
-async function saveApplications(apps) {
-  const key = await AuthStore.getUserKey(APPLICATIONS_KEY);
-  await chrome.storage.local.set({ [key]: apps });
-}
 
-async function addApplication(app) {
-  const apps = await getApplications();
-  const exists = apps.find(a => a.companyName === app.companyName && a.jobTitle === app.jobTitle);
-  if (exists) {
-    Object.assign(exists, app, { updatedAt: new Date().toISOString() });
-  } else {
-    apps.unshift({
-      id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
-      ...app,
-      status: app.status || 'applied',
-      appliedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      notes: '',
-      jobDescription: app.jobDescription || '',
-    });
-  }
-  await saveApplications(apps);
-  return apps;
-}
-
-async function updateApplication(id, updates) {
-  const apps = await getApplications();
-  const app = apps.find(a => a.id === id);
-  if (app) {
-    Object.assign(app, updates, { updatedAt: new Date().toISOString() });
-    await saveApplications(apps);
-  }
-  return apps;
-}
-
-async function deleteApplication(id) {
-  let apps = await getApplications();
-  apps = apps.filter(a => a.id !== id);
-  await saveApplications(apps);
-  return apps;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// TASK TRACKER
-// ═══════════════════════════════════════════════════════════════
-async function getTasks() {
-  const key = await AuthStore.getUserKey(TASKS_KEY);
-  const result = await chrome.storage.local.get(key);
-  const list = result[key] || [];
-  const { next, changed } = normalizeTaskList(list);
-  if (changed) await saveTasks(next);
-  return next;
-}
-
-async function saveTasks(tasks) {
-  const key = await AuthStore.getUserKey(TASKS_KEY);
-  await chrome.storage.local.set({ [key]: tasks });
-}
-
-function recomputeEpics(tasks) {
-  const epics = tasks.filter(t => t.type === 'epic');
-  for (const epic of epics) {
-    const children = tasks.filter(t => t.parentId === epic.id && t.type !== 'epic');
-    if (children.length === 0) continue;
-    const allDone = children.every(c => c.status === 'done');
-    const anyActive = children.some(c => c.status === 'in_progress' || c.status === 'blocked');
-    const anyDone = children.some(c => c.status === 'done');
-    const anyBacklog = children.some(c => c.status === 'backlog');
-    const anyNew = children.some(c => c.status === 'new');
-    let nextStatus = 'new';
-    if (allDone) nextStatus = 'done';
-    else if (anyActive || anyDone) nextStatus = 'in_progress';
-    else if (anyBacklog) nextStatus = 'backlog';
-    else if (anyNew) nextStatus = 'new';
-    if (epic.status !== nextStatus) {
-      epic.status = nextStatus;
-      epic.updatedAt = new Date().toISOString();
-    }
-  }
-  return tasks;
-}
-
-async function addTask(task) {
-  const tasks = await getTasks();
-  const now = new Date().toISOString();
-  const isEpic = task.type === 'epic' || task.isEpic === true;
-  const parentCandidate = isEpic ? '' : (task.parentId || '');
-  const parentId = parentCandidate && parentCandidate !== task.id ? parentCandidate : '';
-  const entryId = task.id && !tasks.some(t => t.id === task.id)
-    ? task.id
-    : (Date.now().toString(36) + Math.random().toString(36).substr(2, 5));
-  const entry = {
-    id: entryId,
-    title: task.title || 'Untitled Task',
-    description: task.description || '',
-    status: normalizeTaskStatus(task.status || (isEpic ? 'new' : 'new')),
-    priority: task.priority || 'medium',
-    dueDate: task.dueDate || '',
-    createdAt: now,
-    updatedAt: now,
-    tags: Array.isArray(task.tags) ? task.tags : [],
-    type: isEpic ? 'epic' : 'task',
-    parentId,
-  };
-  tasks.unshift(entry);
-  const next = recomputeEpics(tasks);
-  await saveTasks(next);
-  return next;
-}
-
-async function updateTask(id, updates) {
-  const tasks = await getTasks();
-  const task = tasks.find(t => t.id === id);
-  if (task) {
-    const nextUpdates = { ...(updates || {}) };
-    if (nextUpdates.status !== undefined) {
-      nextUpdates.status = normalizeTaskStatus(nextUpdates.status);
-    }
-    if (nextUpdates.type === 'epic') {
-      nextUpdates.parentId = '';
-    }
-    if (task.type === 'epic' && nextUpdates.parentId !== undefined) {
-      delete nextUpdates.parentId;
-    }
-    if (nextUpdates.parentId && nextUpdates.parentId === id) {
-      nextUpdates.parentId = '';
-    }
-    Object.assign(task, nextUpdates, { updatedAt: new Date().toISOString() });
-    const next = recomputeEpics(tasks);
-    await saveTasks(next);
-    return next;
-  }
-  return tasks;
-}
-
-async function deleteTask(id) {
-  let tasks = await getTasks();
-  const removed = tasks.find(t => t.id === id);
-  tasks = tasks.filter(t => t.id !== id);
-  if (removed?.type === 'epic') {
-    const now = new Date().toISOString();
-    tasks.forEach(t => {
-      if (t.parentId === id) {
-        t.parentId = '';
-        t.updatedAt = now;
-      }
-    });
-  }
-  const next = recomputeEpics(tasks);
-  await saveTasks(next);
-  return next;
-}
