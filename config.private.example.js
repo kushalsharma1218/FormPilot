@@ -7,10 +7,11 @@ globalThis.PRIVATE_FIREBASE_CONFIG = {
   authDomain: 'your-firebase-project-id.firebaseapp.com',
 };
 
-// Optional AI config (kept private)
+// Optional AI defaults. NOTE: apiKey is intentionally absent — FormPilot is
+// bring-your-own-key. Anything bundled here ships inside the packaged extension
+// and can be extracted by anyone who installs it. Users enter their own key in
+// Dashboard → Settings → AI.
 globalThis.PRIVATE_AI_CONFIG = {
   provider: 'groq',
-  apiKey: 'YOUR_GROQ_API_KEY',
   model: 'llama-3.3-70b-versatile',
-  enabled: true,
 };
