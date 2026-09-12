@@ -1,0 +1,78 @@
+{
+  "_comment": "Dropdown option-selection corpus. `expect: null` means no option is a correct answer and the field must be left alone. Each case is a real spelling pattern seen on ATS forms; the point is that the saved value and the target option are the same CONCEPT spelt differently.",
+  "cases": [
+    { "valueType": "enum:country", "saved": "United Arab Emirates",
+      "options": ["Select…", "United States", "United Arab Emirates", "India"],
+      "expect": "United Arab Emirates" },
+
+    { "valueType": "enum:country", "saved": "United States",
+      "options": ["Select…", "USA", "UK", "India"],
+      "expect": "USA",
+      "note": "Token matching fails: 'united states' shares no token with 'usa'." },
+
+    { "valueType": "enum:country", "saved": "US",
+      "options": ["Select…", "United States of America", "Canada"],
+      "expect": "United States of America" },
+
+    { "valueType": "enum:country", "saved": "India",
+      "options": ["Select…", "British Indian Ocean Territory", "Indonesia"],
+      "expect": null,
+      "note": "Substring traps: 'india' is inside both. Neither is India." },
+
+    { "valueType": "enum:yesno", "saved": "Yes",
+      "options": ["Select…", "Yes, I am authorized to work in the US", "No, I require sponsorship"],
+      "expect": "Yes, I am authorized to work in the US" },
+
+    { "valueType": "enum:yesno", "saved": "No",
+      "options": ["Select…", "I am authorized to work", "I am not authorized to work"],
+      "expect": "I am not authorized to work" },
+
+    { "valueType": "enum:education", "saved": "Bachelor's Degree",
+      "options": ["Select…", "High School Diploma", "Bachelor's Degree (BA/BS)", "Master's Degree (MA/MS)"],
+      "expect": "Bachelor's Degree (BA/BS)" },
+
+    { "valueType": "enum:education", "saved": "B.Tech",
+      "options": ["Select…", "Bachelors", "Masters", "Doctorate"],
+      "expect": "Bachelors",
+      "note": "Same concept, no shared tokens at all." },
+
+    { "valueType": "enum:education", "saved": "MBA",
+      "options": ["Select…", "Undergraduate", "Postgraduate", "PhD"],
+      "expect": "Postgraduate" },
+
+    { "valueType": "enum:workmode", "saved": "Remote",
+      "options": ["Select…", "Remote (Work from home)", "Hybrid (3 days onsite)", "On-site"],
+      "expect": "Remote (Work from home)" },
+
+    { "valueType": "enum:workmode", "saved": "WFH",
+      "options": ["Select…", "Fully Remote", "Hybrid", "In Office"],
+      "expect": "Fully Remote" },
+
+    { "valueType": "enum:gender", "saved": "Male",
+      "options": ["Select…", "Female", "Male", "Prefer not to say"],
+      "expect": "Male" },
+
+    { "valueType": "enum:gender", "saved": "Male",
+      "options": ["Select…", "Woman", "Man", "Non-binary"],
+      "expect": "Man",
+      "note": "'male' is a substring of 'female' but not of 'man' — token matching gets this backwards." },
+
+    { "valueType": "number", "saved": "5",
+      "options": ["Select…", "0-2 years", "3-5 years", "6-10 years"],
+      "expect": "3-5 years",
+      "note": "Experience bands: needs interval containment, not string matching." },
+
+    { "valueType": "number", "saved": "7",
+      "options": ["Select…", "0-2 years", "3-5 years", "6-10 years"],
+      "expect": "6-10 years" },
+
+    { "valueType": "number", "saved": "12",
+      "options": ["Select…", "1-3 years", "4-6 years", "10+ years"],
+      "expect": "10+ years" },
+
+    { "valueType": "number", "saved": "2",
+      "options": ["Select…", "Less than 1 year", "More than 5 years"],
+      "expect": null,
+      "note": "2 falls in neither band; guessing would be wrong." }
+  ]
+}
