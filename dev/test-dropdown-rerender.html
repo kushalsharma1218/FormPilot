@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Dropdown re-render loop harness</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "Software Engineer",
+        "hiringOrganization": { "@type": "Organization", "name": "Example Corp" },
+        "description": "Apply now."
+      }
+    </script>
+  </head>
+  <body>
+    <h1>Apply for this role</h1>
+    <form id="application">
+      <label for="firstName">First Name</label>
+      <input id="firstName" name="firstName" type="text" />
+
+      <label for="lastName">Last Name</label>
+      <input id="lastName" name="lastName" type="text" />
+
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" />
+
+      <!-- Padded labels: only a near match exists, never an exact one. -->
+      <label for="degree">Highest Degree</label>
+      <select id="degree" name="degree">
+        <option value="">Select…</option>
+        <option value="hs">High School Diploma</option>
+        <option value="ba">Bachelor's Degree (BA/BS)</option>
+        <option value="ma">Master's Degree (MA/MS)</option>
+      </select>
+
+      <label for="workMode">Work Mode</label>
+      <select id="workMode" name="workMode">
+        <option value="">Choose…</option>
+        <option value="remote">Remote (Work from home)</option>
+        <option value="hybrid">Hybrid (3 days onsite)</option>
+      </select>
+
+      <button type="submit">Submit Application</button>
+    </form>
+
+    <div id="render-target"></div>
+
+    <script>
+      // Stands in for a React re-render: any change to a control mutates the DOM,
+      // which is what wakes the extension's MutationObserver. If the extension
+      // re-fills an already-satisfied dropdown, this feeds back into itself.
+      window.__changeCounts = { degree: 0, workMode: 0 };
+      var target = document.getElementById('render-target');
+      ['degree', 'workMode'].forEach(function (id) {
+        document.getElementById(id).addEventListener('change', function () {
+          window.__changeCounts[id]++;
+          var node = document.createElement('span');
+          node.textContent = id + ':' + window.__changeCounts[id];
+          target.appendChild(node);
+          if (target.childNodes.length > 3) target.removeChild(target.firstChild);
+        });
+      });
+    </script>
+  </body>
+</html>
