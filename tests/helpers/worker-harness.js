@@ -63,6 +63,14 @@ function makeWorkerContext(fetchImpl) {
     fetch: fetchImpl || (async () => ({ ok: true, status: 200, json: async () => ({}) })),
     Headers: class {}, importScripts: noop,
   };
+  // Supplied explicitly so the suite does not depend on config.private.js, which
+  // is gitignored and therefore absent from a fresh clone. Every network call is
+  // stubbed, so these values are never used for anything real.
+  sandbox.PRIVATE_FIREBASE_CONFIG = {
+    apiKey: 'test-api-key',
+    projectId: 'test-project',
+    authDomain: 'test-project.firebaseapp.com',
+  };
   sandbox.globalThis = sandbox;
   sandbox.self = sandbox;
   return { context: vm.createContext(sandbox), listeners, store };
