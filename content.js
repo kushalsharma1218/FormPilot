@@ -2213,6 +2213,8 @@ function getGlobalMatch(fieldKey) {
   return null;
 }
 
+const ErrorReporter = (globalThis.JobAutofill && JobAutofill.ErrorReporter) || null;
+ErrorReporter?.install('content');
 const FieldMatch = (globalThis.JobAutofill && JobAutofill.FieldMatch) || null;
 const ValueVocab = (globalThis.JobAutofill && JobAutofill.ValueVocab) || null;
 
@@ -6892,6 +6894,8 @@ async function runInit() {
     }
 
     currentGlobalProfile = profileResp?.profile || {};
+    // So a crash mentioning a real value reports it as <profile>, not the value.
+    ErrorReporter?.registerOwnValues(currentGlobalProfile);
     const sessionFields = sessionResp?.fields || {};
     const mergedFields = normalizeStoredFieldKeys({ ...(site?.fields || {}), ...(sessionFields || {}) });
 

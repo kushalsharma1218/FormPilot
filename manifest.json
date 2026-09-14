@@ -28,6 +28,7 @@
         "<all_urls>"
       ],
       "js": [
+        "lib/error-reporter.js",
         "lib/field-utils.js",
         "lib/field-ontology.js",
         "lib/value-vocab.js",

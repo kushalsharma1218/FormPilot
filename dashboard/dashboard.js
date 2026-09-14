@@ -1,3 +1,6 @@
+// Report uncaught errors from this page like every other surface.
+window.JobAutofill?.ErrorReporter?.install('dashboard');
+
 // dashboard.js — FormPilot AI Copilot Dashboard
 
 // ── State ──────────────────────────────────────────────────────
@@ -125,6 +128,33 @@ function bindThemeToggle() {
 function renderAutofillMode(requireSignIn) {
     document.querySelectorAll('#autofill-mode-toggle .theme-btn').forEach(btn => {
         btn.classList.toggle('active', (btn.dataset.requireSignin === 'true') === requireSignIn);
+    });
+}
+
+// Local diagnostics sink (see scripts/log-sink.js). Off unless a URL is set.
+async function initDiagnosticsSink() {
+    const input = document.getElementById('diagnostics-sink');
+    const msg = document.getElementById('diagnostics-sink-msg');
+    if (!input) return;
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: 'GET_EXT_SETTINGS' });
+        input.value = resp?.settings?.diagnosticsSink || '';
+    } catch (_) { }
+
+    bindEvent('btn-save-sink', 'click', async () => {
+        const url = input.value.trim();
+        // Mirrors the background's own check: diagnostics must never leave this machine.
+        if (url && !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) {
+            if (msg) msg.textContent = 'Only local addresses are allowed (http://127.0.0.1:8787/).';
+            return;
+        }
+        try {
+            await chrome.runtime.sendMessage({ type: 'SAVE_EXT_SETTINGS', settings: { diagnosticsSink: url } });
+            if (msg) msg.textContent = url ? 'Streaming diagnostics to the local sink.' : 'Diagnostics sink off.';
+            showToast('Diagnostics setting saved.', 'success');
+        } catch (err) {
+            if (msg) msg.textContent = 'Could not save.';
+        }
     });
 }
 
@@ -2780,6 +2810,7 @@ function setupDashAuth() {
 // ── Init ───────────────────────────────────────────────
 initTheme();
 initAutofillMode();
+initDiagnosticsSink();
 renderCloudSync().catch(err => console.warn('[Dashboard] Cloud sync panel failed:', err));
 setupDashAuth();
 loadAllData().then(() => {

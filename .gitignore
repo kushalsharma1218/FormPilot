@@ -3,3 +3,4 @@ node_modules/
 .env
 manifest.key
 config.private.js
+.diagnostics/

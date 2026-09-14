@@ -6,7 +6,9 @@
     "test": "node --test tests/*.test.js",
     "e2e:real": "node scripts/e2e-real-sites.js",
     "health": "node scripts/health-check.js",
-    "add-case": "node scripts/add-case.js"
+    "add-case": "node scripts/add-case.js",
+    "sink": "node scripts/log-sink.js",
+    "triage": "node scripts/triage-logs.js"
   },
   "dependencies": {
     "jsdom": "^29.0.1"

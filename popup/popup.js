@@ -1,3 +1,6 @@
+// Report uncaught errors from this page like every other surface.
+window.JobAutofill?.ErrorReporter?.install('popup');
+
 // popup.js — FormPilot AI Popup (Refactored)
 
 let currentHostname = '';

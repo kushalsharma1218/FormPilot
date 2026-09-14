@@ -1093,6 +1093,23 @@
                     </div>
                 </div>
 
+                <!-- Diagnostics sink (local development) -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Diagnostics Sink</h2>
+                    </div>
+                    <p class="card-hint">Optional, for development. Stream scrubbed error reports to a
+                        local listener so crashes can be triaged as they happen. Run
+                        <code>npm run sink</code>, then paste its address below. Local addresses only;
+                        leave empty to send nothing.</p>
+                    <div class="ai-key-row">
+                        <input type="text" id="diagnostics-sink" placeholder="http://127.0.0.1:8787/"
+                            autocomplete="off" spellcheck="false" />
+                        <button class="btn btn-secondary btn-sm" id="btn-save-sink" type="button">Save</button>
+                    </div>
+                    <div id="diagnostics-sink-msg" class="card-hint"></div>
+                </div>
+
                 <!-- Diagnostics -->
                 <div class="card">
                     <div class="card-header">
@@ -1248,6 +1265,7 @@
     <div id="toast-container"></div>
 
     <script src="pdf.min.js"></script>
+    <script src="../lib/error-reporter.js"></script>
     <script src="dashboard.js"></script>
 </body>
 

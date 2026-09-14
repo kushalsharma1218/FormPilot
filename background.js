@@ -1,5 +1,6 @@
 // background.js — Service Worker (v2.2 with Cloud Sync)
 
+importScripts('lib/error-reporter.js');
 importScripts('lib/auth-store.js');
 importScripts('lib/ai-utils.js');
 importScripts('lib/firestore-utils.js');
@@ -14,6 +15,9 @@ importScripts('lib/crypto-utils.js');
 importScripts('cloud-sync.js');
 
 const AuthStore = JobAutofill.AuthStore;
+const ErrorReporter = JobAutofill.ErrorReporter;
+// Uncaught errors in the worker were previously invisible outside its devtools.
+ErrorReporter.install('background');
 const CryptoUtils = JobAutofill.CryptoUtils;
 const SyncQueue = JobAutofill.SyncQueue;
 
@@ -147,15 +151,42 @@ async function flushDebugLogs() {
     logs = logs.concat(buffer);
     if (logs.length > DEBUG_LOG_MAX) logs = logs.slice(-DEBUG_LOG_MAX);
     await chrome.storage.local.set({ [key]: logs });
+    forwardToSink(buffer);
   } catch (err) {
     console.warn('[Background] Debug log flush failed:', err?.message || err);
   }
+}
+
+// Off unless the user sets a sink URL. Never awaited and never allowed to throw:
+// a diagnostics pipeline that can break the extension is worse than none.
+async function forwardToSink(records) {
+  if (!records || !records.length) return;
+  try {
+    const { diagnosticsSink } = await getExtSettings();
+    if (!diagnosticsSink) return;
+    if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(diagnosticsSink)) {
+      console.warn('[Diagnostics] Sink must be a local address; ignoring:', diagnosticsSink);
+      return;
+    }
+    await fetch(diagnosticsSink, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(records),
+    });
+  } catch (_) { /* sink not running is the normal case */ }
 }
 
 function queueDebugLog(entry) {
   if (!entry) return;
   const sanitized = { ...entry };
   if (sanitized.value) delete sanitized.value;
+  // Defence in depth: every surface scrubs before sending, but this is the one
+  // place all diagnostics funnel through before they are persisted.
+  for (const field of ['message', 'stack', 'source', 'label', 'url']) {
+    if (typeof sanitized[field] === 'string') {
+      sanitized[field] = ErrorReporter.scrub(sanitized[field]);
+    }
+  }
   debugLogBuffer.push(sanitized);
   if (debugLogBuffer.length >= 80) {
     flushDebugLogs();
@@ -537,6 +568,10 @@ async function accountUsesE2ee() {
 }
 
 const DEFAULT_EXT_SETTINGS = {
+  // Empty = off. When set to a local sink URL (see scripts/log-sink.js),
+  // scrubbed diagnostics are forwarded there as they happen so a watcher can
+  // react to a crash instead of it sitting in devtools unseen.
+  diagnosticsSink: '',
   // false = local-only mode: autofill works signed out, sign-in only adds cloud sync.
   // true  = autofill stays disabled until the user signs in.
   requireSignIn: false,

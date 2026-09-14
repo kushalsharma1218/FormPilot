@@ -71,6 +71,10 @@ function makeWorkerContext(fetchImpl) {
     projectId: 'test-project',
     authDomain: 'test-project.firebaseapp.com',
   };
+  // A real service-worker global has these; the sandbox needs them so that
+  // anything installing error handlers at load time behaves as it would in Chrome.
+  sandbox.addEventListener = () => {};
+  sandbox.removeEventListener = () => {};
   sandbox.globalThis = sandbox;
   sandbox.self = sandbox;
   return { context: vm.createContext(sandbox), listeners, store };
