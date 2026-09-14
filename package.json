@@ -4,7 +4,9 @@
   "type": "commonjs",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "e2e:real": "node scripts/e2e-real-sites.js"
+    "e2e:real": "node scripts/e2e-real-sites.js",
+    "health": "node scripts/health-check.js",
+    "add-case": "node scripts/add-case.js"
   },
   "dependencies": {
     "jsdom": "^29.0.1"

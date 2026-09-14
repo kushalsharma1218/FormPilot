@@ -1,0 +1,5 @@
+{
+  "_comment": "Quality ratchet. health-check fails if any number drops below these. Raise them when you genuinely improve; never lower them to make a build pass — that is the whole point. `npm run health -- --accept` rewrites this file from the current run.",
+  "matching": { "precision": 100, "recall": 100 },
+  "dropdowns": { "correct": 17, "total": 17 }
+}
