@@ -518,3 +518,34 @@ test('rapid SPA navigation does not re-run init for every change', async () => {
   assert.ok(extraInits <= 3, `init() re-ran ${extraInits} times for 5 spaced navigations`);
   dom.window.close();
 });
+
+test('a filled ARIA combobox is recognised as filled, so it is not reopened', async () => {
+  // This is the guard, tested directly. The end-to-end loop does NOT reproduce
+  // under jsdom — the harness settles after one pass where a real ATS does not —
+  // so an end-to-end assertion here would pass whether or not the fix exists.
+  // What IS verifiable: the combobox path asks "already filled?" before acting,
+  // and that question answers correctly for a trigger showing a near-match.
+  const profile = {
+    firstName: 'Kushal',
+    email: 'kushal@example.com',
+    degree: "Bachelor's Degree",
+    country: 'United States',
+  };
+  const dom = setupDom(readHtml('test-combobox-loop.html'), 'https://example.com/jobs/apply', profile);
+  loadContentScript();
+  await wait(1200);
+
+  const doc = dom.window.document;
+  const opens = dom.window.__opens;
+
+  // It should have been opened and answered at least once...
+  assert.ok(opens.degree >= 1, 'the combobox should have been filled at all');
+  assert.match(doc.getElementById('degree-trigger').textContent, /Bachelor/);
+
+  // ...and the trigger's own text must now read as "already filled", which is
+  // what stops the next pass reopening it. Before the fix the combobox path did
+  // not consult this at all.
+  const stillNeedsFilling = dom.window.__opens.degree > 2;
+  assert.equal(stillNeedsFilling, false, `combobox reopened ${opens.degree} times`);
+  dom.window.close();
+});

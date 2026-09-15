@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ARIA combobox re-fill harness</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "Software Engineer",
+        "hiringOrganization": { "@type": "Organization", "name": "Example Corp" },
+        "description": "Apply now."
+      }
+    </script>
+  </head>
+  <body>
+    <h1>Apply for this role</h1>
+    <form id="application">
+      <label for="firstName">First Name</label>
+      <input id="firstName" name="firstName" type="text" />
+
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" />
+
+      <!-- A Radix/Headless-style combobox: a BUTTON trigger whose options are
+           rendered into a body portal. This is the shape Greenhouse and Workday
+           use, and the one the extension fills by clicking open then clicking an
+           option — so re-filling an already-correct one reopens the dropdown and
+           takes focus away from the user. -->
+      <label id="degree-label" for="degree-trigger">Highest Degree</label>
+      <button id="degree-trigger" type="button" role="combobox"
+              aria-haspopup="listbox" aria-labelledby="degree-label">Select…</button>
+
+      <label id="country-label" for="country-trigger">Country</label>
+      <button id="country-trigger" type="button" role="combobox"
+              aria-haspopup="listbox" aria-labelledby="country-label">Select…</button>
+
+      <button type="submit">Submit Application</button>
+    </form>
+
+    <div id="portal"></div>
+    <div id="render-target"></div>
+
+    <script>
+      // Instrumentation the test reads: how many times was each dropdown OPENED,
+      // and how many times did a value actually get chosen.
+      window.__opens = { degree: 0, country: 0 };
+      window.__selections = { degree: 0, country: 0 };
+
+      var OPTIONS = {
+        degree: ['High School Diploma', "Bachelor's Degree (BA/BS)", "Master's Degree (MA/MS)"],
+        country: ['United States of America', 'India', 'Canada']
+      };
+
+      var portal = document.getElementById('portal');
+      var renderTarget = document.getElementById('render-target');
+
+      function closePortal() { portal.innerHTML = ''; }
+
+      function wire(name) {
+        var trigger = document.getElementById(name + '-trigger');
+        trigger.addEventListener('click', function () {
+          if (portal.childNodes.length) { closePortal(); return; }
+          window.__opens[name]++;
+
+          var list = document.createElement('div');
+          list.setAttribute('role', 'listbox');
+          OPTIONS[name].forEach(function (text) {
+            var opt = document.createElement('div');
+            opt.setAttribute('role', 'option');
+            opt.textContent = text;
+            opt.addEventListener('click', function () {
+              window.__selections[name]++;
+              trigger.textContent = text;
+              closePortal();
+              // Stand in for a framework re-render, which is what wakes the
+              // extension's MutationObserver and starts the cycle again.
+              var node = document.createElement('span');
+              node.textContent = name + ':' + window.__selections[name];
+              renderTarget.appendChild(node);
+              if (renderTarget.childNodes.length > 3) {
+                renderTarget.removeChild(renderTarget.firstChild);
+              }
+            });
+            list.appendChild(opt);
+          });
+          portal.appendChild(list);
+        });
+      }
+
+      wire('degree');
+      wire('country');
+
+      // A real ATS page never stops mutating — React re-renders, analytics,
+      // validation, spinners. Without ongoing churn the extension's observer
+      // settle window hides the very loop we are trying to measure, so the
+      // harness has to behave like the real thing.
+      var churn = document.createElement('div');
+      document.body.appendChild(churn);
+      window.__churn = setInterval(function () {
+        var n = document.createElement('i');
+        n.textContent = String(Date.now());
+        churn.appendChild(n);
+        if (churn.childNodes.length > 4) churn.removeChild(churn.firstChild);
+      }, 150);
+    </script>
+  </body>
+</html>

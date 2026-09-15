@@ -788,6 +788,19 @@ function fillAttemptsExhausted(el, fieldKey) {
   return !!byKey && (byKey[fieldKey] || 0) >= FILL_ATTEMPT_LIMIT;
 }
 
+// Every path that writes to a field must go through this. The cap used to live
+// inside applyValueToElement, but the three dropdown paths (select, listbox,
+// combobox) never call it — which is why text inputs settled while dropdowns
+// were re-filled on every pass.
+function beginFillAttempt(el, fieldKey) {
+  if (fillAttemptsExhausted(el, fieldKey)) {
+    flog(`[FormPilot] Giving up on "${fieldKey}" after ${FILL_ATTEMPT_LIMIT} attempts — the page keeps resetting it.`);
+    return false;
+  }
+  noteFillAttempt(el, fieldKey);
+  return true;
+}
+
 function isUsableTextTarget(el) {
   if (!el) return false;
   const tag = el.tagName?.toUpperCase();
@@ -1179,11 +1192,7 @@ function showApprovalBanner() {
 function applyValueToElement(el, fieldKey, primaryVal, altVal) {
   if (!el) return false;
   if (!shouldFillValue(el, fieldKey, primaryVal)) return false;
-  if (fillAttemptsExhausted(el, fieldKey)) {
-    flog(`[FormPilot] Giving up on "${fieldKey}" after ${FILL_ATTEMPT_LIMIT} attempts — the page keeps resetting it.`);
-    return false;
-  }
-  noteFillAttempt(el, fieldKey);
+  if (!beginFillAttempt(el, fieldKey)) return false;
   const tag = el.tagName?.toUpperCase();
   const type = (el.type || '').toLowerCase();
 
@@ -3568,8 +3577,13 @@ function scheduleVerifyFill(el, fieldKey, primaryVal, altVal) {
   setTimeout(() => {
     if (!isCurrentContentInstance()) return;
     if (!el.isConnected) return;
+    // Dropdowns are matched by SCORE, so verifying them by raw string equality
+    // reports a correct near-match ("USA" for a saved "United States") as a
+    // failure and retries it forever. Ask the same question the fill asked.
     const current = getCurrentFieldValue(el);
-    const matched = valuesRoughlyMatch(current, expected) || valuesRoughlyMatch(current, alt);
+    const matched = isDropdownLike(el)
+      ? (alreadyMatches(el, fieldKey, expected) || (alt && alreadyMatches(el, fieldKey, alt)))
+      : (valuesRoughlyMatch(current, expected) || valuesRoughlyMatch(current, alt));
     logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: matched });
     if (matched) return;
 
@@ -3694,6 +3708,7 @@ function getValueTypeHint(fieldKey, el) {
 }
 
 function fillSelectSafely(selectEl, decoded, fieldKey, unresolvedDropdowns) {
+  if (!beginFillAttempt(selectEl, fieldKey)) return false;
   const meta = getDropdownMeta(selectEl);
   const valueTypeHint = getValueTypeHint(fieldKey, selectEl);
   const targets = [decoded.text, decoded.value].filter(Boolean);
@@ -3754,6 +3769,7 @@ function fillSelectSafely(selectEl, decoded, fieldKey, unresolvedDropdowns) {
 }
 
 function fillListboxSafely(listboxEl, decoded, fieldKey, unresolvedDropdowns) {
+  if (!beginFillAttempt(listboxEl, fieldKey)) return false;
   const meta = getDropdownMeta(listboxEl);
   const raw = decoded.text || decoded.value || '';
   const targets = [decoded.text, decoded.value].filter(Boolean);
@@ -4057,6 +4073,16 @@ function fillFields(savedFields, opts = {}) {
           if (confidence === 'mid') queueApproval({ el, fieldKey, val: primaryVal, altVal });
           continue;
         }
+
+        // This check did not exist. Radix/Headless comboboxes are filled by
+        // CLICKING them open and clicking an option, so re-filling an
+        // already-correct one reopens the dropdown and steals focus — the page
+        // becomes unusable while the extension cycles through them.
+        if (alreadyMatches(el, fieldKey, primaryVal)) {
+          stats.filled += 1;
+          continue;
+        }
+        if (!beginFillAttempt(el, fieldKey)) continue;
 
         if (DEBUG_AUTOFILL) {
           flog(`[FP DEBUG] combobox="${fieldKey}" trying to fill="${primaryVal}"`);
