@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "FormPilot AI \u2014 Smart Application Autofill",
+  "name": "FormPilot AI — Smart Application Autofill",
   "version": "2.2.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvPqmznUDl30NEoSKETIKelvB39xOix0GseGCRCO7reAMaP0IAMJkj6KSiIjHoj9y+exzcCV+cuPM/dZ9cgJQbkuiBDBcL5FBRm99wJOZuwaZEANsN1hroPq2lJXu3kNwSbk4uclJE53PXibWvlsRaIyGNCTLT/FP1LgHdEfKdLD1gqmTmicr5gO8eTBC7oHs4A3SlgMgBfi4703VnSKjMIspLLy9ShVAeirsjtQtKSS+vLvQ3O2vAbBszJP14EJjylECRg1hFrR+likx+aCcgYy0cQdrmnQlsFYYD5A78wkBZHVXylT/AE82fC4BuGTIzjz3e2q1c83MYvSv1+vacwIDAQAB",
   "description": "Elegant AI-powered autofill for job applications and complex forms. Learn once, fill everywhere.",
   "permissions": [
     "storage",
@@ -9,7 +10,7 @@
     "identity"
   ],
   "oauth2": {
-    "client_id": "1054554783896-ll03qgku69vsug14ar55sj73r2erc1lt.apps.googleusercontent.com",
+    "client_id": "1054554783896-ni6tmuo8fbejunqskf6lj1l3gq7jdaal.apps.googleusercontent.com",
     "scopes": [
       "email",
       "profile",
