@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Custom combobox re-render loop harness</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "Software Engineer",
+        "hiringOrganization": { "@type": "Organization", "name": "Example Corp" },
+        "description": "Apply now."
+      }
+    </script>
+  </head>
+  <body>
+    <h1>Apply for this role</h1>
+    <form id="application">
+      <label for="firstName">First Name</label>
+      <input id="firstName" name="firstName" type="text" />
+
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" />
+
+      <!-- react-select style: the typed text lives in the input, the chosen value
+           is rendered in a sibling and the input is cleared after a pick. -->
+      <label for="degree-input">Highest Degree</label>
+      <div class="select__control" id="degree-control">
+        <div class="select__value-container">
+          <div class="select__placeholder" id="degree-display">Select...</div>
+          <input id="degree-input" role="combobox" aria-autocomplete="list" aria-expanded="false" />
+        </div>
+      </div>
+
+      <!-- Radix style: a button trigger that opens a portal listbox on click. -->
+      <span id="workMode-label">Work Mode</span>
+      <button type="button" id="workMode-trigger" role="combobox" aria-haspopup="listbox"
+        aria-expanded="false" aria-labelledby="workMode-label">Select...</button>
+
+      <button type="submit">Submit Application</button>
+    </form>
+
+    <script>
+      // Counts how often the extension opens each menu and picks an option. A
+      // dropdown that already shows the saved value must not be opened again.
+      window.__comboCounts = { degreeOpens: 0, degreePicks: 0, workModeOpens: 0, workModePicks: 0 };
+
+      function closeMenus() {
+        document.querySelectorAll('.portal-menu').forEach(function (m) { m.remove(); });
+        degreeInput.setAttribute('aria-expanded', 'false');
+        trigger.setAttribute('aria-expanded', 'false');
+      }
+
+      function renderMenu(options, onPick) {
+        closeMenus();
+        var menu = document.createElement('div');
+        menu.className = 'portal-menu';
+        menu.setAttribute('role', 'listbox');
+        options.forEach(function (label) {
+          var opt = document.createElement('div');
+          opt.setAttribute('role', 'option');
+          opt.setAttribute('data-value', label);
+          opt.textContent = label;
+          opt.addEventListener('click', function () { onPick(label); closeMenus(); });
+          menu.appendChild(opt);
+        });
+        document.body.appendChild(menu);
+      }
+
+      var degreeInput = document.getElementById('degree-input');
+      var degreeDisplay = document.getElementById('degree-display');
+      var degreeOptions = ["High School Diploma", "Bachelor's Degree (BA/BS)", "Master's Degree (MA/MS)"];
+      degreeInput.addEventListener('input', function () {
+        if (!degreeInput.value) return;
+        window.__comboCounts.degreeOpens++;
+        degreeInput.setAttribute('aria-expanded', 'true');
+        var q = degreeInput.value.toLowerCase().split(' ')[0];
+        renderMenu(degreeOptions.filter(function (o) { return o.toLowerCase().indexOf(q) !== -1; }), function (label) {
+          window.__comboCounts.degreePicks++;
+          // Re-render: swap the placeholder for a single-value node, clear the search.
+          var fresh = document.createElement('div');
+          fresh.className = 'select__single-value';
+          fresh.id = 'degree-display';
+          fresh.textContent = label;
+          degreeDisplay.replaceWith(fresh);
+          degreeDisplay = fresh;
+          degreeInput.value = '';
+        });
+      });
+
+      var trigger = document.getElementById('workMode-trigger');
+      trigger.addEventListener('click', function () {
+        if (trigger.getAttribute('aria-expanded') === 'true') { closeMenus(); return; }
+        window.__comboCounts.workModeOpens++;
+        trigger.setAttribute('aria-expanded', 'true');
+        renderMenu(['Remote (Work from home)', 'Hybrid (3 days onsite)', 'Onsite'], function (label) {
+          window.__comboCounts.workModePicks++;
+          trigger.textContent = label;
+        });
+      });
+    </script>
+  </body>
+</html>
