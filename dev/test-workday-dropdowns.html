@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Workday-style dropdown harness</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        "title": "Senior Software Engineer",
+        "hiringOrganization": { "@type": "Organization", "name": "Example Corp" },
+        "description": "Apply now."
+      }
+    </script>
+  </head>
+  <body>
+    <!-- Site chrome: the language switcher. Using it re-renders the whole page,
+         which is what re-ran init every few seconds. It must never be autofilled. -->
+    <header>
+      <label id="lang-label">Language</label>
+      <button type="button" id="site-language" aria-haspopup="listbox" aria-labelledby="lang-label">English</button>
+    </header>
+    <div class="locale-bar">
+      <select id="localeSelect" name="locale" aria-label="Language">
+        <option value="en">English</option>
+        <option value="hi">Hindi</option>
+      </select>
+    </div>
+
+    <div data-automation-id="applyFlowPage">
+      <h1>My Information</h1>
+      <label for="firstName">First Name</label>
+      <input id="firstName" data-automation-id="legalNameSection_firstName" type="text" />
+
+      <!-- Workday prompt: a button that opens a popup; options react to mousedown,
+           not to a bare click(). The button is re-rendered after every pick. -->
+      <div id="country-wrap">
+        <label id="country-label">Country</label>
+        <button type="button" id="country" aria-haspopup="listbox" aria-labelledby="country-label">Select One</button>
+      </div>
+
+      <!-- Workday multiselect search: typing does nothing until Enter; the pick is
+           shown as a pill and the search box is cleared. -->
+      <div data-automation-id="multiselectInputContainer">
+        <label for="source-search">How Did You Hear About Us?</label>
+        <div id="source-pills"></div>
+        <input id="source-search" data-automation-id="searchBox" type="text" />
+      </div>
+    </div>
+
+    <script>
+      window.__wd = { countryOpens: 0, countryPicks: 0, sourceSearches: 0, sourcePicks: 0, sourceTyped: 0, languageOpens: 0, localeChanges: 0 };
+      document.getElementById('site-language').addEventListener('click', function () {
+        window.__wd.languageOpens++;
+        popup(['English', 'Hindi', 'Deutsch'], function () { });
+      });
+      document.getElementById('localeSelect').addEventListener('change', function () {
+        window.__wd.localeChanges++;
+      });
+
+      function closePopups() {
+        document.querySelectorAll('.wd-popup').forEach(function (p) { p.remove(); });
+      }
+      function popup(labels, onPick) {
+        closePopups();
+        var list = document.createElement('div');
+        list.className = 'wd-popup';
+        list.setAttribute('role', 'listbox');
+        labels.forEach(function (label) {
+          var opt = document.createElement('div');
+          opt.setAttribute('role', 'option');
+          opt.setAttribute('data-automation-id', 'promptOption');
+          opt.textContent = label;
+          // Selection happens on mousedown only, as in Workday.
+          opt.addEventListener('mousedown', function () { onPick(label); closePopups(); });
+          list.appendChild(opt);
+        });
+        document.body.appendChild(list);
+      }
+
+      function bindCountry(btn) {
+        btn.addEventListener('click', function () {
+          window.__wd.countryOpens++;
+          popup(['Canada', 'India', 'United States of America'], function (label) {
+            window.__wd.countryPicks++;
+            // React-style re-render: a brand-new button node replaces the old one.
+            var fresh = btn.cloneNode(false);
+            fresh.textContent = label;
+            btn.replaceWith(fresh);
+            bindCountry(fresh);
+          });
+        });
+      }
+      bindCountry(document.getElementById('country'));
+
+      var search = document.getElementById('source-search');
+      search.addEventListener('input', function () { window.__wd.sourceTyped++; });
+      search.addEventListener('keydown', function (e) {
+        if (e.key !== 'Enter' || !search.value) return;
+        window.__wd.sourceSearches++;
+        popup(['LinkedIn', 'Indeed', 'Company Website'], function (label) {
+          window.__wd.sourcePicks++;
+          var pill = document.createElement('div');
+          pill.setAttribute('data-automation-id', 'selectedItem');
+          pill.textContent = label;
+          var pills = document.getElementById('source-pills');
+          pills.innerHTML = '';
+          pills.appendChild(pill);
+          search.value = '';
+        });
+      });
+      // Workday clears unselected search text on blur.
+      search.addEventListener('blur', function () { search.value = ''; });
+    </script>
+  </body>
+</html>

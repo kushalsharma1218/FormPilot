@@ -430,7 +430,7 @@ function showJobContextPrompt() {
     setFormPreference(sig, true);
     setSessionFlag('jobContextConfirmed', true);
     wrap.remove();
-    debouncedInit();
+    debouncedInit('job-context-confirmed');
   });
   wrap.querySelector('#ja-job-no')?.addEventListener('click', () => {
     setFormPreference(sig, false);
@@ -729,7 +729,8 @@ function isDropdownLike(el) {
   const tag = el?.tagName?.toUpperCase();
   const role = el?.getAttribute?.('role') || '';
   return tag === 'SELECT' || role === 'listbox' || role === 'combobox'
-    || el?.getAttribute?.('aria-haspopup') === 'listbox';
+    || el?.getAttribute?.('aria-haspopup') === 'listbox'
+    || isSearchDropdownInput(el);
 }
 
 // A dropdown is filled by *scoring* an option against the saved value, so "is it
@@ -786,6 +787,153 @@ function noteFillAttempt(el, fieldKey) {
 function fillAttemptsExhausted(el, fieldKey) {
   const byKey = fillAttemptCounts.get(el);
   return !!byKey && (byKey[fieldKey] || 0) >= FILL_ATTEMPT_LIMIT;
+}
+
+// Custom comboboxes are filled by opening their menu and clicking, which moves
+// focus and scroll. That must yield to the user: once they click, type or scroll,
+// the pass stops instead of dragging focus back to the next dropdown.
+let lastUserInteractionTs = 0;
+// Narrower than the above: typing, or pressing on a form control. Clicking "Next"
+// must not count, or the fields of the step it reveals would never get filled.
+let lastUserEditTs = 0;
+const USER_EDIT_IDLE_MS = 2500;
+let comboboxFillRunning = false;
+const FORM_CONTROL_SELECTOR = 'input, textarea, select, [contenteditable="true"], [role="combobox"], [role="listbox"], [role="option"], [aria-haspopup="listbox"]';
+(function trackUserInteraction() {
+  const note = (evt) => {
+    if (!evt.isTrusted) return;
+    lastUserInteractionTs = Date.now();
+    const target = evt.composedPath?.()[0] || evt.target;
+    if (evt.type === 'keydown' || target?.closest?.(FORM_CONTROL_SELECTOR)) lastUserEditTs = Date.now();
+  };
+  ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(type => {
+    try { window.addEventListener(type, note, { capture: true, passive: true }); } catch (_) { }
+  });
+})();
+
+function userInteractedSince(ts) {
+  return lastUserInteractionTs > ts;
+}
+
+function userIsEditing() {
+  return Date.now() - lastUserEditTs < USER_EDIT_IDLE_MS;
+}
+
+// Per page + field, not per element. Pages like Workday re-render a dropdown into a
+// brand-new node and re-run init every few seconds; both reset the WeakMap above,
+// so it alone let the same dropdown be opened and picked indefinitely.
+const DROPDOWN_ATTEMPT_LIMIT = 2;
+const dropdownAttemptLedger = new Map();
+
+function dropdownLedgerKey(fieldKey) {
+  return `${location.pathname}|${fieldKey}`;
+}
+
+function dropdownAttemptsExhausted(fieldKey) {
+  return (dropdownAttemptLedger.get(dropdownLedgerKey(fieldKey)) || 0) >= DROPDOWN_ATTEMPT_LIMIT;
+}
+
+function noteDropdownAttempt(fieldKey) {
+  const key = dropdownLedgerKey(fieldKey);
+  dropdownAttemptLedger.set(key, (dropdownAttemptLedger.get(key) || 0) + 1);
+}
+
+// Site chrome — language/region switchers, header search, nav menus — is not part
+// of the application. Autofilling it was actively harmful: picking a language
+// re-renders (or reloads) the whole site, that re-ran init, and init picked the
+// language again, every few seconds, while the user could do nothing.
+const SITE_CHROME_CONTAINER_SELECTOR = [
+  'header', 'nav', 'footer',
+  '[role="banner"]', '[role="navigation"]', '[role="contentinfo"]',
+  '[role="menubar"]', '[role="menu"]', '[role="toolbar"]', '[role="search"]',
+  '[data-automation-id*="header" i]', '[data-automation-id*="footer" i]', '[data-automation-id*="utility" i]',
+].join(',');
+const FORM_CONTEXT_SELECTOR = 'form, [role="form"], fieldset, [data-automation-id="applyFlowPage"], [data-automation-id^="formField"], [data-fkit-id]';
+const SITE_CHROME_HINT_RE = /\b(language|lang|locale|region|currency|theme|site[\s_-]?search)\b|language[\s_-]?(selector|picker|switch)|locale[\s_-]?(selector|picker|switch)/i;
+
+function isSiteChromeControl(el) {
+  if (!el?.closest) return false;
+  const formContext = el.closest(FORM_CONTEXT_SELECTOR);
+  const chrome = el.closest(SITE_CHROME_CONTAINER_SELECTOR);
+  // A header or nav wrapped around the form (some ATS shells do this) doesn't count.
+  if (chrome && !(formContext && chrome.contains(formContext))) return true;
+  if (formContext) return false;
+  // Outside any form: a language/locale/region picker is a site setting, not a question.
+  const hints = [
+    el.id, el.getAttribute('name'), el.getAttribute('aria-label'),
+    el.getAttribute('data-automation-id'), el.getAttribute('data-testid'),
+    typeof el.className === 'string' ? el.className : '',
+  ].filter(Boolean).join(' ').replace(/([a-z])([A-Z])/g, '$1 $2');
+  if (SITE_CHROME_HINT_RE.test(hints)) return true;
+  // The visible label alone is only trusted when it is *just* the setting's name,
+  // so a form question like "Languages you speak" outside a <form> still fills.
+  const label = getFieldKey(el) || '';
+  return /^\s*((select|choose|change)\s+)?(your\s+)?(language|locale|region)\s*$/i.test(label);
+}
+
+// Search-as-you-type dropdowns (Workday's searchBox, autocomplete inputs) look like
+// text inputs. Typing the saved value into one opens its results popup but never
+// selects anything, the page clears it, and the next pass types it again.
+function isSearchDropdownInput(el) {
+  if (el?.tagName?.toUpperCase() !== 'INPUT') return false;
+  const role = el.getAttribute('role') || '';
+  if (role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox') return true;
+  const autocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
+  if (autocomplete === 'list' || autocomplete === 'both') return true;
+  if (el.getAttribute('data-automation-id') === 'searchBox') return true;
+  return !!el.closest?.('[role="combobox"], [aria-haspopup="listbox"], [data-automation-id*="multiselect" i], [data-uxi-widget-type="multiselect"]');
+}
+
+// Frameworks differ on which event selects an option (Radix: pointerup, Workday
+// and MUI: mousedown/click). A bare .click() is ignored by some, which left the
+// dropdown unselected — so every later pass saw it empty and opened it again.
+function clickOptionLikeUser(el) {
+  const opts = { bubbles: true, cancelable: true, composed: true, button: 0 };
+  const fire = (Ctor, type) => {
+    try { if (typeof Ctor === 'function') el.dispatchEvent(new Ctor(type, opts)); } catch (_) { }
+  };
+  fire(globalThis.PointerEvent, 'pointerdown');
+  fire(globalThis.MouseEvent, 'mousedown');
+  fire(globalThis.PointerEvent, 'pointerup');
+  fire(globalThis.MouseEvent, 'mouseup');
+  try { el.click(); } catch (_) { }
+}
+
+// A react-select clears its search input after a pick and renders the chosen
+// value in a sibling. Reading only the input made every filled dropdown look empty.
+const COMBOBOX_DISPLAY_SELECTOR = [
+  '[class*="singleValue"]', '[class*="single-value"]', '[class*="SingleValue"]',
+  '.select2-selection__rendered', '.chosen-single span',
+  '[data-automation-id="selectedItem"]',
+].join(',');
+
+function getComboboxDisplayValue(el) {
+  let node = el;
+  for (let depth = 0; depth < 4 && node; depth++, node = node.parentElement) {
+    // Stop before climbing into a container that holds other dropdowns too.
+    if (depth > 0 && node.querySelectorAll?.(
+      '[role="combobox"], [aria-haspopup="listbox"], select, input:not([type="hidden"]), textarea'
+    ).length > 1) break;
+    const shown = node.querySelector?.(COMBOBOX_DISPLAY_SELECTOR);
+    const text = (shown?.innerText || shown?.textContent || '').trim();
+    if (text && !isPlaceholderText(text)) return text;
+  }
+  return '';
+}
+
+function closeComboboxMenu(el) {
+  const target = el?.isConnected ? el : document.activeElement;
+  try {
+    target?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, composed: true }));
+  } catch (_) { }
+}
+
+// Hand focus back so the page isn't left with our dropdown focused and open.
+function releaseComboboxFocus(el) {
+  const active = document.activeElement;
+  if (active && active !== document.body && (active === el || el?.contains?.(active))) {
+    try { active.blur(); } catch (_) { }
+  }
 }
 
 function isUsableTextTarget(el) {
@@ -2916,9 +3064,11 @@ function getFieldValue(el) {
   }
   const role = el.getAttribute('role');
   const hasPopupListbox = el.getAttribute('aria-haspopup') === 'listbox';
-  if (role === 'combobox' || hasPopupListbox) {
+  if (role === 'combobox' || hasPopupListbox || isSearchDropdownInput(el)) {
     const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
     if (inputChild?.value) return inputChild.value.trim();
+    const displayed = getComboboxDisplayValue(el);
+    if (displayed) return displayed;
     const activeId = el.getAttribute('aria-activedescendant');
     if (activeId) {
       const root = getRootNodeFor(el);
@@ -3173,6 +3323,7 @@ function getWorkdayFields() {
     const type = (el.type || '').toLowerCase();
     if (type === 'hidden' || type === 'submit' || type === 'button' || type === 'password' || type === 'file') return;
     if (isSensitiveField(el)) return;
+    if (isSiteChromeControl(el)) return;
 
     // Use label or automation-id as key
     let key = getFieldKey(el);
@@ -3274,6 +3425,7 @@ function getFormFields() {
     if (type === 'text' && el.maxLength === 1) return;
     // Skip sensitive fields (SSN, bank, passport, etc.)
     if (isSensitiveField(el)) return;
+    if (isSiteChromeControl(el)) return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
     if (!key || isErrorLabelText(key)) return;
@@ -3316,6 +3468,7 @@ function getFormFields() {
   const comboEls = [];
   collectElements('[role="combobox"], [aria-haspopup="listbox"]').forEach(el => {
     if (el.tagName === 'INPUT') return;
+    if (isSiteChromeControl(el)) return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
     if (!key || isErrorLabelText(key)) return;
@@ -3333,6 +3486,7 @@ function getFormFields() {
 
   // ── ARIA listboxes ──
   collectElements('[role="listbox"]').forEach(listbox => {
+    if (isSiteChromeControl(listbox)) return;
     const mapped = resolveMappedKey(listbox);
     const key = mapped.key || getFieldKey(listbox);
     const selected = listbox.querySelectorAll('[role="option"][aria-selected="true"]');
@@ -3426,6 +3580,24 @@ function universalFillText(el, value) {
   return true;
 }
 
+// Typing into a dropdown's search box. Unlike universalFillText this sends no
+// change/blur: search boxes (Workday's among them) clear unselected text on blur,
+// which wiped the query before its results could be picked.
+function typeIntoSearchInput(el, value) {
+  try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (__) { } }
+  const setter = getValueSetter(el);
+  const prev = el.value;
+  if (setter) setter.call(el, String(value));
+  else el.value = String(value);
+  const tracker = el._valueTracker;
+  if (tracker && typeof tracker.setValue === 'function') tracker.setValue(prev);
+  if (typeof InputEvent !== 'undefined') {
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: String(value), inputType: 'insertText' }));
+  } else {
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+  }
+}
+
 // Click-based Radix UI (and similar) combobox filler.
 // Works on: Bolt (Greenhouse v3), Ashby, some Lever forms.
 // Strategy: click the trigger to open the listbox, then click matching option.
@@ -3449,16 +3621,15 @@ async function fillRadixCombobox(triggerBtn, desiredValues, minScore = 0.9) {
       if (score > picked.score) picked = { el: opt, score };
     }
     if (picked.el && picked.score >= minScore) {
-      picked.el.click();
-      // Also dispatch pointer events some frameworks need
-      picked.el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-      picked.el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      clickOptionLikeUser(picked.el);
       markAutofilledElement(triggerBtn);
       return true;
     }
     // If options appeared but no match, close and bail
-    if (i > 4) { document.body.click(); return false; }
+    if (i > 4) { closeComboboxMenu(triggerBtn); document.body.click(); return false; }
   }
+  // Never leave a menu we opened hanging open over the page.
+  if (triggerBtn.getAttribute?.('aria-expanded') === 'true') closeComboboxMenu(triggerBtn);
   return false;
 }
 
@@ -3566,28 +3737,32 @@ function scheduleVerifyFill(el, fieldKey, primaryVal, altVal) {
   setTimeout(() => {
     if (!isCurrentContentInstance()) return;
     if (!el.isConnected) return;
-    const current = getCurrentFieldValue(el);
-    const matched = valuesRoughlyMatch(current, expected) || valuesRoughlyMatch(current, alt);
-    logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: matched });
-    if (matched) return;
-
     const role = el.getAttribute?.('role') || '';
     const hasPopupListbox = el.getAttribute?.('aria-haspopup') === 'listbox';
     const tag = el.tagName?.toUpperCase();
+    const dropdown = isDropdownLike(el);
+
+    // Dropdowns are filled by scoring, so verify them the same way; a raw string
+    // compare called "Remote (Work from home)" a miss for "Remote" and refilled it.
+    const current = getCurrentFieldValue(el);
+    const matched = dropdown
+      ? (alreadyMatches(el, fieldKey, expected) || (!!alt && alreadyMatches(el, fieldKey, alt)))
+      : (valuesRoughlyMatch(current, expected) || valuesRoughlyMatch(current, alt));
+    logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: matched });
+    if (matched) return;
+
+    // Custom comboboxes are never retried from here. A retry means opening the
+    // menu again from a timer, on top of whatever pass or user action is under
+    // way; the next observer pass (bounded by the attempt limit) covers real misses.
+    if (role === 'combobox' || hasPopupListbox) return;
+    if (userInteractedSince(Date.now() - VERIFY_DELAY_MS)) return;
+
     let retried = false;
 
     if (tag === 'SELECT') {
       retried = fillSelectSafely(el, { text: expected, value: alt }, fieldKey);
     } else if (role === 'listbox') {
       retried = fillListboxSafely(el, { text: expected, value: alt }, fieldKey);
-    } else if (role === 'combobox' || hasPopupListbox) {
-      const inputChild = el.tagName === 'INPUT' ? el : el.querySelector?.('input');
-      if (inputChild && isUsableTextTarget(inputChild)) {
-        retried = universalFillText(inputChild, expected);
-      }
-      if (!retried) {
-        fillRadixCombobox(el, [expected, alt].filter(Boolean), 0.85).catch(() => { });
-      }
     } else {
       retried = applyValueWithEvents(el, expected);
       if (!retried) {
@@ -3603,9 +3778,11 @@ function scheduleVerifyFill(el, fieldKey, primaryVal, altVal) {
       if (!isCurrentContentInstance()) return;
       if (!el.isConnected) return;
       const current2 = getCurrentFieldValue(el);
-      const matchedRetry = valuesRoughlyMatch(current2, expected) || valuesRoughlyMatch(current2, alt);
+      const matchedRetry = dropdown
+        ? (alreadyMatches(el, fieldKey, expected) || (!!alt && alreadyMatches(el, fieldKey, alt)))
+        : (valuesRoughlyMatch(current2, expected) || valuesRoughlyMatch(current2, alt));
       logEvent({ type: 'fill_verify', hostname, field: fieldKey, match: matchedRetry, stage: 'retry' });
-      if (!matchedRetry) {
+      if (!matchedRetry && !dropdown) {
         // Final attempt: try alternative value if provided
         if (alt && alt !== expected) {
           applyValueWithEvents(el, alt);
@@ -3789,6 +3966,12 @@ function fillFields(savedFields, opts = {}) {
     flog('[FormPilot] Fill cooldown active, skipping.');
     return;
   }
+  // Passes nobody asked for (DOM observers, step re-apply, a re-init of the page
+  // already filled) must never cut in while the user is typing or picking.
+  if ((opts.skipObserver || opts.reinit) && userIsEditing()) {
+    flog('[FormPilot] User is editing — skipping automatic refill pass.');
+    return;
+  }
   autofillInProgress = true;
   lastFillTimestamp = Date.now();
   if (autofillGuardTimer) clearTimeout(autofillGuardTimer);
@@ -3814,6 +3997,7 @@ function fillFields(savedFields, opts = {}) {
 
   // Radio buttons — enhanced with fuzzy + boolean matching
   collectElements('input[type=radio]').forEach(el => {
+    if (isSiteChromeControl(el)) return;
     stats.detected += 1;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el) || el.name;
@@ -3855,6 +4039,7 @@ function fillFields(savedFields, opts = {}) {
     const type = (el.type || '').toLowerCase();
     if (type === 'radio') return;
     if (!isVisibleElement(el)) return;
+    if (isSiteChromeControl(el)) return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
     if (!key || isErrorLabelText(key)) return;
@@ -3949,8 +4134,9 @@ function fillFields(savedFields, opts = {}) {
       return;
     }
 
-    if (el.tagName === 'INPUT' && (role === 'combobox' || hasPopupListbox)) {
-      // Defer combobox inputs to the combobox handler for safer selection
+    if (isSearchDropdownInput(el)) {
+      // Defer combobox / search-dropdown inputs to the combobox handler, which
+      // picks an option instead of leaving typed text that the page then clears.
       return;
     }
 
@@ -4005,7 +4191,12 @@ function fillFields(savedFields, opts = {}) {
   // lists into document.body portals — so we must CLICK to open then CLICK option.
   try {
     const comboboxEls = [];
-    collectElements('[role="combobox"], [aria-haspopup="listbox"]').forEach(el => {
+    collectElements('[role="combobox"], [aria-haspopup="listbox"], input[aria-autocomplete="list"], input[aria-autocomplete="both"], input[data-automation-id="searchBox"]').forEach(el => {
+      // A search input inside a combobox wrapper is handled through the wrapper.
+      const wrapper = el.parentElement?.closest?.('[role="combobox"], [aria-haspopup="listbox"]');
+      if (wrapper && el.tagName === 'INPUT') return;
+      if (el.tagName === 'INPUT' && !isVisibleElement(el)) return;
+      if (isSiteChromeControl(el)) return;
       const mapped = resolveMappedKey(el);
       const key = mapped.key || getFieldKey(el);
       if (!key || isErrorLabelText(key)) return;
@@ -4015,11 +4206,23 @@ function fillFields(savedFields, opts = {}) {
     comboboxEls.forEach(({ key }) => { comboKeyCounts[key] = (comboKeyCounts[key] || 0) + 1; });
     const comboKeyIndex = {};
 
-    // Process sequentially with small delay so portals don't stack
-    (async () => {
+    // Process sequentially with small delay so portals don't stack. Only one pass
+    // at a time: observer passes used to start a second loop while the first was
+    // still clicking, and the two fought over the same menus.
+    const comboPassStart = Date.now();
+    if (userIsEditing() && comboboxEls.length) {
+      flog('[FormPilot] User is editing — not opening dropdowns this pass.');
+    }
+    if (!comboboxFillRunning && !userIsEditing() && comboboxEls.length) (async () => {
       if (!isCurrentContentInstance()) return;
+      comboboxFillRunning = true;
+      try {
       for (const { el, key } of comboboxEls) {
         if (!isCurrentContentInstance()) return;
+        if (userInteractedSince(comboPassStart)) {
+          flog('[FormPilot] User took over — stopping dropdown fill pass.');
+          return;
+        }
         stats.detected += 1;
         const isDuplicate = comboKeyCounts[key] > 1;
         comboKeyIndex[key] = (comboKeyIndex[key] || 0);
@@ -4056,37 +4259,84 @@ function fillFields(savedFields, opts = {}) {
           continue;
         }
 
+        const logDropdown = (result, extra = {}) => logEvent({
+          type: 'dropdown_fill', hostname, field: fieldKey, reason: result,
+          tag: el.tagName + (el.getAttribute('role') ? `[${el.getAttribute('role')}]` : ''), source, ...extra,
+        });
+        // Already showing the saved value: opening the menu again only steals focus.
+        if (alreadyMatches(el, fieldKey, primaryVal) || (altVal !== primaryVal && alreadyMatches(el, fieldKey, altVal))) {
+          stats.filled += 1;
+          continue;
+        }
+        // Don't grab focus from a field the user is working in.
+        const active = document.activeElement;
+        if (active && active !== document.body && (active === el || el.contains(active)) && !active.dataset?.jaFilledByUs) {
+          continue;
+        }
+        if (fillAttemptsExhausted(el, fieldKey) || dropdownAttemptsExhausted(fieldKey)) {
+          flog(`[FormPilot] Giving up on dropdown "${fieldKey}" — already tried it on this page.`);
+          logDropdown('skip-attempt-limit', { filled: false });
+          continue;
+        }
+        noteFillAttempt(el, fieldKey);
+        noteDropdownAttempt(fieldKey);
+
         if (DEBUG_AUTOFILL) {
           flog(`[FP DEBUG] combobox="${fieldKey}" trying to fill="${primaryVal}"`);
         }
 
         const meta = getDropdownMeta(el);
         const minScore = getDropdownMatchThreshold(decoded, meta);
+        // The menu opening and closing re-renders the page; keep the observers
+        // from reading that as new fields and queueing yet another pass.
+        lastFillTimestamp = Date.now();
 
         // First try: if it has an input child, fill that (search-style comboboxes)
         const inputChild = el.tagName === 'INPUT' ? el : el.querySelector('input');
         if (inputChild) {
           const originalVal = inputChild.value;
-          universalFillText(inputChild, primaryVal);
+          typeIntoSearchInput(inputChild, primaryVal);
           await new Promise(r => setTimeout(r, 80));
           const root = getRootNodeFor(el);
           const optionSets = [root, document].filter((r, idx, arr) => r && arr.indexOf(r) === idx);
-          let found = false;
-          for (const r of optionSets) {
-            if (selectBestOption([primaryVal, altVal], r, minScore)) { stats.filled += 1; found = true; break; }
+          const pickFromOpenMenu = () => optionSets.some(r => selectBestOption([primaryVal, altVal], r, minScore));
+          let found = pickFromOpenMenu();
+          if (!found && !userInteractedSince(comboPassStart)) {
+            // Some search boxes (Workday) only list results once Enter is pressed.
+            try {
+              inputChild.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true, composed: true }));
+            } catch (_) { }
+            await new Promise(r => setTimeout(r, 350));
+            found = pickFromOpenMenu();
           }
+          lastFillTimestamp = Date.now();
           if (found) {
+            stats.filled += 1;
+            markAutofilledElement(el);
             attachCorrectionTracker(inputChild, fieldKey, primaryVal);
             ensureValueSticks(el, fieldKey, primaryVal, altVal);
+            releaseComboboxFocus(el);
+            await new Promise(r => setTimeout(r, 120));
+            logDropdown('picked-from-search', { filled: alreadyMatches(el, fieldKey, primaryVal) || alreadyMatches(el, fieldKey, altVal) });
             continue;
           }
-          // Revert if we didn't pick a valid option
+          logDropdown('no-matching-option', { filled: false });
+          // Revert if we didn't pick a valid option, and close the menu we opened
           setNativeValue(inputChild, originalVal);
           triggerEvents(inputChild);
+          closeComboboxMenu(inputChild);
+          releaseComboboxFocus(el);
+          // A search box with no matching option is not a click-to-open trigger.
+          if (inputChild === el) {
+            unresolvedDropdowns.push({ el, key: fieldKey, desired: primaryVal, type: 'combobox' });
+            continue;
+          }
         }
+        if (userInteractedSince(comboPassStart)) return;
 
         // Second try: click-based (Radix UI / portal-based dropdowns)
         const filled = await fillRadixCombobox(el, [primaryVal, altVal], minScore);
+        lastFillTimestamp = Date.now();
         if (filled) {
           stats.filled += 1;
           attachCorrectionTracker(el, fieldKey, primaryVal);
@@ -4097,6 +4347,14 @@ function fillFields(savedFields, opts = {}) {
 
         // Small pause between dropdowns so portals don't interfere
         await new Promise(r => setTimeout(r, 120));
+        if (filled && el.getAttribute?.('aria-expanded') === 'true') closeComboboxMenu(el);
+        releaseComboboxFocus(el);
+        logDropdown(filled ? 'clicked-option' : 'no-matching-option', {
+          filled: filled && el.isConnected ? alreadyMatches(el, fieldKey, primaryVal) || alreadyMatches(el, fieldKey, altVal) : filled,
+        });
+      }
+      } finally {
+        comboboxFillRunning = false;
       }
     })();
   } catch (err) {
@@ -4105,6 +4363,7 @@ function fillFields(savedFields, opts = {}) {
 
   // ── Custom ARIA listboxes (already expanded) ───────────────────
   collectElements('[role="listbox"]').forEach(listbox => {
+    if (isSiteChromeControl(listbox)) return;
     stats.detected += 1;
     const mapped = resolveMappedKey(listbox);
     const key = mapped.key || getFieldKey(listbox);
@@ -4369,6 +4628,7 @@ function attachLiveCapture() {
     if (type === 'password' || type === 'file' || type === 'hidden') return;
     if (type === 'radio' && !el.checked) return;
     if (isSensitiveField(el)) return;
+    if (isSiteChromeControl(el)) return;
     const mapped = resolveMappedKey(el);
     const key = mapped.key || getFieldKey(el);
     if (!key) return;
@@ -4823,7 +5083,9 @@ function computeOptionMatchScore(optText, optValue, targets) {
 }
 
 function selectBestOption(targets, container, minScore = 0.9) {
-  const options = container ? Array.from(container.querySelectorAll('[role="option"]')) : findVisibleOptions();
+  const options = container
+    ? Array.from(container.querySelectorAll('[role="option"], [data-automation-id="promptOption"]'))
+    : findVisibleOptions();
   if (!options.length) return false;
   let best = { el: null, score: 0 };
   for (const opt of options) {
@@ -4834,7 +5096,7 @@ function selectBestOption(targets, container, minScore = 0.9) {
     if (score > best.score) best = { el: opt, score };
   }
   if (best.el && best.score >= minScore) {
-    best.el.click();
+    clickOptionLikeUser(best.el);
     return true;
   }
   return false;
@@ -6614,7 +6876,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!msg.enabled) {
           suppressSiteUi();
         } else {
-          debouncedInit();
+          debouncedInit('site-enabled-message');
         }
       }
       sendResponse({ ok: true });
@@ -6654,7 +6916,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Local-only mode: cloud data is gone but local autofill keeps working.
       currentGlobalProfile = {};
       globalAliases = {};
-      debouncedInit();
+      debouncedInit('auth-changed-local-mode');
       sendResponse({ ok: true });
       return true;
     }
@@ -6680,7 +6942,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       flog('[FormPilot] Logged out - stopped and cleared state.');
     } else {
       flog('[FormPilot] Logged in - re-initializing...');
-      debouncedInit();
+      debouncedInit('auth-logged-in');
     }
     sendResponse({ ok: true });
     return true;
@@ -6779,6 +7041,11 @@ let initRunning = false;
 let initInFlight = false;
 let lastInitAt = 0;
 const INIT_MIN_INTERVAL_MS = 1500;
+// Why the next init() runs, and which page was last filled — logged so a page that
+// keeps re-initialising shows what is triggering it.
+let pendingInitReason = 'load';
+let lastFilledPageKey = null;
+let sameUrlReinitCount = 0;
 
 // Several things call debouncedInit() — SPA path changes, hash changes, auth
 // changes, site-setting messages. On a page whose embed script rewrites the query
@@ -6936,9 +7203,16 @@ async function runInit() {
       console.warn('  ⚠️ OR upload your resume in Dashboard to populate global profile.');
     }
     fgroupEnd();
+    const initReason = pendingInitReason;
+    pendingInitReason = 'unknown';
+    const pageKey = location.pathname + location.search;
+    const isReinit = lastFilledPageKey === pageKey;
+    sameUrlReinitCount = isReinit ? sameUrlReinitCount + 1 : 0;
     logEvent({
       type: 'init_summary',
       hostname,
+      reason: initReason,
+      reinit: isReinit,
       allowAuto,
       jobContextOk,
       currentSiteActive,
@@ -6958,10 +7232,16 @@ async function runInit() {
     // ─────────────────────────────────────────────────────────────
 
     if (allowAuto && (savedCount > 0 || globalCount > 0)) {
-      if (!ACCURACY_MODE) {
+      lastFilledPageKey = pageKey;
+      if (isReinit && sameUrlReinitCount > 2) {
+        // The page keeps triggering re-init without actually navigating. Filling
+        // again each time is what kept yanking focus; the observers already cover
+        // fields that appear later.
+        flog('[FormPilot] Repeated re-init on the same page — not refilling again.');
+      } else if (!ACCURACY_MODE) {
         flog('[FormPilot] Aggressive autofill enabled. Auto-filling now.');
         setSessionFlag('autofillActive', true);
-        fillFields(mergedFields || {});
+        fillFields(mergedFields || {}, { reinit: isReinit });
       } else if (getSessionFlag('autofillActive')) {
         flog(`[FormPilot] Autofill session active. Auto-filling new fields...`);
         fillFields(mergedFields || {});
@@ -6973,7 +7253,7 @@ async function runInit() {
       console.warn('[FormPilot] Autofill skipped — no saved fields and no global profile data.');
     }
 
-    if (allowAuto && (savedCount > 0 || globalCount > 0) && getSessionFlag('autofillActive')) {
+    if (allowAuto && (savedCount > 0 || globalCount > 0) && getSessionFlag('autofillActive') && !(isReinit && sameUrlReinitCount > 2)) {
       startStepReapplyObserver(mergedFields || {});
     }
 
@@ -6983,7 +7263,7 @@ async function runInit() {
       initAiAssistPanel();
 
       const selectors = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=password]), textarea, select, [contenteditable="true"], [role="textbox"]';
-      const elementsToMap = collectElements(selectors);
+      const elementsToMap = collectElements(selectors).filter(el => !isSiteChromeControl(el));
       triggerAiMapping(elementsToMap);
     }
 
@@ -7025,9 +7305,10 @@ async function runInit() {
 
 // ── Debounced init for SPA navigation ──────────────────────────
 let reinitTimer = null;
-function debouncedInit() {
+function debouncedInit(reason = 'unknown') {
   // Don't re-init if site is disabled or excluded
   if (siteExcluded || isSiteDisabled()) return;
+  pendingInitReason = reason;
   if (reinitTimer) clearTimeout(reinitTimer);
   reinitTimer = setTimeout(() => {
     resetFieldCaches();
@@ -7041,7 +7322,7 @@ init();
 // Handle SPA navigation (hash changes)
 window.addEventListener('hashchange', () => {
   flog('[FormPilot] Hash change detected, re-initializing...');
-  debouncedInit();
+  debouncedInit(`hashchange:${location.hash.slice(0, 60)}`);
 });
 
 // Watch for path changes in SPAs
@@ -7049,9 +7330,10 @@ lastPath = location.pathname + location.search + location.hash;
 navObserver = new MutationObserver(() => {
   const currentPath = location.pathname + location.search + location.hash;
   if (currentPath !== lastPath) {
+    const from = lastPath;
     lastPath = currentPath;
     flog('[FormPilot] Path change detected, re-initializing...');
-    debouncedInit();
+    debouncedInit(`path:${from.slice(-80)} -> ${currentPath.slice(-80)}`);
   }
 });
 try {

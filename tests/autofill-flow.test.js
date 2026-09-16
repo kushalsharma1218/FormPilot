@@ -104,6 +104,8 @@ function setupDom(html, url, profile, opts = {}) {
   global.MutationObserver = win.MutationObserver;
   global.InputEvent = win.InputEvent;
   global.PointerEvent = win.PointerEvent;
+  global.KeyboardEvent = win.KeyboardEvent;
+  global.MouseEvent = win.MouseEvent;
   global.Event = win.Event;
   global.CSS = win.CSS;
   global.HTMLElement = win.HTMLElement;
@@ -133,8 +135,11 @@ function loadContentScript() {
   require(CONTENT_PATH);
 }
 
+// setupDom() swaps in an unref'd setTimeout for the content script's timers. The
+// test's own waits must keep the event loop alive, or Node exits mid-test.
+const refSetTimeout = global.setTimeout;
 async function wait(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise(r => refSetTimeout(r, ms));
 }
 
 test('autofill fills basic job form from global profile', async () => {
@@ -448,6 +453,74 @@ test('re-filling a dropdown settles instead of looping', async () => {
   const counts = dom.window.__changeCounts;
   assert.ok(counts.degree <= 2, `degree was re-filled ${counts.degree} times (expected <= 2)`);
   assert.ok(counts.workMode <= 2, `workMode was re-filled ${counts.workMode} times (expected <= 2)`);
+  dom.window.close();
+});
+
+test('custom comboboxes are not re-opened once they show the saved value', async () => {
+  // The combobox pass never asked "is this already filled?", and a react-select
+  // clears its search input after a pick, so the verify step read it as empty.
+  // Every observer pass, step re-apply and verify retry re-opened each menu and
+  // re-picked the same option, holding focus while the user waited.
+  const profile = {
+    firstName: 'Kushal',
+    email: 'kushal@example.com',
+    degree: "Bachelor's Degree",
+    workMode: 'Remote',
+  };
+  const dom = setupDom(readHtml('test-combobox-rerender.html'), 'https://example.com/jobs/apply', profile);
+  loadContentScript();
+  await wait(3000);
+
+  const doc = dom.window.document;
+  assert.equal(doc.getElementById('degree-display').textContent.trim(), "Bachelor's Degree (BA/BS)");
+  assert.equal(doc.getElementById('workMode-trigger').textContent.trim(), 'Remote (Work from home)');
+
+  const counts = dom.window.__comboCounts;
+  assert.equal(counts.degreePicks, 1, `degree was picked ${counts.degreePicks} times`);
+  assert.equal(counts.workModePicks, 1, `workMode was picked ${counts.workModePicks} times`);
+  assert.ok(counts.degreeOpens <= 1, `degree menu was opened ${counts.degreeOpens} times`);
+  assert.ok(counts.workModeOpens <= 1, `workMode menu was opened ${counts.workModeOpens} times`);
+  // No stray search text left behind in the react-select input.
+  assert.equal(doc.getElementById('degree-input').value, '');
+  dom.window.close();
+});
+
+test('Workday-style dropdowns get picked once and survive re-init and re-render', async () => {
+  // Workday options select on mousedown (a bare click() did nothing, so the
+  // dropdown stayed empty and was re-opened on every pass), its multiselect search
+  // only lists results on Enter, and it re-renders the prompt into a new node —
+  // which reset the per-element attempt limit.
+  const profile = {
+    firstName: 'Kushal',
+    country: 'India',
+    howDidYouHearAboutUs: 'LinkedIn',
+    // Matches the site's language switcher, which must be left alone.
+    language: 'Hindi',
+  };
+  const dom = setupDom(readHtml('test-workday-dropdowns.html'), 'https://example.wd5.myworkdayjobs.com/en-US/global/job/apply', profile);
+  loadContentScript();
+  await wait(2500);
+
+  // Page keeps poking the URL hash, the way re-init kept firing on Workday.
+  for (let i = 0; i < 4; i++) {
+    dom.window.location.hash = `#tick${i}`;
+    await wait(2200);
+  }
+
+  const doc = dom.window.document;
+  const wd = dom.window.__wd;
+  assert.equal(doc.getElementById('country').textContent.trim(), 'India');
+  assert.equal(wd.countryPicks, 1, `country was picked ${wd.countryPicks} times`);
+  assert.ok(wd.countryOpens <= 1, `country popup was opened ${wd.countryOpens} times`);
+  assert.equal(doc.querySelector('[data-automation-id="selectedItem"]')?.textContent.trim(), 'LinkedIn');
+  assert.equal(wd.sourcePicks, 1, `source was picked ${wd.sourcePicks} times`);
+  assert.ok(wd.sourceSearches <= 2, `source search ran ${wd.sourceSearches} times`);
+
+  // Site chrome is not part of the application form.
+  assert.equal(wd.languageOpens, 0, 'the site language switcher was opened');
+  assert.equal(doc.getElementById('site-language').textContent.trim(), 'English');
+  assert.equal(wd.localeChanges, 0, 'the site locale select was changed');
+  assert.equal(doc.getElementById('localeSelect').value, 'en');
   dom.window.close();
 });
 

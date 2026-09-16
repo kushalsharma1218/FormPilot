@@ -2474,12 +2474,14 @@ async function renderDebugLogs() {
             const url = l.url ? ` url=${l.url}` : '';
             const confidence = l.confidence ? ` conf=${l.confidence}` : '';
             const canFill = typeof l.canFill === 'boolean' ? ` canFill=${l.canFill}` : '';
+            const reason = l.reason ? ` reason="${l.reason}"` : '';
+            const reinit = l.reinit ? ' reinit=true' : '';
             let counts = '';
             if (l.counts) {
                 const c = l.counts;
                 counts = ` counts(site=${c.siteFields ?? '-'},session=${c.sessionFields ?? '-'},global=${c.global ?? '-'},merged=${c.merged ?? '-'})`;
             }
-            return `[${ts}] ${type}${field}${tag}${src}${confidence}${canFill}${filled}${match}${visible}${interactable}${frame}${url}${counts}`;
+            return `[${ts}] ${type}${reason}${reinit}${field}${tag}${src}${confidence}${canFill}${filled}${match}${visible}${interactable}${frame}${url}${counts}`;
         });
         output.textContent = lines.join('\n');
     } catch (err) {
